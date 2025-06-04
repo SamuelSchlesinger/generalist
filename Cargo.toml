@@ -2,6 +2,14 @@
 name = "claude"
 version = "0.1.0"
 edition = "2021"
+authors = ["Samuel Schlesinger <sgschlesinger@gmail.com>"]
+description = "A Rust client library for Anthropic's Claude AI API with tool support"
+homepage = "https://github.com/SamuelSchlesinger/claude-chatbot"
+repository = "https://github.com/SamuelSchlesinger/claude-chatbot"
+license = "MIT"
+readme = "README.md"
+keywords = ["claude", "anthropic", "ai", "chatbot", "tools"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 reqwest = { version = "0.11", features = ["json"] }
