@@ -71,7 +71,6 @@ pub use permissions::{
 };
 pub use execution::{ExecutionState, ToolExecution};
 pub use state::ChatbotState;
-pub use tools::{NewsSearchTool, NewsArticle, NewsSearchInput, WebSearchTool, WebSearchResult, WebSearchInput, AcademicSearchTool, AcademicPaper, AcademicSearchInput};
 
 // Modules
 pub mod client;

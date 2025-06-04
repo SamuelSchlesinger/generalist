@@ -319,12 +319,13 @@ impl ChatUI {
         println!("  • {} - Get current weather for any city", "weather".cyan());
         println!("  • {} - Make HTTP requests to fetch data", "http_fetch".cyan());
         println!("  • {} - Store and search persistent memories", "enhanced_memory".cyan());
-        println!("  • {} - Generate deeper thinking prompts", "still_thinking".cyan());
+        println!("  • {} - Think more deeply about topics", "think".cyan());
         println!("  • {} - Search Wikipedia articles and get summaries", "wikipedia".cyan());
         println!("  • {} - Z3 SMT/SAT constraint solver for logic and optimization", "z3_solver".cyan());
-        println!("  • {} - Search recent news articles from RSS feeds", "news_search".cyan());
-        println!("  • {} - Search the web using DuckDuckGo API and scraping", "web_search".cyan());
-        println!("  • {} - Search academic papers from arXiv and other sources", "academic_search".cyan());
+        println!("  • {} - Crawl websites and extract content using Firecrawl", "firecrawl_crawl".cyan());
+        println!("  • {} - Search the web using Firecrawl's search API", "firecrawl_search".cyan());
+        println!("  • {} - Map website structure using Firecrawl", "firecrawl_map".cyan());
+        println!("  • {} - Extract structured data from web pages using Firecrawl", "firecrawl_extract".cyan());
         println!();
         println!("{} {}", "🔐".cyan(), "Tool Permission System Active".yellow().bold());
         println!("{}", "You'll be asked to approve each tool use with these options:".dimmed());
@@ -536,12 +537,14 @@ async fn main() -> Result<()> {
     registry.register(Arc::new(WeatherTool))?;
     registry.register(Arc::new(HttpFetchTool))?;
     registry.register(Arc::new(EnhancedMemoryTool::new()?))?;
-    registry.register(Arc::new(StillThinkingTool))?;
+    registry.register(Arc::new(ThinkTool))?;
     registry.register(Arc::new(WikipediaTool))?;
     registry.register(Arc::new(Z3SolverTool))?;
-    registry.register(Arc::new(NewsSearchTool))?;
-    registry.register(Arc::new(WebSearchTool))?;
-    registry.register(Arc::new(AcademicSearchTool))?;
+    registry.register(Arc::new(TodoTool))?;
+    registry.register(Arc::new(FirecrawlCrawlTool))?;
+    registry.register(Arc::new(FirecrawlSearchTool))?;
+    registry.register(Arc::new(FirecrawlMapTool))?;
+    registry.register(Arc::new(FirecrawlExtractTool))?;
     
     // Load system prompt
     let system_prompt = include_str!("../SYSTEM_PROMPT.md");
