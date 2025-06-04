@@ -1,6 +1,6 @@
 # Generalist 🤖
 
-A powerful command-line generalist command-line agent powered by Claude AI, with 17 built-in tools and a focus on safety and transparency.
+A powerful command-line generalist command-line agent powered by Claude AI and Firecrawl, with 17 built-in tools and a focus on safety and transparency.
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ A powerful command-line generalist command-line agent powered by Claude AI, with
 - **🛠️ 17 Built-in Tools** - Everything from file operations to web scraping
 - **🔐 Permission System** - You control what tools can run
 - **💾 Save Conversations** - Resume chats later with `/save` and `/load`
-- **🎨 Beautiful UI** - See exactly what Claude is doing in real-time
+- **🎨 Beautiful UI** - See exactly what the generalist is doing in real-time
 
 ## Available Tools
 
@@ -56,7 +56,7 @@ A powerful command-line generalist command-line agent powered by Claude AI, with
 
 ## Permission System
 
-When Claude wants to use a tool, you'll see:
+When the generalist wants to use a tool, you'll see:
 
 ```
 ⚠️  Tool Permission Request

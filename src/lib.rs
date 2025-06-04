@@ -82,3 +82,4 @@ pub mod permissions;
 pub mod execution;
 pub mod tools;
 pub mod state;
+pub mod chat_ui;

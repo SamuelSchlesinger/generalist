@@ -1,140 +1,21 @@
 use claude::{Claude, Message, ContentBlock, ToolRegistry, Result, Error, 
     tools::*, ChatbotState, MemoryPermissionHandler};
-use serde_json::Value;
 use std::sync::Arc;
 use std::env;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
-use console::Term;
+use indicatif::{ProgressBar, ProgressStyle};
 use colored::*;
 use tokio::time::Duration;
 use chrono::Local;
 use std::fs;
 use std::path::PathBuf;
 
+mod chat_ui;
+use chat_ui::ChatUI;
 
 
 
-struct ChatUI {
-    term: Term,
-    multi_progress: MultiProgress,
-    max_result_length: usize,
-}
 
-impl ChatUI {
-    fn new() -> Self {
-        Self {
-            term: Term::stdout(),
-            multi_progress: MultiProgress::new(),
-            max_result_length: 200, // Default max length for tool results
-        }
-    }
-    
-    fn shorten_result(&self, result: &str) -> String {
-        if result.len() <= self.max_result_length {
-            result.to_string()
-        } else {
-            let half_len = (self.max_result_length - 20) / 2;
-            format!(
-                "{}... [truncated {} chars] ...{}", 
-                &result[..half_len],
-                result.len() - self.max_result_length,
-                &result[result.len() - half_len..]
-            )
-        }
-    }
-    
-    fn print_welcome(&self) {
-        self.term.clear_screen().unwrap();
-        println!("{}", "╔═══════════════════════════════════════════════════════════╗".bright_blue());
-        println!("{}", "║            🤖 Claude CLI Chatbot with Tools 🛠️            ║".bright_blue());
-        println!("{}", "╚═══════════════════════════════════════════════════════════╝".bright_blue());
-        println!();
-        println!("{}", "Available tools:".yellow());
-        println!("  • {} - Apply patches/diffs to files", "patch_file".cyan());
-        println!("  • {} - Read content from files", "read_file".cyan());
-        println!("  • {} - List directory contents", "list_directory".cyan());
-        println!("  • {} - Execute bash commands", "bash".cyan());
-        println!("  • {} - Get system information", "system_info".cyan());
-        println!("  • {} - Perform mathematical calculations", "calculator".cyan());
-        println!("  • {} - Get current weather for any city", "weather".cyan());
-        println!("  • {} - Make HTTP requests to fetch data", "http_fetch".cyan());
-        println!("  • {} - Store and search persistent memories", "enhanced_memory".cyan());
-        println!("  • {} - Think more deeply about topics", "think".cyan());
-        println!("  • {} - Search Wikipedia articles and get summaries", "wikipedia".cyan());
-        println!("  • {} - Z3 SMT/SAT constraint solver for logic and optimization", "z3_solver".cyan());
-        println!("  • {} - Crawl websites and extract content using Firecrawl", "firecrawl_crawl".cyan());
-        println!("  • {} - Search the web using Firecrawl's search API", "firecrawl_search".cyan());
-        println!("  • {} - Map website structure using Firecrawl", "firecrawl_map".cyan());
-        println!("  • {} - Extract structured data from web pages using Firecrawl", "firecrawl_extract".cyan());
-        println!();
-        println!("{} {}", "🔐".cyan(), "Tool Permission System Active".yellow().bold());
-        println!("{}", "You'll be asked to approve each tool use with these options:".dimmed());
-        println!("  • {} - Tool will always be allowed automatically", "Yes (always allow)".green());
-        println!("  • {} - Allow just this execution", "Yes (just this once)".green());
-        println!("  • {} - Tool will always be denied automatically", "No (never allow)".red());
-        println!("  • {} - Deny just this execution", "No (just this once)".red());
-        println!();
-        println!("{}", "Commands:".yellow());
-        println!("  • {} - Save current conversation", "/save".cyan());
-        println!("  • {} - Load a saved conversation", "/load".cyan());
-        println!("  • {} - Show help message", "/help".cyan());
-        println!("  • {} or {} - Exit the chatbot", "exit".cyan(), "quit".cyan());
-        println!("{}", "─".repeat(60).dimmed());
-        println!();
-    }
-    
-    fn print_message(&self, role: &str, content: &str) {
-        let timestamp = Local::now().format("%H:%M:%S");
-        match role {
-            "user" => {
-                println!("{} {} {}", 
-                    format!("[{}]", timestamp).dimmed(),
-                    "You:".green().bold(),
-                    content
-                );
-            }
-            "assistant" => {
-                println!("{} {} {}", 
-                    format!("[{}]", timestamp).dimmed(),
-                    "Claude:".blue().bold(),
-                    content
-                );
-            }
-            _ => {}
-        }
-    }
-    
-    fn print_tool_use(&self, tool_name: &str, input: &Value) -> ProgressBar {
-        let pb = self.multi_progress.add(ProgressBar::new_spinner());
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-        );
-        pb.set_message(format!("🔧 Using tool: {} with input: {}", 
-            tool_name.yellow(), 
-            serde_json::to_string(input).unwrap_or_default().dimmed()
-        ));
-        pb.enable_steady_tick(Duration::from_millis(100));
-        pb
-    }
-    
-    #[allow(dead_code)]
-    fn print_tool_result(&self, tool_name: &str, result: &str, pb: ProgressBar) {
-        pb.finish_and_clear();
-        println!("   {} {} result: {}", 
-            "✓".green(),
-            tool_name.yellow(),
-            result.italic()
-        );
-    }
-    
-    fn print_error(&self, error: &str) {
-        println!("{} {}", "Error:".red().bold(), error);
-    }
-}
 
 // Conversation history management
 fn get_history_dir() -> PathBuf {
@@ -427,7 +308,7 @@ async fn main() -> Result<()> {
         ]));
         
         // Show thinking indicator
-        let mut thinking_pb = ui.multi_progress.add(ProgressBar::new_spinner());
+        let mut thinking_pb = ui.multi_progress().add(ProgressBar::new_spinner());
         thinking_pb.set_style(
             ProgressStyle::default_spinner()
                 .template("{spinner:.blue} {msg}")
@@ -492,14 +373,14 @@ async fn main() -> Result<()> {
                                                 // Other error during execution - show progress bar
                                                 let pb = ui.print_tool_use(name, input);
                                                 pb.finish_with_message(format!("✗ {} failed", name.red()));
-                                                println!("   {} Error: {}", "→".red(), ui.shorten_result(content).dimmed());
+                                                println!("   {} Error: {}", "→".red(), ui.shorten_result_public(content).dimmed());
                                             }
                                         } else {
                                             // Success - show progress bar
                                             let pb = ui.print_tool_use(name, input);
                                             pb.finish_with_message(format!("✓ {} completed", name.green()));
                                             if let ContentBlock::ToolResult { content, .. } = &result {
-                                                println!("   {} Result: {}", "→".cyan(), ui.shorten_result(content).dimmed());
+                                                println!("   {} Result: {}", "→".cyan(), ui.shorten_result_public(content).dimmed());
                                             }
                                         }
                                         tool_results.push(result);
@@ -549,7 +430,7 @@ async fn main() -> Result<()> {
                         }
                         
                         // Show we're waiting for Claude's next response
-                        thinking_pb = ui.multi_progress.add(ProgressBar::new_spinner());
+                        thinking_pb = ui.multi_progress().add(ProgressBar::new_spinner());
                         thinking_pb.set_style(
                             ProgressStyle::default_spinner()
                                 .template("{spinner:.blue} {msg}")
