@@ -27,7 +27,3 @@ firecrawl = "1.2.0"
 [[bin]]
 name = "chatbot"
 path = "src/main.rs"
-
-[[example]]
-name = "discord_bot"
-path = "examples/discord_bot.rs"
