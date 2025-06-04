@@ -217,10 +217,15 @@ impl Tool for TodoTool {
                     let mut output = String::new();
                     for todo in items {
                         let status = if todo.completed { "✓" } else { "○" };
+                        let short_id = if todo.id.len() >= 8 {
+                            &todo.id[0..8]
+                        } else {
+                            &todo.id
+                        };
                         output.push_str(&format!(
                             "{} [{}] {}\n",
                             status,
-                            &todo.id[0..8],
+                            short_id,
                             todo.title
                         ));
                     }

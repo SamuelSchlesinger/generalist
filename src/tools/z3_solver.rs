@@ -62,7 +62,7 @@ impl Tool for Z3SolverTool {
                     "items": {
                         "type": "string"
                     },
-                    "description": "List of constraints in SMT-LIB format"
+                    "description": "List of constraints in SMT-LIB format (e.g., '(> x 0)', '(= (+ x y) 10)')"
                 },
                 "goal": {
                     "type": "string",
@@ -90,11 +90,11 @@ impl Tool for Z3SolverTool {
                 "hypothesis": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Hypotheses/premises for proof (for 'prove' action)"
+                    "description": "Hypotheses/premises in SMT-LIB format for proof (for 'prove' action)"
                 },
                 "conclusion": {
                     "type": "string",
-                    "description": "Conclusion to prove (for 'prove' action)"
+                    "description": "Conclusion in SMT-LIB format to prove (for 'prove' action)"
                 }
             },
             "required": [],
@@ -107,7 +107,7 @@ impl Tool for Z3SolverTool {
 
         let params: Z3Input = serde_json::from_value(input)
             .map_err(|e| Error::Other(format!(
-                "Invalid input parameters: {}. Example: {{\"constraints\": [\"(assert (> x 0))\"], \"variables\": {{\"x\": \"Int\"}}}}", e
+                "Invalid input parameters: {}. Example: {{\"constraints\": [\"(> x 0)\", \"(< x 10)\"], \"variables\": {{\"x\": \"Int\"}}}}", e
             )))?;
 
         let action = params.action.clone().unwrap_or_else(|| "solve".to_string());
@@ -273,12 +273,18 @@ impl Z3SolverTool {
             }
         }
 
-        // Add constraints
+        // Add constraints - expect proper SMT-LIB format
         if let Some(constraints) = &params.constraints {
             for constraint in constraints {
-                // Handle simple constraint formats and convert to SMT-LIB
-                let smt_constraint = Self::convert_to_smt_lib(constraint)?;
-                program.push_str(&format!("(assert {})\n", smt_constraint));
+                // Validate basic SMT-LIB format
+                let trimmed = constraint.trim();
+                if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+                    return Err(Error::Other(format!(
+                        "Constraint must be in SMT-LIB format (enclosed in parentheses): {}",
+                        constraint
+                    )));
+                }
+                program.push_str(&format!("(assert {})\n", trimmed));
             }
         }
 
@@ -314,11 +320,18 @@ impl Z3SolverTool {
             }
         }
 
-        // Add constraints
+        // Add constraints - expect proper SMT-LIB format
         if let Some(constraints) = &params.constraints {
             for constraint in constraints {
-                let smt_constraint = Self::convert_to_smt_lib(constraint)?;
-                program.push_str(&format!("(assert {})\n", smt_constraint));
+                // Validate basic SMT-LIB format
+                let trimmed = constraint.trim();
+                if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+                    return Err(Error::Other(format!(
+                        "Constraint must be in SMT-LIB format (enclosed in parentheses): {}",
+                        constraint
+                    )));
+                }
+                program.push_str(&format!("(assert {})\n", trimmed));
             }
         }
 
@@ -370,26 +383,47 @@ impl Z3SolverTool {
             }
         }
 
-        // Add hypotheses
+        // Add hypotheses - expect proper SMT-LIB format
         if let Some(hypotheses) = &params.hypothesis {
             for hypothesis in hypotheses {
-                let smt_constraint = Self::convert_to_smt_lib(hypothesis)?;
-                program.push_str(&format!("(assert {})\n", smt_constraint));
+                // Validate basic SMT-LIB format
+                let trimmed = hypothesis.trim();
+                if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+                    return Err(Error::Other(format!(
+                        "Hypothesis must be in SMT-LIB format (enclosed in parentheses): {}",
+                        hypothesis
+                    )));
+                }
+                program.push_str(&format!("(assert {})\n", trimmed));
             }
         }
 
-        // Add general constraints
+        // Add general constraints - expect proper SMT-LIB format
         if let Some(constraints) = &params.constraints {
             for constraint in constraints {
-                let smt_constraint = Self::convert_to_smt_lib(constraint)?;
-                program.push_str(&format!("(assert {})\n", smt_constraint));
+                // Validate basic SMT-LIB format
+                let trimmed = constraint.trim();
+                if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+                    return Err(Error::Other(format!(
+                        "Constraint must be in SMT-LIB format (enclosed in parentheses): {}",
+                        constraint
+                    )));
+                }
+                program.push_str(&format!("(assert {})\n", trimmed));
             }
         }
 
-        // Add negation of conclusion
+        // Add negation of conclusion - expect proper SMT-LIB format
         if let Some(conclusion) = &params.conclusion {
-            let smt_conclusion = Self::convert_to_smt_lib(conclusion)?;
-            program.push_str(&format!("(assert (not {}))\n", smt_conclusion));
+            // Validate basic SMT-LIB format
+            let trimmed = conclusion.trim();
+            if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+                return Err(Error::Other(format!(
+                    "Conclusion must be in SMT-LIB format (enclosed in parentheses): {}",
+                    conclusion
+                )));
+            }
+            program.push_str(&format!("(assert (not {}))\n", trimmed));
         } else {
             return Err(Error::Other("Conclusion is required for proof".to_string()));
         }
@@ -400,96 +434,6 @@ impl Z3SolverTool {
         Ok(program)
     }
 
-    fn convert_to_smt_lib(constraint: &str) -> Result<String> {
-        let constraint = constraint.trim();
-
-        // If already in SMT-LIB format (starts with parentheses), return as-is
-        if constraint.starts_with('(') && constraint.ends_with(')') {
-            return Ok(constraint.to_string());
-        }
-
-        // Convert simple infix notation to SMT-LIB
-        // Handle equality: "x + y == 10" -> "(= (+ x y) 10)"
-        if let Some(eq_pos) = constraint.find("==") {
-            let left = constraint[..eq_pos].trim();
-            let right = constraint[eq_pos + 2..].trim();
-            return Ok(format!(
-                "(= {} {})",
-                Self::convert_expression_to_smt(left)?,
-                Self::convert_expression_to_smt(right)?
-            ));
-        }
-
-        // Handle inequalities
-        for (op, smt_op) in [(">=", ">="), ("<=", "<="), (">", ">"), ("<", "<")] {
-            if let Some(op_pos) = constraint.find(op) {
-                let left = constraint[..op_pos].trim();
-                let right = constraint[op_pos + op.len()..].trim();
-                return Ok(format!(
-                    "({} {} {})",
-                    smt_op,
-                    Self::convert_expression_to_smt(left)?,
-                    Self::convert_expression_to_smt(right)?
-                ));
-            }
-        }
-
-        // Handle boolean values
-        if constraint == "true" {
-            return Ok("true".to_string());
-        }
-        if constraint == "false" {
-            return Ok("false".to_string());
-        }
-
-        // If it's a simple variable or number, return as-is
-        Ok(constraint.to_string())
-    }
-
-    fn convert_expression_to_smt(expr: &str) -> Result<String> {
-        let expr = expr.trim();
-
-        // Handle numbers
-        if expr.parse::<i64>().is_ok() || expr.parse::<f64>().is_ok() {
-            return Ok(expr.to_string());
-        }
-
-        // Handle simple addition: "x + y" -> "(+ x y)"
-        if let Some(plus_pos) = expr.find(" + ") {
-            let left = expr[..plus_pos].trim();
-            let right = expr[plus_pos + 3..].trim();
-            return Ok(format!(
-                "(+ {} {})",
-                Self::convert_expression_to_smt(left)?,
-                Self::convert_expression_to_smt(right)?
-            ));
-        }
-
-        // Handle simple subtraction: "x - y" -> "(- x y)"
-        if let Some(minus_pos) = expr.find(" - ") {
-            let left = expr[..minus_pos].trim();
-            let right = expr[minus_pos + 3..].trim();
-            return Ok(format!(
-                "(- {} {})",
-                Self::convert_expression_to_smt(left)?,
-                Self::convert_expression_to_smt(right)?
-            ));
-        }
-
-        // Handle simple multiplication: "x * y" -> "(* x y)"
-        if let Some(mult_pos) = expr.find(" * ") {
-            let left = expr[..mult_pos].trim();
-            let right = expr[mult_pos + 3..].trim();
-            return Ok(format!(
-                "(* {} {})",
-                Self::convert_expression_to_smt(left)?,
-                Self::convert_expression_to_smt(right)?
-            ));
-        }
-
-        // Otherwise assume it's a variable
-        Ok(expr.to_string())
-    }
 
     fn run_z3(program: &str, timeout: u64) -> Result<String> {
         use std::fs;

@@ -247,8 +247,9 @@ impl WikipediaTool {
         let actual_title = page["title"].as_str().unwrap_or(title);
 
         // Limit summary length to prevent overly long responses
-        let summary = if extract.len() > 2000 {
-            format!("{}...", &extract[..2000])
+        let summary = if extract.chars().count() > 2000 {
+            let truncated: String = extract.chars().take(2000).collect();
+            format!("{}...", truncated)
         } else {
             extract.to_string()
         };
