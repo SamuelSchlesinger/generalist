@@ -21,15 +21,21 @@ impl ChatUI {
     }
 
     fn shorten_result(&self, result: &str) -> String {
-        if result.len() <= self.max_result_length {
+        let char_count = result.chars().count();
+        if char_count <= self.max_result_length {
             result.to_string()
         } else {
             let half_len = (self.max_result_length - 20) / 2;
+            let chars: Vec<char> = result.chars().collect();
+            
+            let start: String = chars.iter().take(half_len).collect();
+            let end: String = chars.iter().skip(char_count.saturating_sub(half_len)).collect();
+            
             format!(
                 "{}... [truncated {} chars] ...{}",
-                &result[..half_len],
-                result.len() - self.max_result_length,
-                &result[result.len() - half_len..]
+                start,
+                char_count - self.max_result_length,
+                end
             )
         }
     }
