@@ -67,7 +67,7 @@ pub use tool::{Tool, ToolRegistry};
 pub use permissions::{
     ToolPermissionHandler, PermissionDecision, ToolExecutionRequest,
     AlwaysAllowPermissions, AlwaysDenyPermissions, LoggingPermissions,
-    InteractivePermissions, PolicyPermissions
+    InteractivePermissions, PolicyPermissions, MemoryPermissionHandler
 };
 pub use execution::{ExecutionState, ToolExecution};
 pub use state::ChatbotState;

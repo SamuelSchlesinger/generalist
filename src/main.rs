@@ -1,10 +1,8 @@
 use claude::{Claude, Message, ContentBlock, ToolRegistry, Result, Error, 
-    ToolPermissionHandler, ToolExecutionRequest, PermissionDecision, tools::*, ChatbotState};
-use async_trait::async_trait;
+    tools::*, ChatbotState, MemoryPermissionHandler};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::env;
-use std::collections::HashSet;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
 use console::Term;
@@ -15,264 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 
 
-/// Format a diff for pretty display
-fn format_diff_for_display(diff: &str) -> String {
-    let mut formatted = String::new();
-    
-    for line in diff.lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
-            // File headers
-            formatted.push_str(&format!("{}\n", line.bright_blue()));
-        } else if line.starts_with("@@") {
-            // Hunk headers
-            formatted.push_str(&format!("{}\n", line.cyan()));
-        } else if line.starts_with("+") && !line.starts_with("+++") {
-            // Added lines
-            formatted.push_str(&format!("{}\n", line.green()));
-        } else if line.starts_with("-") && !line.starts_with("---") {
-            // Removed lines
-            formatted.push_str(&format!("{}\n", line.red()));
-        } else if line.starts_with(" ") {
-            // Context lines
-            formatted.push_str(&format!("{}\n", line.dimmed()));
-        } else {
-            // Other lines
-            formatted.push_str(&format!("{}\n", line));
-        }
-    }
-    
-    formatted
-}
 
-/// Advanced permission handler with memory for always/never decisions
-struct MemoryPermissionHandler {
-    always_allow: Arc<Mutex<HashSet<String>>>,
-    always_deny: Arc<Mutex<HashSet<String>>>,
-}
-
-impl MemoryPermissionHandler {
-    fn new() -> Self {
-        Self {
-            always_allow: Arc::new(Mutex::new(HashSet::new())),
-            always_deny: Arc::new(Mutex::new(HashSet::new())),
-        }
-    }
-}
-
-/// Wrapper to allow sharing permission handler between registry and state updates
-struct MemoryPermissionHandlerWrapper {
-    inner: Arc<Mutex<MemoryPermissionHandler>>,
-}
-
-#[async_trait]
-impl ToolPermissionHandler for MemoryPermissionHandlerWrapper {
-    async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision {
-        // Clone the handler reference to avoid holding the lock across await
-        let handler_clone = Arc::clone(&self.inner);
-        let handler = handler_clone.lock().unwrap();
-        
-        // Check always allow/deny first
-        {
-            let always_allow = handler.always_allow.lock().unwrap();
-            if always_allow.contains(&request.tool_name) {
-                eprintln!("{} Automatically allowing '{}' (previously set to always allow)", 
-                    "✓".green(), request.tool_name.cyan());
-                return PermissionDecision::Allow;
-            }
-        }
-        
-        {
-            let always_deny = handler.always_deny.lock().unwrap();
-            if always_deny.contains(&request.tool_name) {
-                eprintln!("{} Automatically denying '{}' (previously set to never allow)", 
-                    "✗".red(), request.tool_name.cyan());
-                return PermissionDecision::DenyWithReason(
-                    "Tool was previously set to never allow".to_string()
-                );
-            }
-        }
-        
-        // Drop the handler lock before the interactive prompt
-        drop(handler);
-        
-        // No remembered decision, prompt the user
-        println!("\n{}", "⚠️  Tool Permission Request".yellow().bold());
-        println!("{}", "─".repeat(50).dimmed());
-        println!("Tool: {}", request.tool_name.cyan().bold());
-        println!("Description: {}", request.tool_description.dimmed());
-        
-        // Special formatting for patch_file tool
-        if request.tool_name == "patch_file" {
-            if let Some(path) = request.input.get("path").and_then(|v| v.as_str()) {
-                println!("Target file: {}", path.yellow());
-            }
-            if let Some(diff) = request.input.get("diff").and_then(|v| v.as_str()) {
-                println!("\n{}", "Proposed changes:".bold());
-                println!("{}", "─".repeat(50).dimmed());
-                print!("{}", format_diff_for_display(diff));
-                println!("{}", "─".repeat(50).dimmed());
-            } else {
-                println!("Input: {}", 
-                    serde_json::to_string_pretty(&request.input)
-                        .unwrap_or_default()
-                        .dimmed()
-                );
-            }
-        } else {
-            println!("Input: {}", 
-                serde_json::to_string_pretty(&request.input)
-                    .unwrap_or_default()
-                    .dimmed()
-            );
-        }
-        println!();
-        
-        let choices = vec![
-            "Yes (always allow this tool)",
-            "Yes (just this once)",
-            "No (never allow this tool)",
-            "No (just this once)",
-        ];
-        
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Allow this tool to execute?")
-            .items(&choices)
-            .default(1) // Default to "Yes (just this once)"
-            .interact()
-            .unwrap();
-        
-        // Re-acquire the handler to update always_allow/always_deny
-        let handler = handler_clone.lock().unwrap();
-        
-        match selection {
-            0 => { // Yes (always)
-                let mut always_allow = handler.always_allow.lock().unwrap();
-                always_allow.insert(request.tool_name.clone());
-                println!("{} Tool '{}' will be automatically allowed in the future", 
-                    "✓".green(), request.tool_name.cyan());
-                PermissionDecision::Allow
-            }
-            1 => { // Yes (once)
-                PermissionDecision::Allow
-            }
-            2 => { // No (never)
-                let mut always_deny = handler.always_deny.lock().unwrap();
-                always_deny.insert(request.tool_name.clone());
-                println!("{} Tool '{}' will be automatically denied in the future", 
-                    "✗".red(), request.tool_name.cyan());
-                PermissionDecision::DenyWithReason(
-                    "User chose to never allow this tool".to_string()
-                )
-            }
-            3 => { // No (once)
-                PermissionDecision::DenyWithReason(
-                    "User denied this tool execution".to_string()
-                )
-            }
-            _ => unreachable!()
-        }
-    }
-}
-
-#[async_trait]
-impl ToolPermissionHandler for MemoryPermissionHandler {
-    async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision {
-        // Check if we have a remembered decision
-        {
-            let always_allow = self.always_allow.lock().unwrap();
-            if always_allow.contains(&request.tool_name) {
-                eprintln!("{} Automatically allowing '{}' (previously set to always allow)", 
-                    "✓".green(), request.tool_name.cyan());
-                return PermissionDecision::Allow;
-            }
-        }
-        
-        {
-            let always_deny = self.always_deny.lock().unwrap();
-            if always_deny.contains(&request.tool_name) {
-                eprintln!("{} Automatically denying '{}' (previously set to never allow)", 
-                    "✗".red(), request.tool_name.cyan());
-                return PermissionDecision::DenyWithReason(
-                    "Tool was previously set to never allow".to_string()
-                );
-            }
-        }
-        
-        // No remembered decision, prompt the user
-        println!("\n{}", "⚠️  Tool Permission Request".yellow().bold());
-        println!("{}", "─".repeat(50).dimmed());
-        println!("Tool: {}", request.tool_name.cyan().bold());
-        println!("Description: {}", request.tool_description.dimmed());
-        
-        // Special formatting for patch_file tool
-        if request.tool_name == "patch_file" {
-            if let Some(path) = request.input.get("path").and_then(|v| v.as_str()) {
-                println!("Target file: {}", path.yellow());
-            }
-            if let Some(diff) = request.input.get("diff").and_then(|v| v.as_str()) {
-                println!("\n{}", "Proposed changes:".bold());
-                println!("{}", "─".repeat(50).dimmed());
-                print!("{}", format_diff_for_display(diff));
-                println!("{}", "─".repeat(50).dimmed());
-            } else {
-                println!("Input: {}", 
-                    serde_json::to_string_pretty(&request.input)
-                        .unwrap_or_default()
-                        .dimmed()
-                );
-            }
-        } else {
-            println!("Input: {}", 
-                serde_json::to_string_pretty(&request.input)
-                    .unwrap_or_default()
-                    .dimmed()
-            );
-        }
-        println!();
-        
-        let choices = vec![
-            "Yes (always allow this tool)",
-            "Yes (just this once)",
-            "No (never allow this tool)",
-            "No (just this once)",
-        ];
-        
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Allow this tool to execute?")
-            .items(&choices)
-            .default(1) // Default to "Yes (just this once)"
-            .interact()
-            .unwrap();
-        
-        match selection {
-            0 => { // Yes (always)
-                let mut always_allow = self.always_allow.lock().unwrap();
-                always_allow.insert(request.tool_name.clone());
-                println!("{} Tool '{}' will be automatically allowed in the future", 
-                    "✓".green(), request.tool_name.cyan());
-                PermissionDecision::Allow
-            }
-            1 => { // Yes (once)
-                PermissionDecision::Allow
-            }
-            2 => { // No (never)
-                let mut always_deny = self.always_deny.lock().unwrap();
-                always_deny.insert(request.tool_name.clone());
-                println!("{} Tool '{}' will be automatically denied in the future", 
-                    "✗".red(), request.tool_name.cyan());
-                PermissionDecision::DenyWithReason(
-                    "User chose to never allow this tool".to_string()
-                )
-            }
-            3 => { // No (once)
-                PermissionDecision::DenyWithReason(
-                    "User denied permission for this execution".to_string()
-                )
-            }
-            _ => unreachable!()
-        }
-    }
-}
 
 struct ChatUI {
     term: Term,
@@ -513,7 +254,7 @@ async fn main() -> Result<()> {
     let mut state = ChatbotState::new(model.clone());
     
     // Initialize permission handler
-    let permission_handler = Arc::new(Mutex::new(MemoryPermissionHandler::new()));
+    let permission_handler = Arc::new(MemoryPermissionHandler::new());
     
     // Initialize Claude client
     let mut client = Claude::new(api_key.clone(), model.clone());
@@ -522,10 +263,13 @@ async fn main() -> Result<()> {
     println!("{} Using interactive permissions with memory", "🔐".cyan());
     println!("{}", "You'll be prompted for each tool execution with options to remember your choice.\n".dimmed());
     
+    // Create a shared handler for the registry
+    let shared_handler = MemoryPermissionHandler::with_shared_state(
+        permission_handler.always_allow(),
+        permission_handler.always_deny()
+    );
     let mut registry = ToolRegistry::with_permission_handler(
-        Box::new(MemoryPermissionHandlerWrapper {
-            inner: Arc::clone(&permission_handler)
-        })
+        Box::new(shared_handler)
     );
     
     registry.register(Arc::new(PatchFileTool))?;
@@ -571,11 +315,8 @@ async fn main() -> Result<()> {
                 .unwrap();
             
             // Update state with current permissions
-            {
-                let handler = permission_handler.lock().unwrap();
-                state.always_allow_tools = handler.always_allow.lock().unwrap().clone();
-                state.always_deny_tools = handler.always_deny.lock().unwrap().clone();
-            }
+            state.always_allow_tools = permission_handler.always_allow().lock().unwrap().clone();
+            state.always_deny_tools = permission_handler.always_deny().lock().unwrap().clone();
             
             if let Err(e) = save_state(&state, &name) {
                 ui.print_error(&format!("Failed to save state: {}", e));
@@ -609,15 +350,12 @@ async fn main() -> Result<()> {
                         }
                         
                         // Update permissions
-                        {
-                            let handler = permission_handler.lock().unwrap();
-                            *handler.always_allow.lock().unwrap() = state.always_allow_tools.clone();
-                            *handler.always_deny.lock().unwrap() = state.always_deny_tools.clone();
-                            println!("{} Restored {} allowed and {} denied tools", 
-                                "✓".green(), 
-                                state.always_allow_tools.len(), 
-                                state.always_deny_tools.len());
-                        }
+                        permission_handler.set_always_allow(state.always_allow_tools.clone());
+                        permission_handler.set_always_deny(state.always_deny_tools.clone());
+                        println!("{} Restored {} allowed and {} denied tools", 
+                            "✓".green(), 
+                            state.always_allow_tools.len(), 
+                            state.always_deny_tools.len());
                         
                         // Display loaded conversation
                         for msg in &state.conversation_history {
