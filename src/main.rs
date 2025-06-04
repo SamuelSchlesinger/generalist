@@ -205,27 +205,27 @@ fn list_saved_conversations() -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment from ~/.chatbot.env
+    // Load environment from ~/.generalist.env
     let home_dir = env::home_dir().expect("Unable to determine home directory");
-    let env_path = home_dir.join(".chatbot.env");
+    let env_path = home_dir.join(".generalist.env");
     
     // Check if the file exists
     if !env_path.exists() {
-        eprintln!("{}", "Error: ~/.chatbot.env file not found".red());
+        eprintln!("{}", "Error: ~/.generalist.env file not found".red());
         eprintln!("Please create the file with your API key:");
-        eprintln!("  echo 'CLAUDE_API_KEY=your-api-key-here' > ~/.chatbot.env");
+        eprintln!("  echo 'CLAUDE_API_KEY=your-api-key-here' > ~/.generalist.env");
         std::process::exit(1);
     }
     
     // Load the env file
-    dotenv::from_path(&env_path).expect("Failed to load ~/.chatbot.env");
+    dotenv::from_path(&env_path).expect("Failed to load ~/.generalist.env");
 
     // Get API key
     let api_key = env::var("CLAUDE_API_KEY")
         .unwrap_or_else(|_| {
-            eprintln!("{}", "Error: CLAUDE_API_KEY not found in ~/.chatbot.env".red());
-            eprintln!("Please add your API key to ~/.chatbot.env:");
-            eprintln!("  echo 'CLAUDE_API_KEY=your-api-key-here' >> ~/.chatbot.env");
+            eprintln!("{}", "Error: CLAUDE_API_KEY not found in ~/.generalist.env".red());
+            eprintln!("Please add your API key to ~/.generalist.env:");
+            eprintln!("  echo 'CLAUDE_API_KEY=your-api-key-here' >> ~/.generalist.env");
             std::process::exit(1);
         });
     

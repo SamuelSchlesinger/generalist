@@ -1,16 +1,16 @@
-# Claude CLI Chatbot 🤖
+# Generalist 🤖
 
-A powerful command-line chatbot powered by Claude AI, with 17 built-in tools and a focus on safety and transparency.
+A powerful command-line generalist command-line agent powered by Claude AI, with 17 built-in tools and a focus on safety and transparency.
 
 ## Quick Start
 
-1. **Create your config file** `~/.chatbot.env`:
+1. **Create your config file** `~/.generalist.env`:
    ```bash
    CLAUDE_API_KEY=your-claude-api-key
    FIRECRAWL_API_KEY=your-firecrawl-api-key
    ```
 
-2. **Run the chatbot**:
+2. **Run the generalist**:
    ```bash
    cargo run
    ```
@@ -87,10 +87,10 @@ Your choices are remembered during the session.
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/chatbot.git
-cd chatbot
+git clone https://github.com/SamuelSchlesinger/generalist.git
+cd generalist
 cargo build --release
-./target/release/chatbot
+./target/release/generalist
 ```
 
 ### As a Library
@@ -129,6 +129,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Historical Inspiration
+
+This project draws inspiration from pioneering AI systems that established foundational problem-solving methodologies:
+
+- **General Problem Solver (GPS)** - Developed by Allen Newell and Herbert A. Simon (1957), GPS introduced means-ends analysis as a systematic approach to problem solving, breaking down complex problems by identifying differences between current and goal states.
+- **STRIPS** - The Stanford Research Institute Problem Solver (1971) advanced automated planning with operator-based state space search.
+- **SHRDLU** - Terry Winograd's natural language understanding system (1970) demonstrated sophisticated reasoning about goals and actions in constrained domains.
+
+The generalist agent architecture continues this tradition by implementing means-ends analysis with modern AI capabilities and a rich set of tools for real-world problem solving.
+
+### References
+
+- Newell, A., & Simon, H. A. (1972). *Human Problem Solving*. Prentice-Hall.
+- Fikes, R. E., & Nilsson, N. J. (1971). STRIPS: A new approach to the application of theorem proving to problem solving. *Artificial Intelligence*, 2(3-4), 189-208.
+- Winograd, T. (1972). *Understanding Natural Language*. Academic Press.
 
 ## Contributing
 
