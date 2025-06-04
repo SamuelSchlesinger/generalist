@@ -1,10 +1,10 @@
-use crate::tool::Tool;
 use crate::error::{Error, Result};
+use crate::tool::Tool;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,14 +97,14 @@ impl TodoTool {
 
         let content = fs::read_to_string(&path)
             .map_err(|e| Error::Other(format!("Failed to read todo file: {}", e)))?;
-        
+
         serde_json::from_str(&content)
             .map_err(|e| Error::Other(format!("Failed to parse todo file: {}", e)))
     }
 
     fn save_todos(todos: &TodoList) -> Result<()> {
         let path = Self::get_todo_file_path();
-        
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| Error::Other(format!("Failed to create directory: {}", e)))?;
@@ -112,7 +112,7 @@ impl TodoTool {
 
         let content = serde_json::to_string_pretty(todos)
             .map_err(|e| Error::Other(format!("Failed to serialize todos: {}", e)))?;
-        
+
         fs::write(&path, content)
             .map_err(|e| Error::Other(format!("Failed to write todo file: {}", e)))
     }
@@ -149,21 +149,21 @@ impl Tool for TodoTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "action": { 
-                    "type": "string", 
+                "action": {
+                    "type": "string",
                     "enum": ["add", "remove", "complete", "uncomplete", "list", "clear_completed"],
                     "description": "The action to perform on the todo list"
                 },
-                "title": { 
-                    "type": "string", 
+                "title": {
+                    "type": "string",
                     "description": "Title of the todo item (required for 'add' action)"
                 },
-                "id": { 
-                    "type": "string", 
+                "id": {
+                    "type": "string",
                     "description": "ID of the todo item (required for 'remove', 'complete', 'uncomplete' actions)"
                 },
-                "show_completed": { 
-                    "type": "boolean", 
+                "show_completed": {
+                    "type": "boolean",
                     "description": "Whether to show completed items (optional for 'list' action, default: false)"
                 }
             },
@@ -210,14 +210,19 @@ impl Tool for TodoTool {
             TodoAction::List { show_completed } => {
                 let show_completed = show_completed.unwrap_or(false);
                 let items = todos.list(show_completed);
-                
+
                 if items.is_empty() {
                     Ok("No todos found".to_string())
                 } else {
                     let mut output = String::new();
                     for todo in items {
                         let status = if todo.completed { "✓" } else { "○" };
-                        output.push_str(&format!("{} [{}] {}\n", status, &todo.id[0..8], todo.title));
+                        output.push_str(&format!(
+                            "{} [{}] {}\n",
+                            status,
+                            &todo.id[0..8],
+                            todo.title
+                        ));
                     }
                     Ok(output.trim_end().to_string())
                 }

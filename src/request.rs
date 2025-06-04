@@ -1,6 +1,6 @@
+use crate::message::{ContentBlock, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::message::{Message, ContentBlock};
 
 /// Tool definition for Claude to understand how to use a tool
 ///
@@ -122,10 +122,10 @@ pub struct MessageRequest {
 ///         _ => {}
 ///     }
 /// }
-/// 
+///
 /// // Check token usage
 /// if let Some(usage) = response.usage {
-///     println!("Tokens used: {} input, {} output", 
+///     println!("Tokens used: {} input, {} output",
 ///         usage.input_tokens, usage.output_tokens);
 /// }
 /// # }
@@ -198,7 +198,7 @@ impl Into<Message> for &MessageResponse {
 /// #     cache_read_input_tokens: None,
 /// # };
 /// println!("Total tokens used: {}", usage.input_tokens + usage.output_tokens);
-/// 
+///
 /// if let Some(cached) = usage.cache_read_input_tokens {
 ///     println!("Tokens read from cache: {}", cached);
 /// }

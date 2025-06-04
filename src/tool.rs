@@ -1,12 +1,14 @@
+use crate::error::{Error, Result};
+use crate::execution::{ExecutionState, ToolExecution};
+use crate::message::ContentBlock;
+use crate::permissions::{
+    AlwaysAllowPermissions, PermissionDecision, ToolExecutionRequest, ToolPermissionHandler,
+};
+use crate::request::ToolDef;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::error::{Error, Result};
-use crate::request::ToolDef;
-use crate::message::ContentBlock;
-use crate::permissions::{ToolPermissionHandler, PermissionDecision, ToolExecutionRequest, AlwaysAllowPermissions};
-use crate::execution::{ExecutionState, ToolExecution};
 
 /// Trait defining a tool that Claude can use during conversations
 ///
@@ -62,13 +64,13 @@ use crate::execution::{ExecutionState, ToolExecution};
 pub trait Tool: Send + Sync {
     /// Get the unique name of this tool
     fn name(&self) -> &str;
-    
+
     /// Get a human-readable description of what this tool does
     fn description(&self) -> &str;
-    
+
     /// Get the JSON schema defining the expected input format
     fn input_schema(&self) -> Value;
-    
+
     /// Execute the tool with the given input parameters
     ///
     /// # Arguments
@@ -79,7 +81,7 @@ pub trait Tool: Send + Sync {
     ///
     /// Returns a Result containing either the tool's output as a string or an error
     async fn execute(&self, input: Value) -> Result<String>;
-    
+
     /// Convert this tool to a ToolDef for use with the Claude API
     fn to_tool_def(&self) -> ToolDef {
         ToolDef {
@@ -113,13 +115,13 @@ pub trait Tool: Send + Sync {
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut registry = ToolRegistry::new();
-/// 
+///
 /// // Register a tool
 /// registry.register(Arc::new(MyTool))?;
-/// 
+///
 /// // Check available tools
 /// assert!(registry.has_tool("my_tool"));
-/// 
+///
 /// // Get tool definitions for Claude
 /// let tool_defs = registry.get_tool_defs();
 /// assert_eq!(tool_defs.len(), 1);
@@ -254,16 +256,15 @@ impl ToolRegistry {
         tool_use_id: String,
     ) -> Result<ContentBlock> {
         // Find the tool
-        let tool = self.tools.get(tool_name)
+        let tool = self
+            .tools
+            .get(tool_name)
             .ok_or_else(|| Error::Other(format!("Tool '{}' not found", tool_name)))?
             .clone();
 
         // Create execution record
-        let mut execution = ToolExecution::new(
-            tool_use_id.clone(),
-            tool_name.to_string(),
-            input.clone(),
-        );
+        let mut execution =
+            ToolExecution::new(tool_use_id.clone(), tool_name.to_string(), input.clone());
 
         // Check permissions
         let request = ToolExecutionRequest {
@@ -274,7 +275,7 @@ impl ToolRegistry {
         };
 
         let decision = self.permission_handler.check_permission(&request).await;
-        
+
         match decision {
             PermissionDecision::Allow => {
                 execution.state = ExecutionState::Executing;
@@ -284,7 +285,8 @@ impl ToolRegistry {
                 match tool.execute(input).await {
                     Ok(output) => {
                         // Update execution record
-                        if let Some(exec) = self.executions.iter_mut().find(|e| e.id == tool_use_id) {
+                        if let Some(exec) = self.executions.iter_mut().find(|e| e.id == tool_use_id)
+                        {
                             exec.complete(Ok(output.clone()));
                         }
 
@@ -296,9 +298,10 @@ impl ToolRegistry {
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
-                        
+
                         // Update execution record
-                        if let Some(exec) = self.executions.iter_mut().find(|e| e.id == tool_use_id) {
+                        if let Some(exec) = self.executions.iter_mut().find(|e| e.id == tool_use_id)
+                        {
                             exec.complete(Err(error_msg.clone()));
                         }
 
@@ -349,7 +352,7 @@ impl ToolRegistry {
     pub fn execution_stats(&self) -> HashMap<String, usize> {
         let mut stats = HashMap::new();
         stats.insert("total".to_string(), self.executions.len());
-        
+
         let mut completed = 0;
         let mut failed = 0;
         let mut denied = 0;

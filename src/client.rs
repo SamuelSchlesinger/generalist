@@ -1,10 +1,10 @@
+use crate::error::{Error, Result};
+use crate::message::{ContentBlock, Message};
+use crate::request::{MessageRequest, MessageResponse};
+use crate::tool::ToolRegistry;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
-use crate::error::{Error, Result};
-use crate::request::{MessageRequest, MessageResponse};
-use crate::message::{Message, ContentBlock};
-use crate::tool::ToolRegistry;
 
 /// API endpoint for the Claude Messages API
 pub const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -52,7 +52,7 @@ impl Claude {
     ///
     /// ```rust
     /// use claude::Claude;
-    /// 
+    ///
     /// let client = Claude::new(
     ///     "your-api-key".to_string(),
     ///     "claude-3-haiku-20240307".to_string()
@@ -65,12 +65,12 @@ impl Claude {
             model,
         }
     }
-    
+
     /// Get the model name for this client
     pub fn model(&self) -> &str {
         &self.model
     }
-    
+
     /// Send a message to the Claude API
     ///
     /// Makes a direct request to the Anthropic Messages API using the provided MessageRequest.
@@ -97,12 +97,12 @@ impl Claude {
     /// ```rust
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// use claude::{Claude, MessageRequest, Message, ContentBlock};
-    /// 
+    ///
     /// let client = Claude::new(
     ///     "your-api-key".to_string(),
     ///     "claude-3-haiku-20240307".to_string()
     /// );
-    /// 
+    ///
     /// let request = MessageRequest {
     ///     model: client.model().to_string(),
     ///     messages: vec![
@@ -115,7 +115,7 @@ impl Claude {
     ///     system: None,
     ///     temperature: None,
     /// };
-    /// 
+    ///
     /// let response = client.next_message(request).await?;
     /// # Ok(())
     /// # }
@@ -132,18 +132,13 @@ impl Claude {
         );
 
         // 2. content-type
-        headers.insert(
-            "content-type",
-            HeaderValue::from_static("application/json"),
-        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
 
         // 3. anthropic-version
-        headers.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
-        let response = self.client
+        let response = self
+            .client
             .post(MESSAGES_ENDPOINT)
             .headers(headers)
             .json(&request)
@@ -152,21 +147,31 @@ impl Claude {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            
+            let text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+
             // Try to parse error details from response
             if let Ok(error_json) = serde_json::from_str::<Value>(&text) {
-                if let Some(error_msg) = error_json.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
-                    return Err(Error::Response(error_msg.to_string(), Some(status.as_u16())));
+                if let Some(error_msg) = error_json
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    return Err(Error::Response(
+                        error_msg.to_string(),
+                        Some(status.as_u16()),
+                    ));
                 }
             }
-            
+
             return Err(Error::Response(text, Some(status.as_u16())));
         }
 
         let response_text = response.text().await?;
         let message_response: MessageResponse = serde_json::from_str(&response_text)?;
-        
+
         Ok(message_response)
     }
 
@@ -229,18 +234,18 @@ impl Claude {
     ) -> Result<String> {
         let max_iterations = max_iterations.unwrap_or(10);
         let mut messages = conversation_history.unwrap_or_default();
-        
+
         // Add the user's message
-        messages.push(Message::user(vec![
-            ContentBlock::Text { text: user_message.to_string() }
-        ]));
+        messages.push(Message::user(vec![ContentBlock::Text {
+            text: user_message.to_string(),
+        }]));
 
         let mut iteration = 0;
-        
+
         loop {
             if iteration >= max_iterations {
                 return Err(Error::Other(format!(
-                    "Maximum iterations ({}) reached without completion", 
+                    "Maximum iterations ({}) reached without completion",
                     max_iterations
                 )));
             }
@@ -257,12 +262,14 @@ impl Claude {
 
             // Get Claude's response
             let response = self.next_message(request).await?;
-            
+
             // Add Claude's response to conversation history
             messages.push((&response).into());
 
             // Check if Claude wants to use any tools
-            let tool_uses = response.content.iter()
+            let tool_uses = response
+                .content
+                .iter()
                 .filter_map(|block| match block {
                     ContentBlock::ToolUse { name, input, id } => {
                         Some((name.clone(), input.clone(), id.clone()))
@@ -274,27 +281,31 @@ impl Claude {
             // If no tool uses, return the response
             if tool_uses.is_empty() {
                 // Extract text content from response
-                let text_content = response.content.iter()
+                let text_content = response
+                    .content
+                    .iter()
                     .filter_map(|block| match block {
                         ContentBlock::Text { text } => Some(text.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                
+
                 return Ok(text_content);
             }
 
             // Execute tools and collect results
             let mut tool_results = Vec::new();
             for (tool_name, input, tool_use_id) in tool_uses {
-                let result = tool_registry.execute_tool(&tool_name, input, tool_use_id).await?;
+                let result = tool_registry
+                    .execute_tool(&tool_name, input, tool_use_id)
+                    .await?;
                 tool_results.push(result);
             }
 
             // Add tool results to conversation
             messages.push(Message::user(tool_results));
-            
+
             iteration += 1;
         }
     }
@@ -316,28 +327,30 @@ impl Claude {
     /// ```
     pub fn conversation_stats(&self, messages: &[Message]) -> HashMap<String, usize> {
         let mut stats = HashMap::new();
-        
+
         stats.insert("total_messages".to_string(), messages.len());
-        
+
         let user_messages = messages.iter().filter(|m| m.role == "user").count();
         let assistant_messages = messages.iter().filter(|m| m.role == "assistant").count();
-        
+
         stats.insert("user_messages".to_string(), user_messages);
         stats.insert("assistant_messages".to_string(), assistant_messages);
-        
-        let tool_uses = messages.iter()
+
+        let tool_uses = messages
+            .iter()
             .flat_map(|m| &m.content)
             .filter(|block| matches!(block, ContentBlock::ToolUse { .. }))
             .count();
-        
-        let tool_results = messages.iter()
+
+        let tool_results = messages
+            .iter()
             .flat_map(|m| &m.content)
             .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
             .count();
-        
+
         stats.insert("tool_uses".to_string(), tool_uses);
         stats.insert("tool_results".to_string(), tool_results);
-        
+
         stats
     }
 }

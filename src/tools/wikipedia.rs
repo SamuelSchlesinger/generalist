@@ -1,4 +1,4 @@
-use crate::{Tool, Result, Error};
+use crate::{Error, Result, Tool};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,11 +36,11 @@ impl Tool for WikipediaTool {
     fn name(&self) -> &str {
         "wikipedia"
     }
-    
+
     fn description(&self) -> &str {
         "Search Wikipedia articles and get article summaries. Supports multiple languages and can either search for articles or get detailed summaries of specific pages."
     }
-    
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -69,40 +69,43 @@ impl Tool for WikipediaTool {
             "additionalProperties": false
         })
     }
-    
+
     async fn execute(&self, input: Value) -> Result<String> {
         let params: WikipediaInput = serde_json::from_value(input)
             .map_err(|e| Error::Other(format!(
                 "Invalid input parameters: {}. Example: {{\"query\": \"artificial intelligence\", \"action\": \"search\"}}", e
             )))?;
-        
+
         let action = params.action.as_deref().unwrap_or("search");
         let language = params.language.as_deref().unwrap_or("en");
         let limit = params.limit.unwrap_or(5).min(20).max(1);
-        
+
         // Validate language code (basic validation)
         if language.len() != 2 || !language.chars().all(|c| c.is_ascii_lowercase()) {
             return Err(Error::Other(
-                "Language code must be a 2-letter lowercase code (e.g., 'en', 'es', 'fr')".to_string()
+                "Language code must be a 2-letter lowercase code (e.g., 'en', 'es', 'fr')"
+                    .to_string(),
             ));
         }
-        
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("Claude-RS-Bot/1.0 (https://github.com/anthropics/claude-rs)")
             .build()
             .map_err(|e| Error::Other(format!("Failed to create HTTP client: {}", e)))?;
-        
+
         match action {
             "search" => {
-                self.search_wikipedia(&client, &params.query, language, limit).await
+                self.search_wikipedia(&client, &params.query, language, limit)
+                    .await
             }
             "summary" => {
-                self.get_wikipedia_summary(&client, &params.query, language).await
+                self.get_wikipedia_summary(&client, &params.query, language)
+                    .await
             }
             _ => Err(Error::Other(
-                "Invalid action. Supported actions: 'search', 'summary'".to_string()
-            ))
+                "Invalid action. Supported actions: 'search', 'summary'".to_string(),
+            )),
         }
     }
 }
@@ -115,11 +118,8 @@ impl WikipediaTool {
         language: &str,
         limit: u32,
     ) -> Result<String> {
-        let url = format!(
-            "https://{}.wikipedia.org/w/api.php",
-            language
-        );
-        
+        let url = format!("https://{}.wikipedia.org/w/api.php", language);
+
         let limit_str = limit.to_string();
         let mut params = HashMap::new();
         params.insert("action", "query");
@@ -128,45 +128,50 @@ impl WikipediaTool {
         params.insert("srsearch", query);
         params.insert("srlimit", &limit_str);
         params.insert("srprop", "snippet|wordcount");
-        
+
         let response = client
             .get(&url)
             .query(&params)
             .send()
             .await
             .map_err(|e| Error::Other(format!("Wikipedia API request failed: {}", e)))?;
-        
+
         if !response.status().is_success() {
             return Err(Error::Other(format!(
-                "Wikipedia API returned status: {}", response.status()
+                "Wikipedia API returned status: {}",
+                response.status()
             )));
         }
-        
-        let response_text = response.text().await
+
+        let response_text = response
+            .text()
+            .await
             .map_err(|e| Error::Other(format!("Failed to read Wikipedia response: {}", e)))?;
-        
+
         let json_response: Value = serde_json::from_str(&response_text)
             .map_err(|e| Error::Other(format!("Failed to parse Wikipedia response: {}", e)))?;
-        
+
         let search_results = json_response["query"]["search"]
             .as_array()
             .ok_or_else(|| Error::Other("Invalid Wikipedia search response format".to_string()))?;
-        
+
         let mut results = Vec::new();
         for result in search_results {
             let title = result["title"].as_str().unwrap_or("").to_string();
-            let snippet = result["snippet"].as_str().unwrap_or("")
+            let snippet = result["snippet"]
+                .as_str()
+                .unwrap_or("")
                 .replace("<span class=\"searchmatch\">", "")
                 .replace("</span>", "");
             let wordcount = result["wordcount"].as_u64().map(|w| w as u32);
-            
+
             results.push(WikipediaSearchResult {
                 title,
                 snippet,
                 wordcount,
             });
         }
-        
+
         let wiki_response = WikipediaResponse {
             action: "search".to_string(),
             query: query.to_string(),
@@ -174,22 +179,19 @@ impl WikipediaTool {
             results,
             summary: None,
         };
-        
+
         serde_json::to_string_pretty(&wiki_response)
             .map_err(|e| Error::Other(format!("Failed to serialize response: {}", e)))
     }
-    
+
     async fn get_wikipedia_summary(
         &self,
         client: &reqwest::Client,
         title: &str,
         language: &str,
     ) -> Result<String> {
-        let url = format!(
-            "https://{}.wikipedia.org/w/api.php",
-            language
-        );
-        
+        let url = format!("https://{}.wikipedia.org/w/api.php", language);
+
         let mut params = HashMap::new();
         params.insert("action", "query");
         params.insert("format", "json");
@@ -199,49 +201,58 @@ impl WikipediaTool {
         params.insert("exsectionformat", "plain");
         params.insert("titles", title);
         params.insert("redirects", "true");
-        
+
         let response = client
             .get(&url)
             .query(&params)
             .send()
             .await
             .map_err(|e| Error::Other(format!("Wikipedia API request failed: {}", e)))?;
-        
+
         if !response.status().is_success() {
             return Err(Error::Other(format!(
-                "Wikipedia API returned status: {}", response.status()
+                "Wikipedia API returned status: {}",
+                response.status()
             )));
         }
-        
-        let response_text = response.text().await
+
+        let response_text = response
+            .text()
+            .await
             .map_err(|e| Error::Other(format!("Failed to read Wikipedia response: {}", e)))?;
-        
+
         let json_response: Value = serde_json::from_str(&response_text)
             .map_err(|e| Error::Other(format!("Failed to parse Wikipedia response: {}", e)))?;
-        
+
         let pages = json_response["query"]["pages"]
             .as_object()
             .ok_or_else(|| Error::Other("Invalid Wikipedia summary response format".to_string()))?;
-        
-        let page = pages.values().next()
+
+        let page = pages
+            .values()
+            .next()
             .ok_or_else(|| Error::Other("No page found in Wikipedia response".to_string()))?;
-        
+
         if page["missing"].is_boolean() {
-            return Err(Error::Other(format!("Wikipedia page '{}' not found", title)));
+            return Err(Error::Other(format!(
+                "Wikipedia page '{}' not found",
+                title
+            )));
         }
-        
-        let extract = page["extract"].as_str()
+
+        let extract = page["extract"]
+            .as_str()
             .ok_or_else(|| Error::Other("No extract found in Wikipedia response".to_string()))?;
-        
+
         let actual_title = page["title"].as_str().unwrap_or(title);
-        
+
         // Limit summary length to prevent overly long responses
         let summary = if extract.len() > 2000 {
             format!("{}...", &extract[..2000])
         } else {
             extract.to_string()
         };
-        
+
         let wiki_response = WikipediaResponse {
             action: "summary".to_string(),
             query: title.to_string(),
@@ -253,7 +264,7 @@ impl WikipediaTool {
             }],
             summary: Some(summary),
         };
-        
+
         serde_json::to_string_pretty(&wiki_response)
             .map_err(|e| Error::Other(format!("Failed to serialize response: {}", e)))
     }

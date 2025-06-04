@@ -1,16 +1,16 @@
-use crate::{Tool, Result, Error};
+use crate::{Error, Result, Tool};
 use async_trait::async_trait;
+use firecrawl::scrape::{JsonOptions, ScrapeFormats, ScrapeOptions};
+use firecrawl::FirecrawlApp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use firecrawl::FirecrawlApp;
-use firecrawl::scrape::{ScrapeOptions, ScrapeFormats, JsonOptions};
 
 /// Firecrawl Extract Tool - Extracts structured content from web pages
-/// 
+///
 /// This tool supports AI-powered structured data extraction using JSON schemas.
 /// When an `extract_schema` is provided, Firecrawl will use an LLM to extract
 /// data matching the schema from the page content.
-/// 
+///
 /// Example extract_schema:
 /// ```json
 /// {
@@ -45,7 +45,6 @@ pub struct FirecrawlExtractInput {
     extract_schema: Option<Value>,
 }
 
-
 #[derive(Debug, Serialize)]
 pub struct FirecrawlExtractResponse {
     success: bool,
@@ -79,11 +78,11 @@ impl Tool for FirecrawlExtractTool {
     fn name(&self) -> &str {
         "firecrawl_extract"
     }
-    
+
     fn description(&self) -> &str {
         "Extract clean, structured content from web pages using Firecrawl API - handles JavaScript rendering, removes ads/popups, and can extract data according to custom schemas. Supports multiple output formats including AI-powered structured data extraction using JSON schemas."
     }
-    
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -132,19 +131,20 @@ impl Tool for FirecrawlExtractTool {
             "additionalProperties": false
         })
     }
-    
+
     async fn execute(&self, input: Value) -> Result<String> {
         let params: FirecrawlExtractInput = serde_json::from_value(input)
             .map_err(|e| Error::Other(format!("Invalid input parameters: {}", e)))?;
-        
-        let api_key = std::env::var("FIRECRAWL_API_KEY")
-            .map_err(|_| Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string()))?;
-        
+
+        let api_key = std::env::var("FIRECRAWL_API_KEY").map_err(|_| {
+            Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string())
+        })?;
+
         let firecrawl = FirecrawlApp::new(&api_key)
             .map_err(|e| Error::Other(format!("Failed to initialize Firecrawl: {:?}", e)))?;
-        
+
         let mut scrape_options = ScrapeOptions::default();
-        
+
         if let Some(formats) = params.formats {
             let mut scrape_formats = Vec::new();
             for format in formats {
@@ -162,31 +162,31 @@ impl Tool for FirecrawlExtractTool {
                 scrape_options.formats = Some(scrape_formats);
             }
         }
-        
+
         if let Some(only_main) = params.only_main_content {
             scrape_options.only_main_content = Some(only_main);
         }
-        
+
         if let Some(include) = params.include_tags {
             scrape_options.include_tags = Some(include);
         }
-        
+
         if let Some(exclude) = params.exclude_tags {
             scrape_options.exclude_tags = Some(exclude);
         }
-        
+
         if let Some(headers) = params.headers {
             scrape_options.headers = Some(headers);
         }
-        
+
         if let Some(wait_for) = params.wait_for {
             scrape_options.wait_for = Some(wait_for);
         }
-        
+
         if let Some(timeout) = params.timeout {
             scrape_options.timeout = Some(timeout);
         }
-        
+
         // Handle extract_schema for structured data extraction
         if let Some(schema) = params.extract_schema {
             // Add Json format to enable LLM extraction
@@ -195,7 +195,7 @@ impl Tool for FirecrawlExtractTool {
                 formats.push(ScrapeFormats::Json);
             }
             scrape_options.formats = Some(formats);
-            
+
             // Set up JSON extraction options
             let json_options = JsonOptions {
                 schema: Some(schema),
@@ -205,8 +205,11 @@ impl Tool for FirecrawlExtractTool {
             };
             scrape_options.json_options = Some(json_options);
         }
-        
-        match firecrawl.scrape_url(&params.url, Some(scrape_options)).await {
+
+        match firecrawl
+            .scrape_url(&params.url, Some(scrape_options))
+            .await
+        {
             Ok(scrape_result) => {
                 let metadata = Some(&scrape_result.metadata);
                 let metadata = if let Some(meta) = metadata {
@@ -224,9 +227,9 @@ impl Tool for FirecrawlExtractTool {
                 } else {
                     None
                 };
-                
+
                 let images = None;
-                
+
                 let response = FirecrawlExtractResponse {
                     success: true,
                     url: params.url,
@@ -240,7 +243,7 @@ impl Tool for FirecrawlExtractTool {
                     metadata,
                     error: None,
                 };
-                
+
                 serde_json::to_string_pretty(&response)
                     .map_err(|e| Error::Other(format!("Failed to serialize response: {}", e)))
             }
@@ -258,7 +261,7 @@ impl Tool for FirecrawlExtractTool {
                     metadata: None,
                     error: Some(format!("Extract failed: {:?}", e)),
                 };
-                
+
                 serde_json::to_string_pretty(&response)
                     .map_err(|e| Error::Other(format!("Failed to serialize error response: {}", e)))
             }

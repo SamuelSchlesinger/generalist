@@ -97,21 +97,19 @@ impl ToolExecution {
             duration_ms: None,
         }
     }
-    
+
     /// Mark the execution as executing
     pub fn start(&mut self) {
         self.state = ExecutionState::Executing;
         self.started_at = Utc::now();
     }
-    
+
     /// Mark the execution as completed with a result
     pub fn complete(&mut self, result: Result<String, String>) {
         self.completed_at = Some(Utc::now());
-        self.duration_ms = Some(
-            (self.completed_at.unwrap() - self.started_at)
-                .num_milliseconds() as u64
-        );
-        
+        self.duration_ms =
+            Some((self.completed_at.unwrap() - self.started_at).num_milliseconds() as u64);
+
         match result {
             Ok(output) => {
                 self.state = ExecutionState::Completed { result: output };
@@ -121,27 +119,27 @@ impl ToolExecution {
             }
         }
     }
-    
+
     /// Mark the execution as denied
     pub fn deny(&mut self, reason: &str) {
-        self.state = ExecutionState::Denied { reason: reason.to_string() };
+        self.state = ExecutionState::Denied {
+            reason: reason.to_string(),
+        };
         self.completed_at = Some(Utc::now());
-        self.duration_ms = Some(
-            (self.completed_at.unwrap() - self.started_at)
-                .num_milliseconds() as u64
-        );
+        self.duration_ms =
+            Some((self.completed_at.unwrap() - self.started_at).num_milliseconds() as u64);
     }
-    
+
     /// Check if the execution is finished (completed, failed, or denied)
     pub fn is_finished(&self) -> bool {
         matches!(
-            self.state, 
-            ExecutionState::Completed { .. } | 
-            ExecutionState::Failed { .. } | 
-            ExecutionState::Denied { .. }
+            self.state,
+            ExecutionState::Completed { .. }
+                | ExecutionState::Failed { .. }
+                | ExecutionState::Denied { .. }
         )
     }
-    
+
     /// Get the result if execution completed successfully
     pub fn result(&self) -> Option<&str> {
         match &self.state {
@@ -149,7 +147,7 @@ impl ToolExecution {
             _ => None,
         }
     }
-    
+
     /// Get the error if execution failed
     pub fn error(&self) -> Option<&str> {
         match &self.state {

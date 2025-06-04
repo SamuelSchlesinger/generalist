@@ -1,9 +1,9 @@
 use async_trait::async_trait;
+use colored::*;
+use dialoguer::{theme::ColorfulTheme, Select};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use dialoguer::{theme::ColorfulTheme, Select};
-use colored::*;
 
 /// Decision on whether to allow a tool execution
 ///
@@ -196,8 +196,9 @@ pub struct LoggingPermissions;
 #[async_trait]
 impl ToolPermissionHandler for LoggingPermissions {
     async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision {
-        eprintln!("[TOOL PERMISSION] Allowing tool '{}' with input: {}", 
-            request.tool_name, 
+        eprintln!(
+            "[TOOL PERMISSION] Allowing tool '{}' with input: {}",
+            request.tool_name,
             serde_json::to_string_pretty(&request.input).unwrap_or_default()
         );
         PermissionDecision::Allow
@@ -294,9 +295,10 @@ impl ToolPermissionHandler for PolicyPermissions {
         } else if self.default_allow {
             PermissionDecision::Allow
         } else {
-            PermissionDecision::DenyWithReason(
-                format!("Tool '{}' is not in the allowed tools list", request.tool_name)
-            )
+            PermissionDecision::DenyWithReason(format!(
+                "Tool '{}' is not in the allowed tools list",
+                request.tool_name
+            ))
         }
     }
 }
@@ -304,7 +306,7 @@ impl ToolPermissionHandler for PolicyPermissions {
 /// Format a diff for pretty display
 fn format_diff_for_display(diff: &str) -> String {
     let mut formatted = String::new();
-    
+
     for line in diff.lines() {
         if line.starts_with("+++") || line.starts_with("---") {
             // File headers
@@ -326,7 +328,7 @@ fn format_diff_for_display(diff: &str) -> String {
             formatted.push_str(&format!("{}\n", line));
         }
     }
-    
+
     formatted
 }
 
@@ -343,7 +345,7 @@ impl MemoryPermissionHandler {
             always_deny: Arc::new(Mutex::new(HashSet::new())),
         }
     }
-    
+
     /// Create a new handler that shares state with an existing one
     pub fn with_shared_state(
         always_allow: Arc<Mutex<HashSet<String>>>,
@@ -354,22 +356,22 @@ impl MemoryPermissionHandler {
             always_deny,
         }
     }
-    
+
     /// Get the always_allow set for state management
     pub fn always_allow(&self) -> Arc<Mutex<HashSet<String>>> {
         Arc::clone(&self.always_allow)
     }
-    
+
     /// Get the always_deny set for state management
     pub fn always_deny(&self) -> Arc<Mutex<HashSet<String>>> {
         Arc::clone(&self.always_deny)
     }
-    
+
     /// Update the always_allow set
     pub fn set_always_allow(&self, tools: HashSet<String>) {
         *self.always_allow.lock().unwrap() = tools;
     }
-    
+
     /// Update the always_deny set
     pub fn set_always_deny(&self, tools: HashSet<String>) {
         *self.always_deny.lock().unwrap() = tools;
@@ -383,29 +385,35 @@ impl ToolPermissionHandler for MemoryPermissionHandler {
         {
             let always_allow = self.always_allow.lock().unwrap();
             if always_allow.contains(&request.tool_name) {
-                eprintln!("{} Automatically allowing '{}' (previously set to always allow)", 
-                    "✓".green(), request.tool_name.cyan());
+                eprintln!(
+                    "{} Automatically allowing '{}' (previously set to always allow)",
+                    "✓".green(),
+                    request.tool_name.cyan()
+                );
                 return PermissionDecision::Allow;
             }
         }
-        
+
         {
             let always_deny = self.always_deny.lock().unwrap();
             if always_deny.contains(&request.tool_name) {
-                eprintln!("{} Automatically denying '{}' (previously set to never allow)", 
-                    "✗".red(), request.tool_name.cyan());
+                eprintln!(
+                    "{} Automatically denying '{}' (previously set to never allow)",
+                    "✗".red(),
+                    request.tool_name.cyan()
+                );
                 return PermissionDecision::DenyWithReason(
-                    "Tool was previously set to never allow".to_string()
+                    "Tool was previously set to never allow".to_string(),
                 );
             }
         }
-        
+
         // No remembered decision, prompt the user
         println!("\n{}", "⚠️  Tool Permission Request".yellow().bold());
         println!("{}", "─".repeat(50).dimmed());
         println!("Tool: {}", request.tool_name.cyan().bold());
         println!("Description: {}", request.tool_description.dimmed());
-        
+
         // Special formatting for patch_file tool
         if request.tool_name == "patch_file" {
             if let Some(path) = request.input.get("path").and_then(|v| v.as_str()) {
@@ -417,61 +425,73 @@ impl ToolPermissionHandler for MemoryPermissionHandler {
                 print!("{}", format_diff_for_display(diff));
                 println!("{}", "─".repeat(50).dimmed());
             } else {
-                println!("Input: {}", 
+                println!(
+                    "Input: {}",
                     serde_json::to_string_pretty(&request.input)
                         .unwrap_or_default()
                         .dimmed()
                 );
             }
         } else {
-            println!("Input: {}", 
+            println!(
+                "Input: {}",
                 serde_json::to_string_pretty(&request.input)
                     .unwrap_or_default()
                     .dimmed()
             );
         }
         println!();
-        
+
         let choices = vec![
             "Yes (always allow this tool)",
             "Yes (just this once)",
             "No (never allow this tool)",
             "No (just this once)",
         ];
-        
+
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Allow this tool to execute?")
             .items(&choices)
             .default(1) // Default to "Yes (just this once)"
             .interact()
             .unwrap();
-        
+
         match selection {
-            0 => { // Yes (always)
+            0 => {
+                // Yes (always)
                 let mut always_allow = self.always_allow.lock().unwrap();
                 always_allow.insert(request.tool_name.clone());
-                println!("{} Tool '{}' will be automatically allowed in the future", 
-                    "✓".green(), request.tool_name.cyan());
+                println!(
+                    "{} Tool '{}' will be automatically allowed in the future",
+                    "✓".green(),
+                    request.tool_name.cyan()
+                );
                 PermissionDecision::Allow
             }
-            1 => { // Yes (once)
+            1 => {
+                // Yes (once)
                 PermissionDecision::Allow
             }
-            2 => { // No (never)
+            2 => {
+                // No (never)
                 let mut always_deny = self.always_deny.lock().unwrap();
                 always_deny.insert(request.tool_name.clone());
-                println!("{} Tool '{}' will be automatically denied in the future", 
-                    "✗".red(), request.tool_name.cyan());
+                println!(
+                    "{} Tool '{}' will be automatically denied in the future",
+                    "✗".red(),
+                    request.tool_name.cyan()
+                );
                 PermissionDecision::DenyWithReason(
-                    "User chose to never allow this tool".to_string()
+                    "User chose to never allow this tool".to_string(),
                 )
             }
-            3 => { // No (once)
+            3 => {
+                // No (once)
                 PermissionDecision::DenyWithReason(
-                    "User denied permission for this execution".to_string()
+                    "User denied permission for this execution".to_string(),
                 )
             }
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
 }

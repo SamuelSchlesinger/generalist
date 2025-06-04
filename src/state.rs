@@ -1,6 +1,6 @@
-use serde::{Serialize, Deserialize};
-use std::collections::HashSet;
 use crate::Message;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatbotState {
@@ -23,7 +23,7 @@ impl ChatbotState {
             max_result_length: 200,
         }
     }
-    
+
     pub fn from_conversation(conversation: Vec<Message>, model: String) -> Self {
         Self {
             conversation_history: conversation,

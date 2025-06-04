@@ -1,9 +1,9 @@
-use crate::{Tool, Result, Error};
+use crate::{Error, Result, Tool};
 use async_trait::async_trait;
+use firecrawl::crawl::{CrawlOptions, CrawlScrapeOptions};
+use firecrawl::FirecrawlApp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use firecrawl::FirecrawlApp;
-use firecrawl::crawl::{CrawlOptions, CrawlScrapeOptions};
 
 pub struct FirecrawlCrawlTool;
 
@@ -46,11 +46,11 @@ impl Tool for FirecrawlCrawlTool {
     fn name(&self) -> &str {
         "firecrawl_crawl"
     }
-    
+
     fn description(&self) -> &str {
         "Crawl websites using Firecrawl API - a powerful web scraping service that handles JavaScript rendering, anti-bot measures, and content extraction. Can crawl entire websites or specific sections based on URL patterns."
     }
-    
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -102,61 +102,63 @@ impl Tool for FirecrawlCrawlTool {
             "additionalProperties": false
         })
     }
-    
+
     async fn execute(&self, input: Value) -> Result<String> {
         let params: FirecrawlCrawlInput = serde_json::from_value(input)
             .map_err(|e| Error::Other(format!("Invalid input parameters: {}", e)))?;
-        
-        let api_key = std::env::var("FIRECRAWL_API_KEY")
-            .map_err(|_| Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string()))?;
-        
+
+        let api_key = std::env::var("FIRECRAWL_API_KEY").map_err(|_| {
+            Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string())
+        })?;
+
         let firecrawl = FirecrawlApp::new(&api_key)
             .map_err(|e| Error::Other(format!("Failed to initialize Firecrawl: {:?}", e)))?;
-        
+
         let mut scrape_options = CrawlScrapeOptions::default();
-        
+
         if let Some(headers) = params.headers {
             scrape_options.headers = Some(headers);
         }
-        
+
         if let Some(wait_for) = params.wait_for {
             scrape_options.wait_for = Some(wait_for);
         }
-        
+
         if let Some(timeout) = params.timeout {
             scrape_options.timeout = Some(timeout);
         }
-        
+
         let mut crawl_options = CrawlOptions::default();
         crawl_options.scrape_options = Some(scrape_options);
-        
+
         if let Some(max_depth) = params.max_depth {
             crawl_options.max_depth = Some(max_depth);
         }
-        
+
         if let Some(limit) = params.limit {
             crawl_options.limit = Some(limit);
         }
-        
+
         if let Some(exclude) = params.exclude_patterns {
             crawl_options.exclude_paths = Some(exclude);
         }
-        
+
         if let Some(include) = params.include_patterns {
             crawl_options.include_paths = Some(include);
         }
-        
+
         if let Some(allow_backward) = params.allow_backward_links {
             crawl_options.allow_backward_links = Some(allow_backward);
         }
-        
+
         if let Some(allow_external) = params.allow_external_links {
             crawl_options.allow_external_links = Some(allow_external);
         }
-        
+
         match firecrawl.crawl_url(&params.url, Some(crawl_options)).await {
             Ok(crawl_result) => {
-                let pages: Vec<CrawledPage> = crawl_result.data
+                let pages: Vec<CrawledPage> = crawl_result
+                    .data
                     .into_iter()
                     .enumerate()
                     .map(|(i, doc)| CrawledPage {
@@ -169,7 +171,7 @@ impl Tool for FirecrawlCrawlTool {
                         metadata: Some(serde_json::to_value(&doc.metadata).unwrap_or(Value::Null)),
                     })
                     .collect();
-                
+
                 let response = FirecrawlCrawlResponse {
                     success: true,
                     total_pages: crawl_result.total as usize,
@@ -177,7 +179,7 @@ impl Tool for FirecrawlCrawlTool {
                     pages,
                     error: None,
                 };
-                
+
                 serde_json::to_string_pretty(&response)
                     .map_err(|e| Error::Other(format!("Failed to serialize response: {}", e)))
             }
@@ -189,7 +191,7 @@ impl Tool for FirecrawlCrawlTool {
                     pages: vec![],
                     error: Some(format!("Crawl failed: {:?}", e)),
                 };
-                
+
                 serde_json::to_string_pretty(&response)
                     .map_err(|e| Error::Other(format!("Failed to serialize error response: {}", e)))
             }

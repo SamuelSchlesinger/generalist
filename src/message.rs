@@ -1,6 +1,6 @@
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::error::{Error, Result};
 
 /// Message representation for Claude API interactions
 ///
@@ -99,7 +99,9 @@ impl Message {
     /// assert!(msg.has_tool_use());
     /// ```
     pub fn has_tool_use(&self) -> bool {
-        self.content.iter().any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        self.content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
     }
 
     /// Extract all tool use requests from this message
@@ -230,7 +232,9 @@ impl Into<ContentBlock> for &str {
     /// }
     /// ```
     fn into(self) -> ContentBlock {
-        ContentBlock::Text { text: self.to_string() }
+        ContentBlock::Text {
+            text: self.to_string(),
+        }
     }
 }
 

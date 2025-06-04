@@ -1,9 +1,9 @@
-use crate::{Tool, Result, Error};
+use crate::{Error, Result, Tool};
 use async_trait::async_trait;
+use firecrawl::search::SearchParams;
+use firecrawl::FirecrawlApp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use firecrawl::FirecrawlApp;
-use firecrawl::search::SearchParams;
 
 pub struct FirecrawlSearchTool;
 
@@ -39,11 +39,11 @@ impl Tool for FirecrawlSearchTool {
     fn name(&self) -> &str {
         "firecrawl_search"
     }
-    
+
     fn description(&self) -> &str {
         "Search the web using Firecrawl API - a powerful web scraping service that searches and extracts clean, structured content from web pages. Unlike basic search, this returns the actual page content."
     }
-    
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -81,17 +81,18 @@ impl Tool for FirecrawlSearchTool {
             "additionalProperties": false
         })
     }
-    
+
     async fn execute(&self, input: Value) -> Result<String> {
         let params: FirecrawlSearchInput = serde_json::from_value(input)
             .map_err(|e| Error::Other(format!("Invalid input parameters: {}", e)))?;
-        
-        let api_key = std::env::var("FIRECRAWL_API_KEY")
-            .map_err(|_| Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string()))?;
-        
+
+        let api_key = std::env::var("FIRECRAWL_API_KEY").map_err(|_| {
+            Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string())
+        })?;
+
         let firecrawl = FirecrawlApp::new(&api_key)
             .map_err(|e| Error::Other(format!("Failed to initialize Firecrawl: {:?}", e)))?;
-        
+
         let search_params = SearchParams {
             query: params.query.clone(),
             limit: params.limit,
@@ -104,11 +105,11 @@ impl Tool for FirecrawlSearchTool {
             timeout: Some(60000),
             scrape_options: None,
         };
-        
-        
+
         match firecrawl.search_with_params(search_params).await {
             Ok(search_result) => {
-                let results: Vec<SearchResult> = search_result.data
+                let results: Vec<SearchResult> = search_result
+                    .data
                     .into_iter()
                     .map(|doc| SearchResult {
                         title: doc.title,
@@ -116,7 +117,7 @@ impl Tool for FirecrawlSearchTool {
                         description: doc.description,
                     })
                     .collect();
-                
+
                 let response = FirecrawlSearchResponse {
                     success: true,
                     query: params.query,
@@ -124,7 +125,7 @@ impl Tool for FirecrawlSearchTool {
                     results,
                     error: None,
                 };
-                
+
                 serde_json::to_string_pretty(&response)
                     .map_err(|e| Error::Other(format!("Failed to serialize response: {}", e)))
             }
@@ -136,7 +137,7 @@ impl Tool for FirecrawlSearchTool {
                     results: vec![],
                     error: Some(format!("Search failed: {:?}", e)),
                 };
-                
+
                 serde_json::to_string_pretty(&response)
                     .map_err(|e| Error::Other(format!("Failed to serialize error response: {}", e)))
             }

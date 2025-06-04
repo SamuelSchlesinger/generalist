@@ -61,25 +61,25 @@ let response = client.run_conversation_turn(
 // Re-export main types from submodules
 pub use client::{Claude, MESSAGES_ENDPOINT};
 pub use error::{Error, Result};
-pub use message::{Message, ContentBlock, ToolUse};
-pub use request::{MessageRequest, MessageResponse, ToolDef, Usage};
-pub use tool::{Tool, ToolRegistry};
-pub use permissions::{
-    ToolPermissionHandler, PermissionDecision, ToolExecutionRequest,
-    AlwaysAllowPermissions, AlwaysDenyPermissions, LoggingPermissions,
-    InteractivePermissions, PolicyPermissions, MemoryPermissionHandler
-};
 pub use execution::{ExecutionState, ToolExecution};
+pub use message::{ContentBlock, Message, ToolUse};
+pub use permissions::{
+    AlwaysAllowPermissions, AlwaysDenyPermissions, InteractivePermissions, LoggingPermissions,
+    MemoryPermissionHandler, PermissionDecision, PolicyPermissions, ToolExecutionRequest,
+    ToolPermissionHandler,
+};
+pub use request::{MessageRequest, MessageResponse, ToolDef, Usage};
 pub use state::ChatbotState;
+pub use tool::{Tool, ToolRegistry};
 
 // Modules
+pub mod chat_ui;
 pub mod client;
 pub mod error;
-pub mod message;
-pub mod request;
-pub mod tool;
-pub mod permissions;
 pub mod execution;
-pub mod tools;
+pub mod message;
+pub mod permissions;
+pub mod request;
 pub mod state;
-pub mod chat_ui;
+pub mod tool;
+pub mod tools;

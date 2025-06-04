@@ -1,11 +1,11 @@
-use crate::{Tool, Result, Error};
+use crate::{Error, Result, Tool};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -38,7 +38,7 @@ impl MemoryStorage {
             tag_index: HashMap::new(),
         }
     }
-    
+
     fn add_entry(&mut self, entry: MemoryEntry) {
         // Update tag index
         for tag in &entry.tags {
@@ -47,22 +47,28 @@ impl MemoryStorage {
                 .or_insert_with(Vec::new)
                 .push(entry.id.clone());
         }
-        
+
         // Store entry
         self.entries.insert(entry.id.clone(), entry);
     }
-    
-    fn update_entry(&mut self, id: &str, content: Option<String>, tags: Option<Vec<String>>, metadata: Option<HashMap<String, String>>) -> Result<()> {
+
+    fn update_entry(
+        &mut self,
+        id: &str,
+        content: Option<String>,
+        tags: Option<Vec<String>>,
+        metadata: Option<HashMap<String, String>>,
+    ) -> Result<()> {
         let entry = self.entries.get_mut(id)
             .ok_or_else(|| Error::Other(format!(
                 "Memory entry '{}' not found. Use 'store' to create a new entry or check available entries with 'search'", id
             )))?;
-        
+
         // Update content if provided
         if let Some(new_content) = content {
             entry.content = new_content;
         }
-        
+
         // Update tags if provided
         if let Some(new_tags) = tags {
             // Remove old tag associations
@@ -71,7 +77,7 @@ impl MemoryStorage {
                     ids.retain(|entry_id| entry_id != id);
                 }
             }
-            
+
             // Add new tag associations
             for tag in &new_tags {
                 self.tag_index
@@ -79,64 +85,75 @@ impl MemoryStorage {
                     .or_insert_with(Vec::new)
                     .push(id.to_string());
             }
-            
+
             entry.tags = new_tags;
         }
-        
+
         // Update metadata if provided
         if let Some(new_metadata) = metadata {
             entry.metadata = new_metadata;
         }
-        
+
         entry.updated_at = Utc::now();
-        
+
         Ok(())
     }
-    
-    fn search(&self, query: Option<&str>, tags: Option<&[String]>, limit: Option<usize>) -> Vec<MemoryEntry> {
+
+    fn search(
+        &self,
+        query: Option<&str>,
+        tags: Option<&[String]>,
+        limit: Option<usize>,
+    ) -> Vec<MemoryEntry> {
         let mut results: Vec<&MemoryEntry> = self.entries.values().collect();
-        
+
         // Filter by tags if provided
         if let Some(search_tags) = tags {
-            results.retain(|entry| {
-                search_tags.iter().any(|tag| entry.tags.contains(tag))
-            });
+            results.retain(|entry| search_tags.iter().any(|tag| entry.tags.contains(tag)));
         }
-        
+
         // Filter by query if provided
         if let Some(q) = query {
             let q_lower = q.to_lowercase();
             results.retain(|entry| {
-                entry.content.to_lowercase().contains(&q_lower) ||
-                entry.tags.iter().any(|tag| tag.to_lowercase().contains(&q_lower)) ||
-                entry.metadata.values().any(|v| v.to_lowercase().contains(&q_lower))
+                entry.content.to_lowercase().contains(&q_lower)
+                    || entry
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_lowercase().contains(&q_lower))
+                    || entry
+                        .metadata
+                        .values()
+                        .any(|v| v.to_lowercase().contains(&q_lower))
             });
         }
-        
+
         // Sort by updated_at (most recent first)
         results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        
+
         // Apply limit
         if let Some(limit) = limit {
             results.truncate(limit);
         }
-        
+
         results.into_iter().cloned().collect()
     }
-    
+
     fn delete(&mut self, id: &str) -> Result<()> {
-        let entry = self.entries.remove(id)
-            .ok_or_else(|| Error::Other(format!(
-                "Memory entry '{}' not found. Use 'search' to find available entries", id
-            )))?;
-        
+        let entry = self.entries.remove(id).ok_or_else(|| {
+            Error::Other(format!(
+                "Memory entry '{}' not found. Use 'search' to find available entries",
+                id
+            ))
+        })?;
+
         // Remove from tag index
         for tag in &entry.tags {
             if let Some(ids) = self.tag_index.get_mut(tag) {
                 ids.retain(|entry_id| entry_id != id);
             }
         }
-        
+
         Ok(())
     }
 }
@@ -146,37 +163,36 @@ impl EnhancedMemoryTool {
         let storage = Arc::new(RwLock::new(Self::load_storage()?));
         Ok(Self { storage })
     }
-    
+
     fn get_storage_path() -> PathBuf {
-        let home_dir = std::env::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let home_dir = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
         home_dir.join(".claude_memory.json")
     }
-    
+
     fn load_storage() -> Result<MemoryStorage> {
         let path = Self::get_storage_path();
-        
+
         if path.exists() {
             let data = fs::read_to_string(&path)
                 .map_err(|e| Error::Other(format!("Failed to read memory file: {}", e)))?;
-            
+
             serde_json::from_str(&data)
                 .map_err(|e| Error::Other(format!("Failed to parse memory file: {}", e)))
         } else {
             Ok(MemoryStorage::new())
         }
     }
-    
+
     async fn save_storage(&self) -> Result<()> {
         let path = Self::get_storage_path();
         let storage = self.storage.read().await;
-        
+
         let data = serde_json::to_string_pretty(&*storage)
             .map_err(|e| Error::Other(format!("Failed to serialize memory: {}", e)))?;
-        
+
         fs::write(&path, data)
             .map_err(|e| Error::Other(format!("Failed to write memory file: {}", e)))?;
-        
+
         Ok(())
     }
 }
@@ -204,9 +220,7 @@ enum MemoryAction {
         metadata: Option<HashMap<String, String>>,
     },
     #[serde(rename = "delete")]
-    Delete {
-        id: String,
-    },
+    Delete { id: String },
     #[serde(rename = "list_tags")]
     ListTags,
 }
@@ -216,11 +230,11 @@ impl Tool for EnhancedMemoryTool {
     fn name(&self) -> &str {
         "enhanced_memory"
     }
-    
+
     fn description(&self) -> &str {
         "Advanced memory system with persistent storage, search capabilities, and tagging. Store and retrieve information across sessions."
     }
-    
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -265,15 +279,19 @@ impl Tool for EnhancedMemoryTool {
             "additionalProperties": false
         })
     }
-    
+
     async fn execute(&self, input: Value) -> Result<String> {
         let action: MemoryAction = serde_json::from_value(input)
             .map_err(|e| Error::Other(format!(
                 "Invalid input: {}. Example: {{\"action\": \"store\", \"content\": \"Important info\", \"tags\": [\"work\", \"project\"]}}", e
             )))?;
-        
+
         match action {
-            MemoryAction::Store { content, tags, metadata } => {
+            MemoryAction::Store {
+                content,
+                tags,
+                metadata,
+            } => {
                 let id = Uuid::new_v4().to_string();
                 let entry = MemoryEntry {
                     id: id.clone(),
@@ -283,71 +301,77 @@ impl Tool for EnhancedMemoryTool {
                     updated_at: Utc::now(),
                     metadata: metadata.unwrap_or_default(),
                 };
-                
+
                 let mut storage = self.storage.write().await;
                 storage.add_entry(entry);
                 drop(storage);
-                
+
                 self.save_storage().await?;
-                
+
                 Ok(json!({
                     "success": true,
                     "id": id,
                     "message": "Memory stored successfully"
-                }).to_string())
+                })
+                .to_string())
             }
-            
+
             MemoryAction::Search { query, tags, limit } => {
                 let storage = self.storage.read().await;
-                let results = storage.search(
-                    query.as_deref(),
-                    tags.as_deref(),
-                    limit.or(Some(10))
-                );
-                
+                let results = storage.search(query.as_deref(), tags.as_deref(), limit.or(Some(10)));
+
                 Ok(json!({
                     "success": true,
                     "count": results.len(),
                     "results": results
-                }).to_string())
+                })
+                .to_string())
             }
-            
-            MemoryAction::Update { id, content, tags, metadata } => {
+
+            MemoryAction::Update {
+                id,
+                content,
+                tags,
+                metadata,
+            } => {
                 let mut storage = self.storage.write().await;
                 storage.update_entry(&id, content, tags, metadata)?;
                 drop(storage);
-                
+
                 self.save_storage().await?;
-                
+
                 Ok(json!({
                     "success": true,
                     "message": format!("Memory entry '{}' updated", id)
-                }).to_string())
+                })
+                .to_string())
             }
-            
+
             MemoryAction::Delete { id } => {
                 let mut storage = self.storage.write().await;
                 storage.delete(&id)?;
                 drop(storage);
-                
+
                 self.save_storage().await?;
-                
+
                 Ok(json!({
                     "success": true,
                     "message": format!("Memory entry '{}' deleted", id)
-                }).to_string())
+                })
+                .to_string())
             }
-            
+
             MemoryAction::ListTags => {
                 let storage = self.storage.read().await;
-                let mut tags: Vec<(String, usize)> = storage.tag_index
+                let mut tags: Vec<(String, usize)> = storage
+                    .tag_index
                     .iter()
                     .map(|(tag, ids)| (tag.clone(), ids.len()))
                     .collect();
-                
+
                 // Sort by count (descending)
                 tags.sort_by(|a, b| b.1.cmp(&a.1));
-                
+
                 Ok(json!({
                     "success": true,
                     "tags": tags.into_iter().map(|(tag, count)| {
@@ -356,7 +380,8 @@ impl Tool for EnhancedMemoryTool {
                             "count": count
                         })
                     }).collect::<Vec<_>>()
-                }).to_string())
+                })
+                .to_string())
             }
         }
     }

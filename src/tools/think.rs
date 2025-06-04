@@ -1,4 +1,4 @@
-use crate::{Tool, Result};
+use crate::{Result, Tool};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -9,11 +9,11 @@ impl Tool for ThinkTool {
     fn name(&self) -> &str {
         "think"
     }
-    
+
     fn description(&self) -> &str {
         "Think more deeply about a topic or problem, exploring different angles, implications, and considerations"
     }
-    
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -27,7 +27,7 @@ impl Tool for ThinkTool {
             "additionalProperties": false
         })
     }
-    
+
     async fn execute(&self, input: Value) -> Result<String> {
         let topic = input
             .get("topic")
@@ -35,7 +35,7 @@ impl Tool for ThinkTool {
             .ok_or_else(|| crate::Error::Other(
                 "Missing 'topic' field. Example: {\"topic\": \"the implications of this design decision\"}".to_string()
             ))?;
-        
+
         // Return a thoughtful analysis prompt
         Ok(format!(
             "Let me think more deeply about: {}\n\n\

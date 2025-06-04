@@ -1,9 +1,9 @@
-use crate::{Tool, Result, Error};
+use crate::{Error, Result, Tool};
 use async_trait::async_trait;
+use firecrawl::map::MapOptions;
+use firecrawl::FirecrawlApp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use firecrawl::FirecrawlApp;
-use firecrawl::map::MapOptions;
 use std::collections::HashMap;
 
 pub struct FirecrawlMapTool;
@@ -42,11 +42,11 @@ impl Tool for FirecrawlMapTool {
     fn name(&self) -> &str {
         "firecrawl_map"
     }
-    
+
     fn description(&self) -> &str {
         "Map website structure using Firecrawl API - discovers all pages and links within a website, creating a comprehensive sitemap. Useful for understanding site architecture and finding all available pages."
     }
-    
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -76,40 +76,41 @@ impl Tool for FirecrawlMapTool {
             "additionalProperties": false
         })
     }
-    
+
     async fn execute(&self, input: Value) -> Result<String> {
         let params: FirecrawlMapInput = serde_json::from_value(input)
             .map_err(|e| Error::Other(format!("Invalid input parameters: {}", e)))?;
-        
-        let api_key = std::env::var("FIRECRAWL_API_KEY")
-            .map_err(|_| Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string()))?;
-        
+
+        let api_key = std::env::var("FIRECRAWL_API_KEY").map_err(|_| {
+            Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string())
+        })?;
+
         let firecrawl = FirecrawlApp::new(&api_key)
             .map_err(|e| Error::Other(format!("Failed to initialize Firecrawl: {:?}", e)))?;
-        
+
         let mut map_options = MapOptions::default();
-        
+
         if let Some(search) = params.search {
             map_options.search = Some(search);
         }
-        
+
         if let Some(ignore_sitemap) = params.ignore_sitemap {
             map_options.ignore_sitemap = Some(ignore_sitemap);
         }
-        
+
         if let Some(include_subdomains) = params.include_subdomains {
             map_options.include_subdomains = Some(include_subdomains);
         }
-        
+
         if let Some(limit) = params.limit {
             map_options.limit = Some(limit);
         }
-        
+
         match firecrawl.map_url(&params.url, Some(map_options)).await {
             Ok(map_result) => {
                 let mut link_graph: HashMap<String, Vec<String>> = HashMap::new();
                 let mut sitemap: Vec<SitemapEntry> = Vec::new();
-                
+
                 for link in &map_result {
                     let entry = SitemapEntry {
                         url: link.clone(),
@@ -120,22 +121,25 @@ impl Tool for FirecrawlMapTool {
                         size: None,
                     };
                     sitemap.push(entry);
-                    
+
                     if !link_graph.contains_key(link) {
                         link_graph.insert(link.clone(), Vec::new());
                     }
                 }
-                
+
                 if map_result.len() > 1 {
                     for (i, source) in map_result.iter().enumerate() {
                         for (j, target) in map_result.iter().enumerate() {
-                            if i != j && source.contains(&params.url) && target.contains(&params.url) {
+                            if i != j
+                                && source.contains(&params.url)
+                                && target.contains(&params.url)
+                            {
                                 link_graph.get_mut(source).unwrap().push(target.clone());
                             }
                         }
                     }
                 }
-                
+
                 let response = FirecrawlMapResponse {
                     success: true,
                     url: params.url,
@@ -144,7 +148,7 @@ impl Tool for FirecrawlMapTool {
                     link_graph,
                     error: None,
                 };
-                
+
                 serde_json::to_string_pretty(&response)
                     .map_err(|e| Error::Other(format!("Failed to serialize response: {}", e)))
             }
@@ -157,7 +161,7 @@ impl Tool for FirecrawlMapTool {
                     link_graph: HashMap::new(),
                     error: Some(format!("Map failed: {:?}", e)),
                 };
-                
+
                 serde_json::to_string_pretty(&response)
                     .map_err(|e| Error::Other(format!("Failed to serialize error response: {}", e)))
             }
