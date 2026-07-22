@@ -44,23 +44,19 @@ pub enum ExecutionState {
 /// # Example
 ///
 /// ```rust
-/// # use claude::ToolExecution;
-/// # use chrono::Utc;
+/// # use generalist::{ExecutionState, ToolExecution};
 /// # let execution = ToolExecution::new(
 /// #     "exec_123".to_string(),
 /// #     "calculator".to_string(),
 /// #     serde_json::json!({"expression": "2+2"})
 /// # );
-/// // Check execution state
 /// if execution.is_finished() {
 ///     match &execution.state {
-///         claude::ExecutionState::Completed { result } => println!("Success: {}", result),
-///         claude::ExecutionState::Failed { error } => println!("Failed: {}", error),
-///         claude::ExecutionState::Denied { reason } => println!("Denied: {}", reason),
+///         ExecutionState::Completed { result } => println!("Success: {}", result),
+///         ExecutionState::Failed { error } => println!("Failed: {}", error),
+///         ExecutionState::Denied { reason } => println!("Denied: {}", reason),
 ///         _ => {}
 ///     }
-///     
-///     // Check execution time
 ///     if let Some(duration) = execution.duration_ms {
 ///         println!("Took {} ms", duration);
 ///     }

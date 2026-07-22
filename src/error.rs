@@ -1,52 +1,46 @@
 use std::error::Error as StdError;
 use std::fmt;
 
-/// Custom error type for the Claude API client
-///
-/// Represents various errors that can occur when interacting with the Claude API
-/// or during tool execution.
-///
-/// # Example
-///
-/// ```rust
-/// use claude::Error;
-///
-/// fn handle_api_error(error: Error) {
-///     match error {
-///         Error::Request(e) => eprintln!("Network error: {}", e),
-///         Error::Response(msg, status) => {
-///             eprintln!("API error: {} (status: {:?})", msg, status)
-///         },
-///         Error::Parse(e) => eprintln!("Failed to parse response: {}", e),
-///         Error::Header(msg) => eprintln!("Header error: {}", msg),
-///         Error::Other(msg) => eprintln!("Error: {}", msg),
-///     }
-/// }
-/// ```
+/// Error type shared across providers, tools, and the agent loop.
 #[derive(Debug)]
 pub enum Error {
-    /// HTTP request error
-    Request(reqwest::Error),
-    /// API response error with message and optional status code
-    Response(String, Option<u16>),
-    /// JSON parsing error
+    /// Transport-level failure (connection, timeout, TLS, ...).
+    Network(reqwest::Error),
+    /// The provider API returned a non-success status.
+    Api { status: u16, message: String },
+    /// A response could not be parsed.
     Parse(serde_json::Error),
-    /// Header configuration error
-    Header(String),
-    /// Other errors
+    /// A tool failed to execute.
+    Tool(String),
+    /// Anything else.
     Other(String),
+}
+
+impl Error {
+    /// Whether the error is transient and worth retrying with backoff.
+    ///
+    /// Covers rate limits (429), server errors (5xx including Anthropic's 529
+    /// "overloaded"), request timeouts, and connection failures.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Error::Network(e) => e.is_timeout() || e.is_connect() || e.is_request(),
+            // Status 0 is the sentinel for mid-stream failures (premature
+            // stream end, in-band stream errors) — transient in practice.
+            Error::Api { status, .. } => matches!(*status, 0 | 408 | 429) || *status >= 500,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Request(e) => write!(f, "Request error: {}", e),
-            Error::Response(msg, status) => match status {
-                Some(code) => write!(f, "API error (status {}): {}", code, msg),
-                None => write!(f, "API error: {}", msg),
-            },
+            Error::Network(e) => write!(f, "Network error: {}", e),
+            Error::Api { status, message } => {
+                write!(f, "API error (status {}): {}", status, message)
+            }
             Error::Parse(e) => write!(f, "Parse error: {}", e),
-            Error::Header(msg) => write!(f, "Header error: {}", msg),
+            Error::Tool(msg) => write!(f, "Tool error: {}", msg),
             Error::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -55,7 +49,7 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Error::Request(e) => Some(e),
+            Error::Network(e) => Some(e),
             Error::Parse(e) => Some(e),
             _ => None,
         }
@@ -64,7 +58,7 @@ impl StdError for Error {
 
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
-        Error::Request(err)
+        Error::Network(err)
     }
 }
 
@@ -75,3 +69,35 @@ impl From<serde_json::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_statuses() {
+        for status in [0u16, 408, 429, 500, 502, 503, 529] {
+            assert!(
+                Error::Api {
+                    status,
+                    message: String::new()
+                }
+                .is_retryable(),
+                "{} should be retryable",
+                status
+            );
+        }
+        for status in [400u16, 401, 403, 404, 413] {
+            assert!(
+                !Error::Api {
+                    status,
+                    message: String::new()
+                }
+                .is_retryable(),
+                "{} should not be retryable",
+                status
+            );
+        }
+        assert!(!Error::Other("nope".into()).is_retryable());
+    }
+}

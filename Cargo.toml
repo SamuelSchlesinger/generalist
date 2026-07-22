@@ -1,15 +1,15 @@
 [package]
-name = "claude"
-version = "0.1.0"
+name = "generalist"
+version = "0.2.0"
 edition = "2021"
 authors = ["Samuel Schlesinger <sgschlesinger@gmail.com>"]
-description = "A Rust client library for Anthropic's Claude AI API with tool support. A generalist CLI agent implementation using this API."
+description = "A provider-agnostic CLI agent with tool use. Works with Anthropic and any OpenAI-compatible API."
 homepage = "https://github.com/SamuelSchlesinger/generalist"
 repository = "https://github.com/SamuelSchlesinger/generalist"
 license = "MIT"
 readme = "README.md"
-keywords = ["claude", "anthropic", "ai", "chatbot", "tools"]
-categories = ["api-bindings", "asynchronous"]
+keywords = ["agent", "llm", "ai", "chatbot", "tools"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 reqwest = { version = "0.11", features = ["json"] }
@@ -25,11 +25,8 @@ colored = "2.2"
 dotenv = "0.15.0"
 exmex = "0.20"
 urlencoding = "2.1"
-url = "2.5"
 uuid = { version = "1.17.0", features = ["v4"] }
-serenity = "0.12.4"
 tempfile = "3.8"
-z3 = "0.12"
 firecrawl = "1.2.0"
 
 [[bin]]

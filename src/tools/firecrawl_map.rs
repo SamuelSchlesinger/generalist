@@ -4,7 +4,6 @@ use firecrawl::map::MapOptions;
 use firecrawl::FirecrawlApp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 
 pub struct FirecrawlMapTool;
 
@@ -22,19 +21,8 @@ pub struct FirecrawlMapResponse {
     success: bool,
     url: String,
     total_links: usize,
-    sitemap: Vec<SitemapEntry>,
-    link_graph: HashMap<String, Vec<String>>,
+    links: Vec<String>,
     error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SitemapEntry {
-    url: String,
-    title: Option<String>,
-    description: Option<String>,
-    last_modified: Option<String>,
-    content_type: Option<String>,
-    size: Option<usize>,
 }
 
 #[async_trait]
@@ -44,7 +32,9 @@ impl Tool for FirecrawlMapTool {
     }
 
     fn description(&self) -> &str {
-        "Map website structure using Firecrawl API - discovers all pages and links within a website, creating a comprehensive sitemap. Useful for understanding site architecture and finding all available pages."
+        "Discover the URLs of a website using the Firecrawl API. Returns the list of pages \
+         found via sitemaps and crawling. Useful for understanding site structure before \
+         extracting specific pages."
     }
 
     fn input_schema(&self) -> Value {
@@ -69,7 +59,7 @@ impl Tool for FirecrawlMapTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of pages to map"
+                    "description": "Maximum number of pages to map (default: 500)"
                 }
             },
             "required": ["url"],
@@ -79,92 +69,48 @@ impl Tool for FirecrawlMapTool {
 
     async fn execute(&self, input: Value) -> Result<String> {
         let params: FirecrawlMapInput = serde_json::from_value(input)
-            .map_err(|e| Error::Other(format!("Invalid input parameters: {}", e)))?;
+            .map_err(|e| Error::Tool(format!("Invalid input parameters: {}", e)))?;
 
         let api_key = std::env::var("FIRECRAWL_API_KEY").map_err(|_| {
-            Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string())
+            Error::Tool("FIRECRAWL_API_KEY environment variable not set".to_string())
         })?;
 
         let firecrawl = FirecrawlApp::new(&api_key)
-            .map_err(|e| Error::Other(format!("Failed to initialize Firecrawl: {:?}", e)))?;
+            .map_err(|e| Error::Tool(format!("Failed to initialize Firecrawl: {:?}", e)))?;
 
-        let mut map_options = MapOptions::default();
-
+        let mut map_options = MapOptions {
+            // Unbounded maps of large sites produce enormous responses.
+            limit: Some(params.limit.unwrap_or(500)),
+            ..Default::default()
+        };
         if let Some(search) = params.search {
             map_options.search = Some(search);
         }
-
         if let Some(ignore_sitemap) = params.ignore_sitemap {
             map_options.ignore_sitemap = Some(ignore_sitemap);
         }
-
         if let Some(include_subdomains) = params.include_subdomains {
             map_options.include_subdomains = Some(include_subdomains);
         }
 
-        if let Some(limit) = params.limit {
-            map_options.limit = Some(limit);
-        }
+        let response = match firecrawl.map_url(&params.url, Some(map_options)).await {
+            Ok(links) => FirecrawlMapResponse {
+                success: true,
+                url: params.url,
+                total_links: links.len(),
+                links,
+                error: None,
+            },
+            Err(e) => FirecrawlMapResponse {
+                success: false,
+                url: params.url,
+                total_links: 0,
+                links: vec![],
+                error: Some(format!("Map failed: {:?}", e)),
+            },
+        };
 
-        match firecrawl.map_url(&params.url, Some(map_options)).await {
-            Ok(map_result) => {
-                let mut link_graph: HashMap<String, Vec<String>> = HashMap::new();
-                let mut sitemap: Vec<SitemapEntry> = Vec::new();
-
-                for link in &map_result {
-                    let entry = SitemapEntry {
-                        url: link.clone(),
-                        title: None,
-                        description: None,
-                        last_modified: None,
-                        content_type: None,
-                        size: None,
-                    };
-                    sitemap.push(entry);
-
-                    if !link_graph.contains_key(link) {
-                        link_graph.insert(link.clone(), Vec::new());
-                    }
-                }
-
-                if map_result.len() > 1 {
-                    for (i, source) in map_result.iter().enumerate() {
-                        for (j, target) in map_result.iter().enumerate() {
-                            if i != j
-                                && source.contains(&params.url)
-                                && target.contains(&params.url)
-                            {
-                                link_graph.get_mut(source).unwrap().push(target.clone());
-                            }
-                        }
-                    }
-                }
-
-                let response = FirecrawlMapResponse {
-                    success: true,
-                    url: params.url,
-                    total_links: sitemap.len(),
-                    sitemap,
-                    link_graph,
-                    error: None,
-                };
-
-                serde_json::to_string_pretty(&response)
-                    .map_err(|e| Error::Other(format!("Failed to serialize response: {}", e)))
-            }
-            Err(e) => {
-                let response = FirecrawlMapResponse {
-                    success: false,
-                    url: params.url,
-                    total_links: 0,
-                    sitemap: vec![],
-                    link_graph: HashMap::new(),
-                    error: Some(format!("Map failed: {:?}", e)),
-                };
-
-                serde_json::to_string_pretty(&response)
-                    .map_err(|e| Error::Other(format!("Failed to serialize error response: {}", e)))
-            }
-        }
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| Error::Tool(format!("Failed to serialize response: {}", e)))
     }
 }

@@ -1,177 +1,174 @@
-use chrono::Local;
-use claude::{
-    tools::*, ChatbotState, Claude, ContentBlock, Error, MemoryPermissionHandler, Message, Result,
-    ToolRegistry,
-};
 use colored::*;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
-use indicatif::{ProgressBar, ProgressStyle};
+use generalist::chat_ui::ChatUI;
+use generalist::provider::{anthropic, AnthropicProvider, OpenAiProvider, Provider};
+use generalist::tools::*;
+use generalist::{
+    Agent, AgentEvent, Error, MemoryPermissionHandler, Result, SavedState, ToolRegistry,
+    TurnOutcome,
+};
+use indicatif::ProgressBar;
+use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::time::Duration;
 
-mod chat_ui;
-use chat_ui::ChatUI;
+const AUTOSAVE_NAME: &str = "autosave";
 
-// Conversation history management
-fn get_history_dir() -> PathBuf {
-    let home_dir = env::home_dir().expect("Unable to determine home directory");
-    let history_dir = home_dir.join(".chatbot_history");
-    fs::create_dir_all(&history_dir).ok();
-    history_dir
+fn home_dir() -> PathBuf {
+    #[allow(deprecated)]
+    env::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn save_state(state: &ChatbotState, filename: &str) -> Result<()> {
-    let history_dir = get_history_dir();
-    let filepath = history_dir.join(format!("{}.json", filename));
+fn history_dir() -> PathBuf {
+    let dir = home_dir().join(".generalist_history");
+    fs::create_dir_all(&dir).ok();
+    dir
+}
 
+/// Legacy history location from earlier versions.
+fn legacy_history_dir() -> PathBuf {
+    home_dir().join(".chatbot_history")
+}
+
+fn save_state(state: &SavedState, filename: &str) -> Result<PathBuf> {
+    let filepath = history_dir().join(format!("{}.json", filename));
     let json_data = serde_json::to_string_pretty(state)
         .map_err(|e| Error::Other(format!("Failed to serialize state: {}", e)))?;
-
     fs::write(&filepath, json_data)
         .map_err(|e| Error::Other(format!("Failed to write state file: {}", e)))?;
-
-    println!("{} State saved to: {}", "✓".green(), filepath.display());
-    Ok(())
+    Ok(filepath)
 }
 
-fn load_state(filename: &str) -> Result<ChatbotState> {
-    let history_dir = get_history_dir();
-    let filepath = history_dir.join(format!("{}.json", filename));
-
-    let json_data = fs::read_to_string(&filepath)
-        .map_err(|e| Error::Other(format!("Failed to read state file: {}", e)))?;
-
-    // First try to parse as ChatbotState
-    match serde_json::from_str::<ChatbotState>(&json_data) {
-        Ok(state) => {
-            println!("{} State loaded from: {}", "✓".green(), filepath.display());
-            Ok(state)
-        }
-        Err(_) => {
-            // Fall back to old format (just conversation history)
-            let messages: Vec<Message> = serde_json::from_str(&json_data)
-                .map_err(|e| Error::Other(format!("Failed to parse state: {}", e)))?;
-
-            println!(
-                "{} Loaded legacy conversation format from: {}",
-                "✓".green(),
-                filepath.display()
-            );
-            println!("{} Converting to new state format...", "ℹ".blue());
-
-            // Use default model for legacy files
-            Ok(ChatbotState::from_conversation(
-                messages,
-                "claude-3-7-sonnet-latest".to_string(),
-            ))
+fn load_state(filename: &str) -> Result<SavedState> {
+    for dir in [history_dir(), legacy_history_dir()] {
+        let filepath = dir.join(format!("{}.json", filename));
+        if let Ok(json_data) = fs::read_to_string(&filepath) {
+            return SavedState::from_legacy_json(&json_data, anthropic::SUGGESTED_MODELS[0])
+                .ok_or_else(|| Error::Other(format!("Failed to parse {}", filepath.display())));
         }
     }
+    Err(Error::Other(format!(
+        "No saved conversation named '{}'",
+        filename
+    )))
 }
 
 fn list_saved_conversations() -> Vec<String> {
-    let history_dir = get_history_dir();
     let mut conversations = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(history_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".json") {
-                    conversations.push(name.trim_end_matches(".json").to_string());
+    for dir in [history_dir(), legacy_history_dir()] {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Some(stem) = name.strip_suffix(".json") {
+                        if !conversations.contains(&stem.to_string()) {
+                            conversations.push(stem.to_string());
+                        }
+                    }
                 }
             }
         }
     }
-
     conversations.sort();
     conversations
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Load environment from ~/.generalist.env
-    let home_dir = env::home_dir().expect("Unable to determine home directory");
-    let env_path = home_dir.join(".generalist.env");
+struct ApiKeys {
+    anthropic: Option<String>,
+    openai: Option<String>,
+    openai_base_url: String,
+}
 
-    // Check if the file exists
-    if !env_path.exists() {
-        eprintln!("{}", "Error: ~/.generalist.env file not found".red());
-        eprintln!("Please create the file with your API key:");
-        eprintln!("  echo 'CLAUDE_API_KEY=your-api-key-here' > ~/.generalist.env");
-        std::process::exit(1);
+impl ApiKeys {
+    fn from_env() -> Self {
+        let openai_base_url = env::var("OPENAI_BASE_URL").ok();
+        Self {
+            // CLAUDE_API_KEY is the name earlier versions used.
+            anthropic: env::var("ANTHROPIC_API_KEY")
+                .or_else(|_| env::var("CLAUDE_API_KEY"))
+                .ok(),
+            // Local servers (Ollama, LM Studio, vLLM) don't check the key, so
+            // a configured base URL is enough to enable the provider.
+            openai: env::var("OPENAI_API_KEY")
+                .ok()
+                .or_else(|| openai_base_url.as_ref().map(|_| "unused".to_string())),
+            openai_base_url: openai_base_url
+                .unwrap_or_else(|| generalist::provider::openai::DEFAULT_BASE_URL.to_string()),
+        }
     }
 
-    // Load the env file
-    dotenv::from_path(&env_path).expect("Failed to load ~/.generalist.env");
+    fn available_providers(&self) -> Vec<&'static str> {
+        let mut providers = Vec::new();
+        if self.anthropic.is_some() {
+            providers.push("anthropic");
+        }
+        if self.openai.is_some() {
+            providers.push("openai");
+        }
+        providers
+    }
+}
 
-    // Get API key
-    let api_key = env::var("CLAUDE_API_KEY").unwrap_or_else(|_| {
-        eprintln!(
-            "{}",
-            "Error: CLAUDE_API_KEY not found in ~/.generalist.env".red()
-        );
-        eprintln!("Please add your API key to ~/.generalist.env:");
-        eprintln!("  echo 'CLAUDE_API_KEY=your-api-key-here' >> ~/.generalist.env");
-        std::process::exit(1);
-    });
+fn choose_model(provider: &str) -> String {
+    match provider {
+        "anthropic" => {
+            let selection = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Select model")
+                .items(anthropic::SUGGESTED_MODELS)
+                .default(0)
+                .interact()
+                .unwrap_or(0);
+            anthropic::SUGGESTED_MODELS[selection].to_string()
+        }
+        _ => {
+            let default = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+            Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Model name (e.g. gpt-4o, or an Ollama model like qwen3:30b)")
+                .default(default)
+                .interact_text()
+                .unwrap_or_else(|_| "gpt-4o".to_string())
+        }
+    }
+}
 
-    // Initialize UI
-    let ui = ChatUI::new();
-    ui.print_welcome();
+fn build_provider(keys: &ApiKeys, provider: &str, model: String) -> Result<Box<dyn Provider>> {
+    match provider {
+        "anthropic" => {
+            let key = keys
+                .anthropic
+                .clone()
+                .ok_or_else(|| Error::Other("ANTHROPIC_API_KEY is not set".to_string()))?;
+            Ok(Box::new(AnthropicProvider::new(key, model)?))
+        }
+        "openai" => {
+            let key = keys
+                .openai
+                .clone()
+                .ok_or_else(|| Error::Other("OPENAI_API_KEY is not set".to_string()))?;
+            Ok(Box::new(OpenAiProvider::new(
+                key,
+                keys.openai_base_url.clone(),
+                model,
+            )?))
+        }
+        other => Err(Error::Other(format!("Unknown provider '{}'", other))),
+    }
+}
 
-    // Select model
-    let models = vec![
-        "claude-3-7-sonnet-latest",
-        "claude-opus-4-20250514",
-        "claude-sonnet-4-20250514",
-    ];
-
-    let model_selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select Claude model")
-        .items(&models)
-        .default(0)
-        .interact()
-        .unwrap();
-
-    let mut model = models[model_selection].to_string();
-    println!("{} Using model: {}\n", "✓".green(), model.cyan());
-
-    // Initialize state
-    let mut state = ChatbotState::new(model.clone());
-
-    // Initialize permission handler
-    let permission_handler = Arc::new(MemoryPermissionHandler::new());
-
-    // Initialize Claude client
-    let mut client = Claude::new(api_key.clone(), model.clone());
-
-    // Initialize tool registry with memory permission handler
-    println!("{} Using interactive permissions with memory", "🔐".cyan());
-    println!(
-        "{}",
-        "You'll be prompted for each tool execution with options to remember your choice.\n"
-            .dimmed()
-    );
-
-    // Create a shared handler for the registry
-    let shared_handler = MemoryPermissionHandler::with_shared_state(
+fn build_registry(permission_handler: &MemoryPermissionHandler) -> Result<ToolRegistry> {
+    let shared = MemoryPermissionHandler::with_shared_state(
         permission_handler.always_allow(),
         permission_handler.always_deny(),
     );
-    let mut registry = ToolRegistry::with_permission_handler(Box::new(shared_handler));
-
-    registry.register(Arc::new(PatchFileTool))?;
+    let mut registry = ToolRegistry::with_permission_handler(Box::new(shared));
     registry.register(Arc::new(ReadFileTool))?;
+    registry.register(Arc::new(PatchFileTool))?;
     registry.register(Arc::new(ListDirectoryTool))?;
     registry.register(Arc::new(BashTool))?;
-    registry.register(Arc::new(SystemInfoTool))?;
-    registry.register(Arc::new(CalculatorTool))?;
     registry.register(Arc::new(WeatherTool))?;
     registry.register(Arc::new(HttpFetchTool))?;
     registry.register(Arc::new(EnhancedMemoryTool::new()?))?;
-    registry.register(Arc::new(ThinkTool))?;
     registry.register(Arc::new(WikipediaTool))?;
     registry.register(Arc::new(Z3SolverTool))?;
     registry.register(Arc::new(TodoTool))?;
@@ -179,337 +176,351 @@ async fn main() -> Result<()> {
     registry.register(Arc::new(FirecrawlSearchTool))?;
     registry.register(Arc::new(FirecrawlMapTool))?;
     registry.register(Arc::new(FirecrawlExtractTool))?;
+    Ok(registry)
+}
 
-    // Load system prompt
-    let system_prompt = include_str!("../SYSTEM_PROMPT.md");
-    state.system_prompt = Some(system_prompt.to_string());
+fn make_saved_state(agent: &Agent, handler: &MemoryPermissionHandler) -> SavedState {
+    SavedState {
+        provider: agent.provider().id().to_string(),
+        model: agent.provider().model().to_string(),
+        conversation_history: agent.history.clone(),
+        always_allow_tools: handler.always_allow().lock().unwrap().clone(),
+        always_deny_tools: handler.always_deny().lock().unwrap().clone(),
+    }
+}
 
-    // Main conversation loop
-    loop {
-        // Get user input
-        let input: String = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("You")
-            .interact_text()
-            .unwrap();
+const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
 
-        // Check for special commands
-        let input_trimmed = input.trim();
-        if input_trimmed.eq_ignore_ascii_case("exit") || input_trimmed.eq_ignore_ascii_case("quit")
-        {
-            println!("\n{}", "👋 Goodbye! Thanks for chatting!".yellow());
+struct CliArgs {
+    /// `--local [model]`: skip provider selection, run against a local
+    /// OpenAI-compatible server (Ollama by default).
+    local_model: Option<String>,
+}
+
+fn print_usage() {
+    println!("Usage: generalist [--local [model]]");
+    println!();
+    println!("  --local [model]   Run against a local OpenAI-compatible server");
+    println!(
+        "                    (default {}, override with OPENAI_BASE_URL).",
+        OLLAMA_BASE_URL
+    );
+    println!(
+        "                    Model defaults to {} if omitted.",
+        DEFAULT_LOCAL_MODEL
+    );
+    println!("  -h, --help        Show this help");
+}
+
+fn parse_args() -> CliArgs {
+    let mut local_model = None;
+    let mut args = env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--local" => {
+                // Model name is optional: `--local` alone uses the default,
+                // and a following flag is not a model name.
+                let model = match args.peek() {
+                    Some(next) if !next.starts_with('-') => args.next().unwrap(),
+                    _ => DEFAULT_LOCAL_MODEL.to_string(),
+                };
+                local_model = Some(model);
+            }
+            a if a.starts_with("--local=") => {
+                local_model = Some(a["--local=".len()..].to_string());
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("{} {}", "Unknown argument:".red(), other);
+                print_usage();
+                std::process::exit(1);
+            }
+        }
+    }
+    CliArgs { local_model }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = parse_args();
+
+    // ~/.generalist.env is optional; plain environment variables work too.
+    let env_path = home_dir().join(".generalist.env");
+    if env_path.exists() {
+        dotenv::from_path(&env_path).ok();
+    }
+
+    let mut keys = ApiKeys::from_env();
+    if cli.local_model.is_some() {
+        // --local needs no API key; point at Ollama unless a base URL was
+        // configured explicitly.
+        if env::var("OPENAI_BASE_URL").is_err() {
+            keys.openai_base_url = OLLAMA_BASE_URL.to_string();
+        }
+        keys.openai.get_or_insert_with(|| "unused".to_string());
+    }
+    let available = keys.available_providers();
+    if available.is_empty() {
+        eprintln!("{}", "No API key found.".red());
+        eprintln!("Set at least one of these (in the environment or in ~/.generalist.env):");
+        eprintln!("  ANTHROPIC_API_KEY=...   for Anthropic models");
+        eprintln!("  OPENAI_API_KEY=...      for OpenAI or any OpenAI-compatible server");
+        eprintln!(
+            "  OPENAI_BASE_URL=...     optional, e.g. {} for Ollama",
+            OLLAMA_BASE_URL
+        );
+        eprintln!("Or run against a local model directly:  generalist --local <model>");
+        std::process::exit(1);
+    }
+
+    let ui = ChatUI::new();
+
+    let (provider_name, model) = match &cli.local_model {
+        Some(model) => ("openai", model.clone()),
+        None => {
+            let provider_name = if available.len() == 1 {
+                available[0]
+            } else {
+                let selection = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select provider")
+                    .items(&available)
+                    .default(0)
+                    .interact()
+                    .unwrap_or(0);
+                available[selection]
+            };
+            (provider_name, choose_model(provider_name))
+        }
+    };
+    let provider = build_provider(&keys, provider_name, model)?;
+
+    let permission_handler = MemoryPermissionHandler::new();
+    let mut registry = build_registry(&permission_handler)?;
+
+    // MCP servers from ~/.generalist/mcp.json; their tools are code-only
+    // (callable from scripts via the tools module, not direct tool calls).
+    if let Some(config) = generalist::mcp::McpConfig::load(&home_dir().join(".generalist/mcp.json"))
+    {
+        for line in generalist::mcp::register_servers(&mut registry, &config).await {
+            ui.print_info(&line);
+        }
+    }
+
+    // System prompt = base + skills index + project notes, if present.
+    let mut system_prompt = include_str!("../SYSTEM_PROMPT.md").to_string();
+    if let Some(index) = generalist::skills::skills_index(&home_dir().join(".generalist/skills")) {
+        system_prompt.push_str(&index);
+    }
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        if let Ok(notes) = fs::read_to_string(name) {
+            system_prompt.push_str(&format!("\n\n## Project notes (./{})\n\n{}", name, notes));
             break;
-        } else if input_trimmed.eq_ignore_ascii_case("/save") {
+        }
+    }
+
+    let mut agent = Agent::new(provider, registry, system_prompt);
+
+    ui.print_welcome(
+        agent.provider().id(),
+        agent.provider().model(),
+        &agent.registry.tool_names(),
+    );
+
+    // Exits on Ctrl-C / closed stdin (Err) or the exit command.
+    while let Ok(input) = Input::<String>::with_theme(&ColorfulTheme::default())
+        .with_prompt("You")
+        .interact_text()
+    {
+        let trimmed = input.trim();
+
+        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+            println!("\n{}", "Goodbye!".yellow());
+            break;
+        } else if trimmed.eq_ignore_ascii_case("/help") {
+            ui.print_help();
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("/compact") {
+            let before = agent.context_tokens();
+            let mut on_note = |event: AgentEvent| {
+                if let AgentEvent::Notice(message) = event {
+                    ui.print_info(&message);
+                }
+            };
+            match agent.compact(&mut on_note).await {
+                Ok(true) => {}
+                Ok(false) => ui.print_info("Nothing to compact yet."),
+                Err(e) => ui.print_error(&format!("Compaction failed: {}", e)),
+            }
+            ui.print_info(&format!(
+                "Context: ~{}k -> ~{}k tokens",
+                before / 1000,
+                agent.context_tokens() / 1000
+            ));
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("/clear") {
+            agent.history.clear();
+            ui.print_info("Conversation cleared.");
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("/save") {
             let name: String = Input::with_theme(&ColorfulTheme::default())
                 .with_prompt("Save conversation as")
-                .default(format!("chat_{}", Local::now().format("%Y%m%d_%H%M%S")))
+                .default(format!(
+                    "chat_{}",
+                    chrono::Local::now().format("%Y%m%d_%H%M%S")
+                ))
                 .interact_text()
-                .unwrap();
-
-            // Update state with current permissions
-            state.always_allow_tools = permission_handler.always_allow().lock().unwrap().clone();
-            state.always_deny_tools = permission_handler.always_deny().lock().unwrap().clone();
-
-            if let Err(e) = save_state(&state, &name) {
-                ui.print_error(&format!("Failed to save state: {}", e));
+                .unwrap_or_else(|_| "unnamed".to_string());
+            match save_state(&make_saved_state(&agent, &permission_handler), &name) {
+                Ok(path) => ui.print_info(&format!("Saved to {}", path.display())),
+                Err(e) => ui.print_error(&format!("Failed to save: {}", e)),
             }
             continue;
-        } else if input_trimmed.eq_ignore_ascii_case("/load") {
+        } else if trimmed.eq_ignore_ascii_case("/load") {
             let saved = list_saved_conversations();
             if saved.is_empty() {
-                println!("{}", "No saved conversations found.".yellow());
+                ui.print_info("No saved conversations found.");
                 continue;
             }
-
-            let selection = Select::with_theme(&ColorfulTheme::default())
+            let Some(idx) = Select::with_theme(&ColorfulTheme::default())
                 .with_prompt("Select conversation to load")
                 .items(&saved)
                 .interact_opt()
-                .unwrap();
-
-            if let Some(idx) = selection {
-                match load_state(&saved[idx]) {
-                    Ok(loaded_state) => {
-                        // Update state
-                        state = loaded_state;
-                        println!(
-                            "{} Loaded {} messages",
-                            "✓".green(),
-                            state.conversation_history.len()
-                        );
-
-                        // Update model if different
-                        if state.model != model {
-                            model = state.model.clone();
-                            client = Claude::new(api_key.clone(), model.clone());
-                            println!("{} Switched to model: {}", "✓".green(), model.cyan());
-                        }
-
-                        // Update permissions
-                        permission_handler.set_always_allow(state.always_allow_tools.clone());
-                        permission_handler.set_always_deny(state.always_deny_tools.clone());
-                        println!(
-                            "{} Restored {} allowed and {} denied tools",
-                            "✓".green(),
-                            state.always_allow_tools.len(),
-                            state.always_deny_tools.len()
-                        );
-
-                        // Display loaded conversation
-                        for msg in &state.conversation_history {
-                            match msg.role.as_str() {
-                                "user" => {
-                                    if let Some(ContentBlock::Text { text }) = msg.content.first() {
-                                        ui.print_message("user", text);
-                                    }
-                                }
-                                "assistant" => {
-                                    for block in &msg.content {
-                                        if let ContentBlock::Text { text } = block {
-                                            ui.print_message("assistant", text);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        println!();
-                    }
-                    Err(e) => ui.print_error(&format!("Failed to load state: {}", e)),
-                }
-            }
-            continue;
-        } else if input_trimmed.eq_ignore_ascii_case("/model") {
-            let models = vec![
-                "claude-3-7-sonnet-latest",
-                "claude-opus-4-20250514",
-                "claude-sonnet-4-20250514",
-            ];
-
-            // Find current model index
-            let current_idx = models.iter().position(|&m| m == model).unwrap_or(0);
-
-            let model_selection = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select new Claude model")
-                .items(&models)
-                .default(current_idx)
-                .interact()
-                .unwrap();
-
-            let new_model = models[model_selection].to_string();
-            if new_model != model {
-                model = new_model;
-                state.model = model.clone();
-                client = Claude::new(api_key.clone(), model.clone());
-                println!("{} Switched to model: {}", "✓".green(), model.cyan());
-            } else {
-                println!("{} Already using model: {}", "ℹ".blue(), model.cyan());
-            }
-            continue;
-        } else if input_trimmed.eq_ignore_ascii_case("/help") {
-            println!("\n{}", "Available commands:".yellow().bold());
-            println!("  {} - Save current conversation", "/save".cyan());
-            println!("  {} - Load a saved conversation", "/load".cyan());
-            println!("  {} - Switch Claude model", "/model".cyan());
-            println!("  {} - Show this help message", "/help".cyan());
-            println!(
-                "  {} or {} - Exit the chatbot",
-                "exit".cyan(),
-                "quit".cyan()
-            );
-            println!();
-            continue;
-        }
-
-        ui.print_message("user", &input);
-
-        // Add user message to history
-        state
-            .conversation_history
-            .push(Message::user(vec![ContentBlock::Text {
-                text: input.clone(),
-            }]));
-
-        // Show thinking indicator
-        let mut thinking_pb = ui.multi_progress().add(ProgressBar::new_spinner());
-        thinking_pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.blue} {msg}")
-                .unwrap(),
-        );
-        thinking_pb.set_message("Claude is thinking...");
-        thinking_pb.enable_steady_tick(Duration::from_millis(100));
-
-        // Manual conversation handling for real-time display
-        let mut current_messages = state.conversation_history.clone();
-        let max_iterations = 100;
-        let mut iterations = 0;
-        let mut final_response = None;
-
-        loop {
-            if iterations >= max_iterations {
-                thinking_pb.finish_and_clear();
-                ui.print_error("Maximum tool execution iterations reached");
-                break;
-            }
-
-            // Create request
-            let request = claude::MessageRequest {
-                model: client.model().to_string(),
-                messages: current_messages.clone(),
-                tools: registry.get_tool_defs(),
-                max_tokens: 1024,
-                system: Some(system_prompt.to_string()),
-                temperature: None,
+                .ok()
+                .flatten()
+            else {
+                continue;
             };
-
-            // Send message
-            match client.next_message(request).await {
-                Ok(response) => {
-                    thinking_pb.finish_and_clear();
-
-                    // Process response content in real-time
-                    let mut has_tool_uses = false;
-                    let mut tool_results = Vec::new();
-                    let mut tool_was_denied = false;
-
-                    for block in &response.content {
-                        match block {
-                            ContentBlock::Text { text } => {
-                                // Show text immediately
-                                ui.print_message("assistant", text);
-                            }
-                            ContentBlock::ToolUse { name, input, id } => {
-                                has_tool_uses = true;
-                                // Don't show tool use until after permission check
-
-                                // Execute tool (permission check happens inside)
-                                match registry.execute_tool(name, input.clone(), id.clone()).await {
-                                    Ok(result) => {
-                                        // Check if this is a permission denial (is_error = true and content contains "denied")
-                                        if let ContentBlock::ToolResult {
-                                            content,
-                                            is_error: Some(true),
-                                            ..
-                                        } = &result
-                                        {
-                                            if content.contains("denied") {
-                                                // Permission was denied - don't show progress bar
-                                                println!(
-                                                    "   {} Tool {} was not executed: {}",
-                                                    "✗".red(),
-                                                    name.cyan(),
-                                                    content.dimmed()
-                                                );
-                                                tool_was_denied = true;
-                                            } else {
-                                                // Other error during execution - show progress bar
-                                                let pb = ui.print_tool_use(name, input);
-                                                pb.finish_with_message(format!(
-                                                    "✗ {} failed",
-                                                    name.red()
-                                                ));
-                                                println!(
-                                                    "   {} Error: {}",
-                                                    "→".red(),
-                                                    ui.shorten_result_public(content).dimmed()
-                                                );
-                                            }
-                                        } else {
-                                            // Success - show progress bar
-                                            let pb = ui.print_tool_use(name, input);
-                                            pb.finish_with_message(format!(
-                                                "✓ {} completed",
-                                                name.green()
-                                            ));
-                                            if let ContentBlock::ToolResult { content, .. } =
-                                                &result
-                                            {
-                                                println!(
-                                                    "   {} Result: {}",
-                                                    "→".cyan(),
-                                                    ui.shorten_result_public(content).dimmed()
-                                                );
-                                            }
-                                        }
-                                        tool_results.push(result);
-                                    }
-                                    Err(e) => {
-                                        // Unexpected error (tool not found, etc)
-                                        println!(
-                                            "   {} Tool {} error: {}",
-                                            "✗".red(),
-                                            name.cyan(),
-                                            e.to_string().dimmed()
-                                        );
-                                        tool_results.push(ContentBlock::ToolResult {
-                                            tool_use_id: id.clone(),
-                                            content: format!("Error: {}", e),
-                                            is_error: Some(true),
-                                        });
-                                    }
-                                }
-                            }
-                            ContentBlock::ToolResult { .. } => {
-                                // Should not appear in assistant responses
-                            }
+            match load_state(&saved[idx]) {
+                Ok(state) => {
+                    match build_provider(&keys, &state.provider, state.model.clone()) {
+                        Ok(provider) => agent.set_provider(provider),
+                        Err(e) => {
+                            ui.print_error(&format!(
+                                "Conversation used provider '{}' which is unavailable ({}); keeping current provider.",
+                                state.provider, e
+                            ));
                         }
                     }
-
-                    // Add assistant response to history
-                    current_messages.push((&response).into());
-
-                    if !has_tool_uses {
-                        // No more tools, we're done
-                        final_response = Some(response);
-                        break;
-                    }
-
-                    // Add tool results to messages
-                    if !tool_results.is_empty() {
-                        current_messages.push(Message::user(tool_results));
-
-                        if tool_was_denied {
-                            // Tool was denied - stop processing and wait for user input
-                            println!(
-                                "\n{} {}",
-                                "⚠️".yellow(),
-                                "Tool execution was denied. The conversation has been paused."
-                                    .yellow()
-                            );
-                            println!("{}", "You can now provide new instructions or continue the conversation.".dimmed());
-                            println!();
-
-                            // Save the response with proper conversation history
-                            final_response = Some(response);
-                            break;
+                    permission_handler.set_always_allow(state.always_allow_tools.clone());
+                    permission_handler.set_always_deny(state.always_deny_tools.clone());
+                    agent.history = state.conversation_history;
+                    ui.print_info(&format!(
+                        "Loaded {} messages on {} / {}",
+                        agent.history.len(),
+                        agent.provider().id(),
+                        agent.provider().model()
+                    ));
+                    for msg in &agent.history {
+                        let text = msg.text();
+                        if !text.is_empty() {
+                            ui.print_message(&msg.role, &text);
                         }
-
-                        // Show we're waiting for Claude's next response
-                        thinking_pb = ui.multi_progress().add(ProgressBar::new_spinner());
-                        thinking_pb.set_style(
-                            ProgressStyle::default_spinner()
-                                .template("{spinner:.blue} {msg}")
-                                .unwrap(),
-                        );
-                        thinking_pb.set_message("Processing tool results...");
-                        thinking_pb.enable_steady_tick(Duration::from_millis(100));
                     }
+                    println!();
+                }
+                Err(e) => ui.print_error(&format!("Failed to load: {}", e)),
+            }
+            continue;
+        } else if trimmed.eq_ignore_ascii_case("/model") {
+            let provider_name = if available.len() == 1 {
+                available[0]
+            } else {
+                let selection = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select provider")
+                    .items(&available)
+                    .default(0)
+                    .interact()
+                    .unwrap_or(0);
+                available[selection]
+            };
+            let model = choose_model(provider_name);
+            match build_provider(&keys, provider_name, model) {
+                Ok(provider) => {
+                    agent.set_provider(provider);
+                    ui.print_info(&format!(
+                        "Switched to {} / {}",
+                        agent.provider().id(),
+                        agent.provider().model()
+                    ));
+                }
+                Err(e) => ui.print_error(&format!("Failed to switch: {}", e)),
+            }
+            continue;
+        } else if trimmed.is_empty() {
+            continue;
+        }
 
-                    iterations += 1;
+        // Run the turn, rendering events as they arrive. The spinner lives in
+        // a RefCell so the event closure can start/stop it; ApiCallFinished is
+        // guaranteed to fire even on errors, keeping the state balanced.
+        let spinner: RefCell<Option<ProgressBar>> = RefCell::new(None);
+        let streaming = RefCell::new(false);
+        let clear_spinner = || {
+            if let Some(pb) = spinner.borrow_mut().take() {
+                pb.finish_and_clear();
+            }
+        };
+        let mut on_event = |event: AgentEvent| match event {
+            AgentEvent::ApiCallStarted => {
+                *spinner.borrow_mut() = Some(ui.spinner("Thinking..."));
+            }
+            AgentEvent::ApiCallFinished { .. } => {
+                clear_spinner();
+                if *streaming.borrow() {
+                    ui.stream_end();
+                    *streaming.borrow_mut() = false;
                 }
-                Err(e) => {
-                    thinking_pb.finish_and_clear();
-                    ui.print_error(&format!("{}", e));
-                    break;
-                }
+            }
+            AgentEvent::AssistantTextDelta(text) => {
+                clear_spinner();
+                let first = !*streaming.borrow();
+                ui.stream_delta(first, &text);
+                *streaming.borrow_mut() = true;
+            }
+            AgentEvent::AssistantText(text) => ui.print_message("assistant", &text),
+            AgentEvent::ToolCallStarted { name, input } => ui.print_tool_call(&name, &input),
+            AgentEvent::ToolCallFinished {
+                name,
+                outcome,
+                content,
+            } => ui.print_tool_result(&name, outcome, &content),
+            AgentEvent::Retrying {
+                attempt,
+                max_retries,
+                delay_secs,
+                error,
+            } => {
+                ui.print_info(&format!(
+                    "Transient API error ({}); retry {}/{} in {}s",
+                    error, attempt, max_retries, delay_secs
+                ));
+            }
+            AgentEvent::Notice(message) => ui.print_info(&message),
+        };
+
+        match agent.run_turn(trimmed, &mut on_event).await {
+            Ok(TurnOutcome::Completed) | Ok(TurnOutcome::Refused) => {}
+            Ok(TurnOutcome::PausedOnDenial) => {
+                ui.print_info("You can now give new instructions.");
+            }
+            Ok(TurnOutcome::MaxIterationsReached) => {
+                ui.print_info("Ask to continue if you want the agent to keep going.");
+            }
+            Err(e) => {
+                ui.print_error(&e.to_string());
+                ui.print_info("The conversation so far is preserved; you can continue or /save.");
             }
         }
 
-        // Update conversation history with the full exchange
-        if let Some(_final_resp) = final_response {
-            state.conversation_history = current_messages;
-        }
-
+        // Best-effort autosave so a crash never loses a session.
+        let _ = save_state(
+            &make_saved_state(&agent, &permission_handler),
+            AUTOSAVE_NAME,
+        );
         println!();
     }
     Ok(())

@@ -1,88 +1,40 @@
-use crate::error::{Error, Result};
+//! Tool trait and registry.
+
+use crate::error::Result;
 use crate::execution::{ExecutionState, ToolExecution};
-use crate::message::ContentBlock;
 use crate::permissions::{
     AlwaysAllowPermissions, PermissionDecision, ToolExecutionRequest, ToolPermissionHandler,
 };
-use crate::request::ToolDef;
+use crate::types::{ContentBlock, ToolDef};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Trait defining a tool that Claude can use during conversations
-///
-/// Implement this trait to create custom tools that extend Claude's capabilities.
-/// Tools can perform any computation or side effect and return results back to Claude.
-///
-/// # Example
-///
-/// ```rust
-/// use claude::{Tool, ToolDef};
-/// use serde_json::{json, Value};
-/// use async_trait::async_trait;
-///
-/// struct Calculator;
-///
-/// #[async_trait]
-/// impl Tool for Calculator {
-///     fn name(&self) -> &str {
-///         "calculator"
-///     }
-///     
-///     fn description(&self) -> &str {
-///         "Performs basic arithmetic operations"
-///     }
-///     
-///     fn input_schema(&self) -> Value {
-///         json!({
-///             "type": "object",
-///             "properties": {
-///                 "expression": {
-///                     "type": "string",
-///                     "description": "Mathematical expression to evaluate"
-///                 }
-///             },
-///             "required": ["expression"]
-///         })
-///     }
-///     
-///     async fn execute(&self, input: Value) -> Result<String, claude::Error> {
-///         let expr = input["expression"]
-///             .as_str()
-///             .ok_or_else(|| claude::Error::Other("Missing expression".to_string()))?;
-///         
-///         // Simplified - real implementation would parse and evaluate
-///         match expr {
-///             "2+2" => Ok("4".to_string()),
-///             _ => Ok("Complex calculation not implemented".to_string()),
-///         }
-///     }
-/// }
-/// ```
+/// A capability the model can invoke during a conversation.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Get the unique name of this tool
+    /// Unique tool name (what the model calls).
     fn name(&self) -> &str;
 
-    /// Get a human-readable description of what this tool does
+    /// Description shown to the model. Say *when* to use the tool, not just
+    /// what it does — models trigger tools from this text.
     fn description(&self) -> &str;
 
-    /// Get the JSON schema defining the expected input format
+    /// JSON Schema for the tool's input.
     fn input_schema(&self) -> Value;
 
-    /// Execute the tool with the given input parameters
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - The input parameters as a JSON Value matching the schema
-    ///
-    /// # Returns
-    ///
-    /// Returns a Result containing either the tool's output as a string or an error
+    /// Execute with validated-by-the-model input; return output text.
     async fn execute(&self, input: Value) -> Result<String>;
 
-    /// Convert this tool to a ToolDef for use with the Claude API
+    /// Code-only tools are excluded from the model-facing tool list but
+    /// remain callable from code-mode scripts (progressive disclosure —
+    /// their schemas live in the generated `tools` module's docstrings).
+    /// MCP tools use this to keep heavy schemas out of the context.
+    fn code_only(&self) -> bool {
+        false
+    }
+
     fn to_tool_def(&self) -> ToolDef {
         ToolDef {
             name: self.name().to_string(),
@@ -92,181 +44,157 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// Registry for managing available tools
-///
-/// The `ToolRegistry` maintains a collection of tools that Claude can use,
-/// handles tool execution with permission checking, and tracks execution history.
-///
-/// # Example
-///
-/// ```rust
-/// use claude::{ToolRegistry, Tool};
-/// use std::sync::Arc;
-/// # use async_trait::async_trait;
-/// # use serde_json::Value;
-/// # struct MyTool;
-/// # #[async_trait]
-/// # impl Tool for MyTool {
-/// #     fn name(&self) -> &str { "my_tool" }
-/// #     fn description(&self) -> &str { "A custom tool" }
-/// #     fn input_schema(&self) -> Value { serde_json::json!({}) }
-/// #     async fn execute(&self, input: Value) -> Result<String, claude::Error> { Ok("Done".to_string()) }
-/// # }
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut registry = ToolRegistry::new();
-///
-/// // Register a tool
-/// registry.register(Arc::new(MyTool))?;
-///
-/// // Check available tools
-/// assert!(registry.has_tool("my_tool"));
-///
-/// // Get tool definitions for Claude
-/// let tool_defs = registry.get_tool_defs();
-/// assert_eq!(tool_defs.len(), 1);
-/// # Ok(())
-/// # }
-/// ```
+/// How a tool call ended. This is a structured signal — never inferred from
+/// the result text — so callers can distinguish a permission denial from an
+/// ordinary tool failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallOutcome {
+    Success,
+    Failed,
+    Denied,
+}
+
+/// The result block to feed back to the model, plus what actually happened.
+#[derive(Debug)]
+pub struct ToolCallResult {
+    pub block: ContentBlock,
+    pub outcome: ToolCallOutcome,
+}
+
+impl ToolCallResult {
+    fn new(tool_use_id: String, content: String, outcome: ToolCallOutcome) -> Self {
+        let is_error = match outcome {
+            ToolCallOutcome::Success => None,
+            _ => Some(true),
+        };
+        Self {
+            block: ContentBlock::ToolResult {
+                content,
+                tool_use_id,
+                is_error,
+            },
+            outcome,
+        }
+    }
+}
+
+/// Holds the available tools, runs them behind a permission handler, and
+/// records execution history.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    order: Vec<String>,
     executions: Vec<ToolExecution>,
     permission_handler: Box<dyn ToolPermissionHandler>,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
-    /// Create a new empty tool registry
     pub fn new() -> Self {
-        Self {
-            tools: HashMap::new(),
-            executions: Vec::new(),
-            permission_handler: Box::new(AlwaysAllowPermissions),
-        }
+        Self::with_permission_handler(Box::new(AlwaysAllowPermissions))
     }
 
-    /// Create a new tool registry with a custom permission handler
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use claude::{ToolRegistry, LoggingPermissions};
-    ///
-    /// let registry = ToolRegistry::with_permission_handler(
-    ///     Box::new(LoggingPermissions)
-    /// );
-    /// ```
     pub fn with_permission_handler(handler: Box<dyn ToolPermissionHandler>) -> Self {
         Self {
             tools: HashMap::new(),
+            order: Vec::new(),
             executions: Vec::new(),
             permission_handler: handler,
         }
     }
 
-    /// Set a new permission handler for this registry
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use claude::{ToolRegistry, InteractivePermissions};
-    ///
-    /// let mut registry = ToolRegistry::new();
-    /// registry.set_permission_handler(Box::new(
-    ///     InteractivePermissions::new(|req| {
-    ///         println!("Allow tool '{}'?", req.tool_name);
-    ///         true // Allow all for this example
-    ///     })
-    /// ));
-    /// ```
     pub fn set_permission_handler(&mut self, handler: Box<dyn ToolPermissionHandler>) {
         self.permission_handler = handler;
     }
 
-    /// Register a new tool in the registry
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a tool with the same name is already registered
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use claude::{ToolRegistry, Tool};
-    /// # use std::sync::Arc;
-    /// # use async_trait::async_trait;
-    /// # use serde_json::Value;
-    /// # struct MyTool;
-    /// # #[async_trait]
-    /// # impl Tool for MyTool {
-    /// #     fn name(&self) -> &str { "my_tool" }
-    /// #     fn description(&self) -> &str { "A custom tool" }
-    /// #     fn input_schema(&self) -> Value { serde_json::json!({}) }
-    /// #     async fn execute(&self, input: Value) -> Result<String, claude::Error> { Ok("Done".to_string()) }
-    /// # }
-    /// let mut registry = ToolRegistry::new();
-    /// registry.register(Arc::new(MyTool))?;
-    /// # Ok::<(), claude::Error>(())
-    /// ```
+    /// Run a request through this registry's permission handler without
+    /// executing anything. Used for agent-level tools (e.g. code mode) that
+    /// are not in the registry but must obey the same policy.
+    pub async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision {
+        self.permission_handler.check_permission(request).await
+    }
+
+    /// Register a tool. Errors if the name is already taken.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<()> {
         let name = tool.name().to_string();
         if self.tools.contains_key(&name) {
-            return Err(Error::Other(format!("Tool '{}' already registered", name)));
+            return Err(crate::error::Error::Other(format!(
+                "Tool '{}' already registered",
+                name
+            )));
         }
+        self.order.push(name.clone());
         self.tools.insert(name, tool);
         Ok(())
     }
 
-    /// Get tool definitions for all registered tools
+    /// Model-facing tool definitions in registration order, excluding
+    /// code-only tools.
     ///
-    /// Returns a vector of ToolDef structs that can be sent to the Claude API
+    /// The order is deterministic on purpose: providers that cache the prompt
+    /// prefix would otherwise miss the cache whenever a HashMap iteration
+    /// order changed.
     pub fn get_tool_defs(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|tool| tool.to_tool_def()).collect()
+        self.order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .filter(|tool| !tool.code_only())
+            .map(|tool| tool.to_tool_def())
+            .collect()
     }
 
-    /// Check if a tool with the given name is registered
+    /// Every tool, including code-only ones — the set exposed to code-mode
+    /// scripts through the generated `tools` module.
+    pub fn get_bridge_tool_defs(&self) -> Vec<ToolDef> {
+        self.order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .map(|tool| tool.to_tool_def())
+            .collect()
+    }
+
+    /// Definitions of code-only tools (for listing their names to the model).
+    pub fn code_only_tool_defs(&self) -> Vec<ToolDef> {
+        self.order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .filter(|tool| tool.code_only())
+            .map(|tool| tool.to_tool_def())
+            .collect()
+    }
+
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
 
-    /// Get a reference to a specific tool by name
-    pub fn get_tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
-        self.tools.get(name)
-    }
-
-    /// Get all registered tool names
     pub fn tool_names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        self.order.clone()
     }
 
-    /// Execute a tool with permission checking
-    ///
-    /// # Arguments
-    ///
-    /// * `tool_name` - Name of the tool to execute
-    /// * `input` - Input parameters for the tool
-    /// * `tool_use_id` - Unique identifier for this tool execution
-    ///
-    /// # Returns
-    ///
-    /// Returns Ok with a ContentBlock containing the result or error
+    /// Execute a tool call. Infallible by design: every failure mode becomes
+    /// a `ToolResult` block the model can react to, with the real outcome
+    /// reported alongside.
     pub async fn execute_tool(
         &mut self,
         tool_name: &str,
         input: Value,
         tool_use_id: String,
-    ) -> Result<ContentBlock> {
-        // Find the tool
-        let tool = self
-            .tools
-            .get(tool_name)
-            .ok_or_else(|| Error::Other(format!("Tool '{}' not found", tool_name)))?
-            .clone();
+    ) -> ToolCallResult {
+        let Some(tool) = self.tools.get(tool_name).cloned() else {
+            return ToolCallResult::new(
+                tool_use_id,
+                format!("Tool '{}' not found", tool_name),
+                ToolCallOutcome::Failed,
+            );
+        };
 
-        // Create execution record
         let mut execution =
             ToolExecution::new(tool_use_id.clone(), tool_name.to_string(), input.clone());
 
-        // Check permissions
         let request = ToolExecutionRequest {
             tool_use_id: tool_use_id.clone(),
             tool_name: tool_name.to_string(),
@@ -274,105 +202,138 @@ impl ToolRegistry {
             tool_description: tool.description().to_string(),
         };
 
-        let decision = self.permission_handler.check_permission(&request).await;
-
-        match decision {
+        match self.permission_handler.check_permission(&request).await {
             PermissionDecision::Allow => {
                 execution.state = ExecutionState::Executing;
-                self.executions.push(execution.clone());
-
-                // Execute the tool
-                match tool.execute(input).await {
+                let result = tool.execute(input).await;
+                let call_result = match result {
                     Ok(output) => {
-                        // Update execution record
-                        if let Some(exec) = self.executions.iter_mut().find(|e| e.id == tool_use_id)
-                        {
-                            exec.complete(Ok(output.clone()));
-                        }
-
-                        Ok(ContentBlock::ToolResult {
-                            content: output,
-                            tool_use_id,
-                            is_error: None,
-                        })
+                        execution.complete(Ok(output.clone()));
+                        ToolCallResult::new(tool_use_id, output, ToolCallOutcome::Success)
                     }
                     Err(e) => {
-                        let error_msg = e.to_string();
-
-                        // Update execution record
-                        if let Some(exec) = self.executions.iter_mut().find(|e| e.id == tool_use_id)
-                        {
-                            exec.complete(Err(error_msg.clone()));
-                        }
-
-                        Ok(ContentBlock::ToolResult {
-                            content: format!("Tool execution failed: {}", error_msg),
+                        let message = e.to_string();
+                        execution.complete(Err(message.clone()));
+                        ToolCallResult::new(
                             tool_use_id,
-                            is_error: Some(true),
-                        })
+                            format!("Tool execution failed: {}", message),
+                            ToolCallOutcome::Failed,
+                        )
                     }
-                }
+                };
+                self.executions.push(execution);
+                call_result
             }
             PermissionDecision::Deny => {
                 execution.deny("Permission denied");
                 self.executions.push(execution);
-
-                Ok(ContentBlock::ToolResult {
-                    content: "Tool execution denied".to_string(),
+                ToolCallResult::new(
                     tool_use_id,
-                    is_error: Some(true),
-                })
+                    "The user declined to run this tool.".to_string(),
+                    ToolCallOutcome::Denied,
+                )
             }
             PermissionDecision::DenyWithReason(reason) => {
                 execution.deny(&reason);
                 self.executions.push(execution);
-
-                Ok(ContentBlock::ToolResult {
-                    content: format!("Tool execution denied: {}", reason),
+                ToolCallResult::new(
                     tool_use_id,
-                    is_error: Some(true),
-                })
+                    format!("The user declined to run this tool: {}", reason),
+                    ToolCallOutcome::Denied,
+                )
             }
         }
     }
 
-    /// Get the execution history
     pub fn execution_history(&self) -> &[ToolExecution] {
         &self.executions
     }
 
-    /// Clear the execution history
     pub fn clear_history(&mut self) {
         self.executions.clear();
     }
+}
 
-    /// Get execution statistics
-    ///
-    /// Returns a summary of tool executions including counts by status
-    pub fn execution_stats(&self) -> HashMap<String, usize> {
-        let mut stats = HashMap::new();
-        stats.insert("total".to_string(), self.executions.len());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permissions::AlwaysDenyPermissions;
+    use serde_json::json;
 
-        let mut completed = 0;
-        let mut failed = 0;
-        let mut denied = 0;
-        let mut executing = 0;
+    struct Echo;
 
-        for exec in &self.executions {
-            match &exec.state {
-                ExecutionState::Completed { .. } => completed += 1,
-                ExecutionState::Failed { .. } => failed += 1,
-                ExecutionState::Denied { .. } => denied += 1,
-                ExecutionState::Executing => executing += 1,
-                _ => {}
-            }
+    #[async_trait]
+    impl Tool for Echo {
+        fn name(&self) -> &str {
+            "echo"
         }
+        fn description(&self) -> &str {
+            "Echo the input"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, input: Value) -> Result<String> {
+            Ok(input.to_string())
+        }
+    }
 
-        stats.insert("completed".to_string(), completed);
-        stats.insert("failed".to_string(), failed);
-        stats.insert("denied".to_string(), denied);
-        stats.insert("executing".to_string(), executing);
+    struct Fails;
 
-        stats
+    #[async_trait]
+    impl Tool for Fails {
+        fn name(&self) -> &str {
+            "fails"
+        }
+        fn description(&self) -> &str {
+            "Always fails"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _input: Value) -> Result<String> {
+            Err(crate::error::Error::Tool(
+                "Permission denied (os error 13)".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn success_denial_and_failure_have_distinct_outcomes() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Echo)).unwrap();
+        registry.register(Arc::new(Fails)).unwrap();
+
+        let ok = registry
+            .execute_tool("echo", json!({"a": 1}), "id1".into())
+            .await;
+        assert_eq!(ok.outcome, ToolCallOutcome::Success);
+
+        // A tool error whose text contains "denied" must NOT read as a denial.
+        let failed = registry
+            .execute_tool("fails", json!({}), "id2".into())
+            .await;
+        assert_eq!(failed.outcome, ToolCallOutcome::Failed);
+
+        let missing = registry.execute_tool("nope", json!({}), "id3".into()).await;
+        assert_eq!(missing.outcome, ToolCallOutcome::Failed);
+
+        let mut denying = ToolRegistry::with_permission_handler(Box::new(AlwaysDenyPermissions));
+        denying.register(Arc::new(Echo)).unwrap();
+        let denied = denying.execute_tool("echo", json!({}), "id4".into()).await;
+        assert_eq!(denied.outcome, ToolCallOutcome::Denied);
+    }
+
+    #[test]
+    fn tool_defs_preserve_registration_order() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Fails)).unwrap();
+        registry.register(Arc::new(Echo)).unwrap();
+        let names: Vec<String> = registry
+            .get_tool_defs()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(names, vec!["fails", "echo"]);
     }
 }

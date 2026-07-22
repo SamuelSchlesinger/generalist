@@ -1,85 +1,75 @@
 /*!
-A Rust client library for Anthropic's Claude AI models and API.
+# generalist
 
-This crate provides a simple, type-safe interface for interacting with Claude's API,
-with a focus on the Messages API and tool-based interactions. It allows you to:
+A provider-agnostic agent library and CLI.
 
-- Send messages to Claude models
-- Define and use tools that Claude can invoke
-- Handle multi-turn conversations
-- Process tool calls and results
-- Control tool execution with permission handlers
+The core is small and deliberate:
 
-## Quick Start
+- [`types`] — neutral conversation types ([`Message`], [`ContentBlock`], ...)
+- [`provider`] — the [`Provider`] trait plus Anthropic and OpenAI-compatible
+  implementations
+- [`tool`] — the [`Tool`] trait and [`ToolRegistry`], with permission gating
+- [`agent`] — [`Agent`], the request → tool → result loop, reporting progress
+  through [`AgentEvent`] callbacks
+- [`permissions`] — pluggable [`ToolPermissionHandler`] implementations
+- [`tools`] — a batteries-included tool set (bash, file ops, web, memory, ...)
+
+## Quick start
 
 ```rust,no_run
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-use claude::{Claude, ToolRegistry};
+use generalist::{Agent, AgentEvent, ToolRegistry};
+use generalist::provider::AnthropicProvider;
+use generalist::tools::CalculatorTool;
+use std::sync::Arc;
 
-// Create a Claude client
-let client = Claude::new(
-    "your-api-key".to_string(),
-    "claude-3-haiku-20240307".to_string()
-);
-
-// Create a tool registry and register tools
+# async fn example() -> generalist::Result<()> {
+let provider = AnthropicProvider::new("api-key".into(), "claude-opus-4-8".into())?;
 let mut registry = ToolRegistry::new();
-// Register your custom tools here
-// registry.register(Arc::new(MyCustomTool))?;
+registry.register(Arc::new(CalculatorTool))?;
 
-// Have a conversation with automatic tool execution
-let response = client.run_conversation_turn(
-    "What's the weather in London?",
-    &mut registry,
-    Some("You are a helpful assistant."),
-    None,  // No conversation history
-    None   // Use default max iterations
-).await?;
+let mut agent = Agent::new(Box::new(provider), registry, "You are a helpful assistant.");
+let outcome = agent
+    .run_turn("What is 2 + 2?", &mut |event| {
+        if let AgentEvent::AssistantText(text) = event {
+            println!("{}", text);
+        }
+    })
+    .await?;
+# let _ = outcome;
 # Ok(())
 # }
 ```
 
-## Features
-
-- **Easy-to-use client**: Simple API for interacting with Claude models
-- **Strongly typed**: Full type safety with Rust's type system
-- **Tool support**: Define custom tools that Claude can use during conversations
-- **Permission control**: Fine-grained control over tool execution with permission handlers
-- **Conversation management**: Track multi-turn conversations with message history
-- **Real-time execution**: Process tool calls as they happen
-- **Comprehensive error handling**: Detailed error types for debugging
-
-## Main Components
-
-- [`Claude`]: The main client for interacting with the API
-- [`Tool`]: Trait for implementing custom tools
-- [`ToolRegistry`]: Manages available tools and tracks execution history
-- [`Message`] and [`ContentBlock`]: Core types for conversation messages
-- [`ToolPermissionHandler`]: Control whether tools can be executed
+The full conversation lives in `agent.history` and survives errors, so a
+failed request never loses the record of tool calls that already ran.
 */
 
-// Re-export main types from submodules
-pub use client::{Claude, MESSAGES_ENDPOINT};
-pub use error::{Error, Result};
-pub use execution::{ExecutionState, ToolExecution};
-pub use message::{ContentBlock, Message, ToolUse};
-pub use permissions::{
-    AlwaysAllowPermissions, AlwaysDenyPermissions, InteractivePermissions, LoggingPermissions,
-    MemoryPermissionHandler, PermissionDecision, PolicyPermissions, ToolExecutionRequest,
-    ToolPermissionHandler,
-};
-pub use request::{MessageRequest, MessageResponse, ToolDef, Usage};
-pub use state::ChatbotState;
-pub use tool::{Tool, ToolRegistry};
-
-// Modules
+pub mod agent;
 pub mod chat_ui;
-pub mod client;
+#[cfg(unix)]
+pub(crate) mod codemode;
 pub mod error;
 pub mod execution;
-pub mod message;
+pub mod mcp;
 pub mod permissions;
-pub mod request;
+pub mod provider;
+pub mod skills;
 pub mod state;
 pub mod tool;
 pub mod tools;
+pub mod types;
+
+pub use agent::{Agent, AgentEvent, TurnOutcome};
+pub use error::{Error, Result};
+pub use execution::{ExecutionState, ToolExecution};
+pub use permissions::{
+    AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler, PermissionDecision,
+    PolicyPermissions, ToolExecutionRequest, ToolPermissionHandler,
+};
+pub use provider::Provider;
+pub use state::SavedState;
+pub use tool::{Tool, ToolCallOutcome, ToolCallResult, ToolRegistry};
+pub use types::{
+    estimate_tokens, truncate_middle, CompletionRequest, CompletionResponse, ContentBlock, Message,
+    StopReason, ToolDef, ToolUse, Usage,
+};

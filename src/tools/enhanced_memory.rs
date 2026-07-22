@@ -44,7 +44,7 @@ impl MemoryStorage {
         for tag in &entry.tags {
             self.tag_index
                 .entry(tag.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(entry.id.clone());
         }
 
@@ -82,7 +82,7 @@ impl MemoryStorage {
             for tag in &new_tags {
                 self.tag_index
                     .entry(tag.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(id.to_string());
             }
 
@@ -129,7 +129,7 @@ impl MemoryStorage {
         }
 
         // Sort by updated_at (most recent first)
-        results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
 
         // Apply limit
         if let Some(limit) = limit {
@@ -165,12 +165,26 @@ impl EnhancedMemoryTool {
     }
 
     fn get_storage_path() -> PathBuf {
+        #[allow(deprecated)]
+        let home_dir = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home_dir.join(".generalist_memory.json")
+    }
+
+    /// Storage location used by earlier versions; read as a fallback so
+    /// existing memories carry over.
+    fn legacy_storage_path() -> PathBuf {
+        #[allow(deprecated)]
         let home_dir = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
         home_dir.join(".claude_memory.json")
     }
 
     fn load_storage() -> Result<MemoryStorage> {
         let path = Self::get_storage_path();
+        let path = if path.exists() {
+            path
+        } else {
+            Self::legacy_storage_path()
+        };
 
         if path.exists() {
             let data = fs::read_to_string(&path)
@@ -370,7 +384,7 @@ impl Tool for EnhancedMemoryTool {
                     .collect();
 
                 // Sort by count (descending)
-                tags.sort_by(|a, b| b.1.cmp(&a.1));
+                tags.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
 
                 Ok(json!({
                     "success": true,

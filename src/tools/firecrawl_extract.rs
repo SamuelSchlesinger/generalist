@@ -211,22 +211,18 @@ impl Tool for FirecrawlExtractTool {
             .await
         {
             Ok(scrape_result) => {
-                let metadata = Some(&scrape_result.metadata);
-                let metadata = if let Some(meta) = metadata {
-                    Some(PageMetadata {
-                        title: meta.title.clone(),
-                        description: meta.description.clone(),
-                        language: meta.language.clone(),
-                        keywords: meta.keywords.clone(),
-                        author: None, // DocumentMetadata doesn't have author field
-                        published_date: meta.published_time.clone(),
-                        modified_date: meta.modified_time.clone(),
-                        site_name: meta.og_site_name.clone(),
-                        og_data: None,
-                    })
-                } else {
-                    None
-                };
+                let meta = &scrape_result.metadata;
+                let metadata = Some(PageMetadata {
+                    title: meta.title.clone(),
+                    description: meta.description.clone(),
+                    language: meta.language.clone(),
+                    keywords: meta.keywords.clone(),
+                    author: None, // DocumentMetadata doesn't have an author field
+                    published_date: meta.published_time.clone(),
+                    modified_date: meta.modified_time.clone(),
+                    site_name: meta.og_site_name.clone(),
+                    og_data: None,
+                });
 
                 let images = None;
 

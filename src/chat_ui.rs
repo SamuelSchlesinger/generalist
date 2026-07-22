@@ -1,207 +1,151 @@
+//! Terminal rendering for the CLI.
+
+use crate::tool::ToolCallOutcome;
+use crate::types::truncate_middle;
 use chrono::Local;
 use colored::*;
-use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde_json::Value;
-use tokio::time::Duration;
+use std::time::Duration;
 
 pub struct ChatUI {
-    term: Term,
     multi_progress: MultiProgress,
-    max_result_length: usize,
+    /// Display cap for tool inputs/results. Only affects what is printed —
+    /// the model always receives the full (history-truncated) content.
+    pub max_display_chars: usize,
+}
+
+impl Default for ChatUI {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChatUI {
     pub fn new() -> Self {
         Self {
-            term: Term::stdout(),
             multi_progress: MultiProgress::new(),
-            max_result_length: 200,
+            max_display_chars: 300,
         }
     }
 
-    fn shorten_result(&self, result: &str) -> String {
-        let char_count = result.chars().count();
-        if char_count <= self.max_result_length {
-            result.to_string()
-        } else {
-            let half_len = (self.max_result_length - 20) / 2;
-            let chars: Vec<char> = result.chars().collect();
-            
-            let start: String = chars.iter().take(half_len).collect();
-            let end: String = chars.iter().skip(char_count.saturating_sub(half_len)).collect();
-            
-            format!(
-                "{}... [truncated {} chars] ...{}",
-                start,
-                char_count - self.max_result_length,
-                end
-            )
-        }
-    }
-
-    pub fn print_welcome(&self) {
-        self.term.clear_screen().unwrap();
-        println!(
-            "{}",
-            "╔═══════════════════════════════════════════════════════════╗".bright_blue()
-        );
-        println!(
-            "{}",
-            "║            🤖 Claude CLI Chatbot with Tools 🛠️            ║".bright_blue()
-        );
-        println!(
-            "{}",
-            "╚═══════════════════════════════════════════════════════════╝".bright_blue()
-        );
+    pub fn print_welcome(&self, provider: &str, model: &str, tools: &[String]) {
         println!();
-        println!("{}", "Available tools:".yellow());
-        println!("  • {} - Apply patches/diffs to files", "patch_file".cyan());
-        println!("  • {} - Read content from files", "read_file".cyan());
-        println!("  • {} - List directory contents", "list_directory".cyan());
-        println!("  • {} - Execute bash commands", "bash".cyan());
-        println!("  • {} - Get system information", "system_info".cyan());
+        println!("{}", "generalist — a provider-agnostic CLI agent".bold());
         println!(
-            "  • {} - Perform mathematical calculations",
-            "calculator".cyan()
+            "{} {} {} {}",
+            "Provider:".dimmed(),
+            provider.cyan(),
+            "Model:".dimmed(),
+            model.cyan()
         );
-        println!(
-            "  • {} - Get current weather for any city",
-            "weather".cyan()
-        );
-        println!(
-            "  • {} - Make HTTP requests to fetch data",
-            "http_fetch".cyan()
-        );
-        println!(
-            "  • {} - Store and search persistent memories",
-            "enhanced_memory".cyan()
-        );
-        println!("  • {} - Think more deeply about topics", "think".cyan());
-        println!(
-            "  • {} - Search Wikipedia articles and get summaries",
-            "wikipedia".cyan()
-        );
-        println!(
-            "  • {} - Z3 SMT/SAT constraint solver for logic and optimization",
-            "z3_solver".cyan()
-        );
-        println!(
-            "  • {} - Crawl websites and extract content using Firecrawl",
-            "firecrawl_crawl".cyan()
-        );
-        println!(
-            "  • {} - Search the web using Firecrawl's search API",
-            "firecrawl_search".cyan()
-        );
-        println!(
-            "  • {} - Map website structure using Firecrawl",
-            "firecrawl_map".cyan()
-        );
-        println!(
-            "  • {} - Extract structured data from web pages using Firecrawl",
-            "firecrawl_extract".cyan()
-        );
+        println!("{} {}", "Tools:".dimmed(), tools.join(", ").cyan());
         println!();
+        println!(
+            "{}",
+            "Each tool call asks for permission; 'always allow' is remembered per tool.".dimmed()
+        );
         println!(
             "{} {}",
-            "🔐".cyan(),
-            "Tool Permission System Active".yellow().bold()
-        );
-        println!(
-            "{}",
-            "You'll be asked to approve each tool use with these options:".dimmed()
-        );
-        println!(
-            "  • {} - Tool will always be allowed automatically",
-            "Yes (always allow)".green()
-        );
-        println!(
-            "  • {} - Allow just this execution",
-            "Yes (just this once)".green()
-        );
-        println!(
-            "  • {} - Tool will always be denied automatically",
-            "No (never allow)".red()
-        );
-        println!(
-            "  • {} - Deny just this execution",
-            "No (just this once)".red()
-        );
-        println!();
-        println!("{}", "Commands:".yellow());
-        println!("  • {} - Save current conversation", "/save".cyan());
-        println!("  • {} - Load a saved conversation", "/load".cyan());
-        println!("  • {} - Show help message", "/help".cyan());
-        println!(
-            "  • {} or {} - Exit the chatbot",
-            "exit".cyan(),
-            "quit".cyan()
+            "Commands:".dimmed(),
+            "/save /load /model /compact /clear /help, exit".cyan()
         );
         println!("{}", "─".repeat(60).dimmed());
         println!();
     }
 
+    pub fn print_help(&self) {
+        println!("\n{}", "Commands:".yellow().bold());
+        println!("  {} - Save the conversation", "/save".cyan());
+        println!("  {} - Load a saved conversation", "/load".cyan());
+        println!("  {} - Switch model", "/model".cyan());
+        println!(
+            "  {} - Summarize older history to free context",
+            "/compact".cyan()
+        );
+        println!("  {} - Clear the conversation history", "/clear".cyan());
+        println!("  {} - Show this help", "/help".cyan());
+        println!("  {} or {} - Exit", "exit".cyan(), "quit".cyan());
+        println!();
+    }
+
     pub fn print_message(&self, role: &str, content: &str) {
         let timestamp = Local::now().format("%H:%M:%S");
-        match role {
-            "user" => {
-                println!(
-                    "{} {} {}",
-                    format!("[{}]", timestamp).dimmed(),
-                    "You:".green().bold(),
-                    content
-                );
+        let label = match role {
+            "user" => "You:".green().bold(),
+            _ => "Assistant:".blue().bold(),
+        };
+        println!(
+            "{} {} {}",
+            format!("[{}]", timestamp).dimmed(),
+            label,
+            content
+        );
+    }
+
+    /// Announce a tool call *before* it is permission-checked or executed.
+    pub fn print_tool_call(&self, name: &str, input: &Value) {
+        let compact = serde_json::to_string(input).unwrap_or_default();
+        println!(
+            "{} {} {}",
+            "→".cyan(),
+            name.yellow(),
+            truncate_middle(&compact, self.max_display_chars).dimmed()
+        );
+    }
+
+    pub fn print_tool_result(&self, name: &str, outcome: ToolCallOutcome, content: &str) {
+        let shown = truncate_middle(content, self.max_display_chars);
+        match outcome {
+            ToolCallOutcome::Success => {
+                println!("  {} {} {}", "✓".green(), name.yellow(), shown.dimmed());
             }
-            "assistant" => {
-                println!(
-                    "{} {} {}",
-                    format!("[{}]", timestamp).dimmed(),
-                    "Claude:".blue().bold(),
-                    content
-                );
+            ToolCallOutcome::Failed => {
+                println!("  {} {} {}", "✗".red(), name.yellow(), shown.dimmed());
             }
-            _ => {}
+            ToolCallOutcome::Denied => {
+                println!("  {} {} {}", "⊘".red(), name.yellow(), "denied".dimmed());
+            }
         }
     }
 
-    pub fn print_tool_use(&self, tool_name: &str, input: &Value) -> ProgressBar {
+    pub fn spinner(&self, message: &str) -> ProgressBar {
         let pb = self.multi_progress.add(ProgressBar::new_spinner());
         pb.set_style(
             ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+                .template("{spinner:.blue} {msg}")
+                .expect("static template"),
         );
-        pb.set_message(format!(
-            "🔧 Using tool: {} with input: {}",
-            tool_name.yellow(),
-            serde_json::to_string(input).unwrap_or_default().dimmed()
-        ));
+        pb.set_message(message.to_string());
         pb.enable_steady_tick(Duration::from_millis(100));
         pb
     }
 
-    #[allow(dead_code)]
-    pub fn print_tool_result(&self, tool_name: &str, result: &str, pb: ProgressBar) {
-        pb.finish_and_clear();
-        println!(
-            "   {} {} result: {}",
-            "✓".green(),
-            tool_name.yellow(),
-            result.italic()
-        );
+    /// Render one streamed fragment; `first` prints the message prefix.
+    pub fn stream_delta(&self, first: bool, text: &str) {
+        use std::io::Write;
+        if first {
+            let timestamp = Local::now().format("%H:%M:%S");
+            print!(
+                "{} {} ",
+                format!("[{}]", timestamp).dimmed(),
+                "Assistant:".blue().bold()
+            );
+        }
+        print!("{}", text);
+        std::io::stdout().flush().ok();
+    }
+
+    /// Close a streamed message.
+    pub fn stream_end(&self) {
+        println!();
     }
 
     pub fn print_error(&self, error: &str) {
         println!("{} {}", "Error:".red().bold(), error);
     }
 
-    pub fn multi_progress(&self) -> &MultiProgress {
-        &self.multi_progress
-    }
-
-    pub fn shorten_result_public(&self, result: &str) -> String {
-        self.shorten_result(result)
+    pub fn print_info(&self, message: &str) {
+        println!("{} {}", "ℹ".blue(), message.dimmed());
     }
 }

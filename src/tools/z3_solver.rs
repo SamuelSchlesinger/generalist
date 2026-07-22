@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-/// Z3 SMT/SAT solver tool for constraint solving and verification
+/// Z3 SMT/SAT solver tool. Shells out to the `z3` CLI (must be installed).
 pub struct Z3SolverTool;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -25,9 +25,7 @@ struct Z3Response {
     result: String,
     satisfiable: bool,
     model: Option<HashMap<String, String>>,
-    execution_time_ms: u64,
-    solver_info: HashMap<String, String>,
-    z3_output: Option<String>,
+    z3_output: String,
 }
 
 #[async_trait]
@@ -37,7 +35,9 @@ impl Tool for Z3SolverTool {
     }
 
     fn description(&self) -> &str {
-        "Z3 SMT/SAT constraint solver for logical reasoning, optimization, and verification. Can solve boolean satisfiability, integer/real arithmetic, and constraint optimization problems."
+        "Z3 SMT/SAT constraint solver. Use for logical constraints, satisfiability checks, \
+         optimization under constraints, and proving/disproving implications. Constraints are \
+         written in SMT-LIB s-expression syntax, e.g. '(> x 0)' or '(= (+ x y) 10)'."
     }
 
     fn input_schema(&self) -> Value {
@@ -59,25 +59,18 @@ impl Tool for Z3SolverTool {
                 },
                 "constraints": {
                     "type": "array",
-                    "items": {
-                        "type": "string"
-                    },
-                    "description": "List of constraints in SMT-LIB format (e.g., '(> x 0)', '(= (+ x y) 10)')"
-                },
-                "goal": {
-                    "type": "string",
-                    "enum": ["satisfiable", "unsatisfiable", "unknown"],
-                    "description": "Expected satisfiability result (optional)"
+                    "items": {"type": "string"},
+                    "description": "Constraints in SMT-LIB format, e.g. '(> x 0)'"
                 },
                 "timeout": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 60000,
-                    "description": "Timeout in milliseconds (default: 5000, max: 60000)"
+                    "description": "Timeout in milliseconds (default: 5000)"
                 },
                 "logic": {
                     "type": "string",
-                    "description": "SMT-LIB logic (e.g., QF_LIA, QF_LRA, QF_BOOL)"
+                    "description": "SMT-LIB logic (e.g. QF_LIA, QF_LRA)"
                 },
                 "optimize": {
                     "type": "object",
@@ -90,11 +83,11 @@ impl Tool for Z3SolverTool {
                 "hypothesis": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Hypotheses/premises in SMT-LIB format for proof (for 'prove' action)"
+                    "description": "Premises in SMT-LIB format (for 'prove')"
                 },
                 "conclusion": {
                     "type": "string",
-                    "description": "Conclusion in SMT-LIB format to prove (for 'prove' action)"
+                    "description": "Conclusion in SMT-LIB format to prove (for 'prove')"
                 }
             },
             "required": [],
@@ -103,410 +96,292 @@ impl Tool for Z3SolverTool {
     }
 
     async fn execute(&self, input: Value) -> Result<String> {
-        let start_time = std::time::Instant::now();
-
         let params: Z3Input = serde_json::from_value(input)
-            .map_err(|e| Error::Other(format!(
-                "Invalid input parameters: {}. Example: {{\"constraints\": [\"(> x 0)\", \"(< x 10)\"], \"variables\": {{\"x\": \"Int\"}}}}", e
-            )))?;
+            .map_err(|e| Error::Tool(format!("Invalid input parameters: {}", e)))?;
 
         let action = params.action.clone().unwrap_or_else(|| "solve".to_string());
-        let timeout = params.timeout.unwrap_or(5000).min(60000);
+        let timeout_ms = params.timeout.unwrap_or(5000).min(60_000);
 
-        // Use Z3 command-line interface for simplicity and thread safety
         let result = tokio::task::spawn_blocking(move || -> Result<Z3Response> {
-            match action.as_str() {
-                "solve" | "check_sat" => Self::solve_with_z3_cli(&params, timeout),
-                "optimize" => Self::optimize_with_z3_cli(&params, timeout),
-                "prove" => Self::prove_with_z3_cli(&params, timeout),
-                _ => Err(Error::Other(format!("Unknown action: {}", action))),
-            }
+            let program = match action.as_str() {
+                "solve" | "check_sat" => build_program(&params, false, false)?,
+                "optimize" => build_program(&params, true, false)?,
+                "prove" => build_program(&params, false, true)?,
+                other => return Err(Error::Tool(format!("Unknown action: {}", other))),
+            };
+            let output = run_z3(&program, timeout_ms)?;
+            Ok(interpret(&action, &output))
         })
         .await
-        .map_err(|e| Error::Other(format!("Task join error: {}", e)))??;
+        .map_err(|e| Error::Tool(format!("Task join error: {}", e)))??;
 
-        let execution_time = start_time.elapsed().as_millis() as u64;
-
-        let mut response = result;
-        response.execution_time_ms = execution_time;
-
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| Error::Other(format!("Failed to serialize response: {}", e)))
+        serde_json::to_string_pretty(&result)
+            .map_err(|e| Error::Tool(format!("Failed to serialize response: {}", e)))
     }
 }
 
-impl Z3SolverTool {
-    fn solve_with_z3_cli(params: &Z3Input, timeout: u64) -> Result<Z3Response> {
-        let smt_program = Self::build_smt_program(params)?;
-        let output = Self::run_z3(&smt_program, timeout)?;
+fn validate_sexpr(kind: &str, expr: &str) -> Result<String> {
+    let trimmed = expr.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return Err(Error::Tool(format!(
+            "{} must be an SMT-LIB s-expression (enclosed in parentheses): {}",
+            kind, expr
+        )));
+    }
+    Ok(trimmed.to_string())
+}
 
-        let satisfiable = output.contains("sat") && !output.contains("unsat");
-        let result = if satisfiable {
-            "satisfiable".to_string()
-        } else if output.contains("unsat") {
-            "unsatisfiable".to_string()
-        } else {
-            "unknown".to_string()
-        };
+/// Build a complete SMT-LIB program for solve/optimize/prove.
+fn build_program(params: &Z3Input, optimize: bool, prove: bool) -> Result<String> {
+    let mut program = String::new();
 
-        // Extract model if available
-        let model = if satisfiable {
-            Self::extract_model(&output)
-        } else {
-            None
-        };
-
-        let mut solver_info = HashMap::new();
-        solver_info.insert("version".to_string(), "Z3 CLI".to_string());
-        solver_info.insert(
-            "logic".to_string(),
-            params.logic.clone().unwrap_or("AUTO".to_string()),
-        );
-
-        Ok(Z3Response {
-            action: "solve".to_string(),
-            result,
-            satisfiable,
-            model,
-            execution_time_ms: 0, // Will be set by caller
-            solver_info,
-            z3_output: Some(output),
-        })
+    if let Some(logic) = &params.logic {
+        program.push_str(&format!("(set-logic {})\n", logic));
     }
 
-    fn optimize_with_z3_cli(params: &Z3Input, timeout: u64) -> Result<Z3Response> {
-        let smt_program = Self::build_optimization_program(params)?;
-        let output = Self::run_z3(&smt_program, timeout)?;
-
-        let satisfiable = output.contains("sat") && !output.contains("unsat");
-        let result = if satisfiable {
-            "optimal".to_string()
-        } else if output.contains("unsat") {
-            "unsatisfiable".to_string()
-        } else {
-            "unknown".to_string()
-        };
-
-        let model = if satisfiable {
-            Self::extract_model(&output)
-        } else {
-            None
-        };
-
-        let mut solver_info = HashMap::new();
-        solver_info.insert("version".to_string(), "Z3 Optimize".to_string());
-        solver_info.insert(
-            "logic".to_string(),
-            params.logic.clone().unwrap_or("AUTO".to_string()),
-        );
-
-        Ok(Z3Response {
-            action: "optimize".to_string(),
-            result,
-            satisfiable,
-            model,
-            execution_time_ms: 0,
-            solver_info,
-            z3_output: Some(output),
-        })
-    }
-
-    fn prove_with_z3_cli(params: &Z3Input, timeout: u64) -> Result<Z3Response> {
-        let smt_program = Self::build_proof_program(params)?;
-        let output = Self::run_z3(&smt_program, timeout)?;
-
-        // For proofs, unsat means theorem is proven
-        let theorem_proven = output.contains("unsat");
-        let result = if theorem_proven {
-            "theorem_proven".to_string()
-        } else if output.contains("sat") {
-            "theorem_disproven".to_string()
-        } else {
-            "unknown".to_string()
-        };
-
-        // If theorem is disproven, show counterexample
-        let model = if output.contains("sat") {
-            Self::extract_model(&output)
-        } else {
-            None
-        };
-
-        let mut solver_info = HashMap::new();
-        solver_info.insert("version".to_string(), "Z3 Theorem Prover".to_string());
-        solver_info.insert("method".to_string(), "negation_satisfiability".to_string());
-
-        Ok(Z3Response {
-            action: "prove".to_string(),
-            result,
-            satisfiable: theorem_proven,
-            model,
-            execution_time_ms: 0,
-            solver_info,
-            z3_output: Some(output),
-        })
-    }
-
-    fn build_smt_program(params: &Z3Input) -> Result<String> {
-        let mut program = String::new();
-
-        // Set logic
-        if let Some(logic) = &params.logic {
-            program.push_str(&format!("(set-logic {})\n", logic));
-        }
-
-        // Declare variables
-        if let Some(variables) = &params.variables {
-            for (name, var_type) in variables {
-                let smt_type = match var_type.as_str() {
-                    "Bool" => "Bool",
-                    "Int" => "Int",
-                    "Real" => "Real",
-                    _ => {
-                        return Err(Error::Other(format!(
-                            "Unsupported variable type: {}",
-                            var_type
-                        )))
-                    }
-                };
-                program.push_str(&format!("(declare-const {} {})\n", name, smt_type));
-            }
-        }
-
-        // Add constraints - expect proper SMT-LIB format
-        if let Some(constraints) = &params.constraints {
-            for constraint in constraints {
-                // Validate basic SMT-LIB format
-                let trimmed = constraint.trim();
-                if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-                    return Err(Error::Other(format!(
-                        "Constraint must be in SMT-LIB format (enclosed in parentheses): {}",
-                        constraint
-                    )));
+    if let Some(variables) = &params.variables {
+        // Sort for deterministic output (HashMap order is random).
+        let mut vars: Vec<_> = variables.iter().collect();
+        vars.sort();
+        for (name, var_type) in vars {
+            match var_type.as_str() {
+                "Bool" | "Int" | "Real" => {
+                    program.push_str(&format!("(declare-const {} {})\n", name, var_type))
                 }
-                program.push_str(&format!("(assert {})\n", trimmed));
+                other => return Err(Error::Tool(format!("Unsupported variable type: {}", other))),
             }
         }
-
-        program.push_str("(check-sat)\n");
-        program.push_str("(get-model)\n");
-
-        Ok(program)
     }
 
-    fn build_optimization_program(params: &Z3Input) -> Result<String> {
-        let mut program = String::new();
-
-        // Set logic
-        if let Some(logic) = &params.logic {
-            program.push_str(&format!("(set-logic {})\n", logic));
-        }
-
-        // Declare variables
-        if let Some(variables) = &params.variables {
-            for (name, var_type) in variables {
-                let smt_type = match var_type.as_str() {
-                    "Bool" => "Bool",
-                    "Int" => "Int",
-                    "Real" => "Real",
-                    _ => {
-                        return Err(Error::Other(format!(
-                            "Unsupported variable type: {}",
-                            var_type
-                        )))
-                    }
-                };
-                program.push_str(&format!("(declare-const {} {})\n", name, smt_type));
-            }
-        }
-
-        // Add constraints - expect proper SMT-LIB format
-        if let Some(constraints) = &params.constraints {
-            for constraint in constraints {
-                // Validate basic SMT-LIB format
-                let trimmed = constraint.trim();
-                if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-                    return Err(Error::Other(format!(
-                        "Constraint must be in SMT-LIB format (enclosed in parentheses): {}",
-                        constraint
-                    )));
-                }
-                program.push_str(&format!("(assert {})\n", trimmed));
-            }
-        }
-
-        // Add optimization objectives
-        if let Some(objectives) = &params.optimize {
-            for (var_name, direction) in objectives {
-                match direction.as_str() {
-                    "minimize" => program.push_str(&format!("(minimize {})\n", var_name)),
-                    "maximize" => program.push_str(&format!("(maximize {})\n", var_name)),
-                    _ => {
-                        return Err(Error::Other(format!(
-                            "Invalid optimization direction: {}",
-                            direction
-                        )))
-                    }
-                }
-            }
-        }
-
-        program.push_str("(check-sat)\n");
-        program.push_str("(get-model)\n");
-
-        Ok(program)
-    }
-
-    fn build_proof_program(params: &Z3Input) -> Result<String> {
-        let mut program = String::new();
-
-        // Set logic
-        if let Some(logic) = &params.logic {
-            program.push_str(&format!("(set-logic {})\n", logic));
-        }
-
-        // Declare variables
-        if let Some(variables) = &params.variables {
-            for (name, var_type) in variables {
-                let smt_type = match var_type.as_str() {
-                    "Bool" => "Bool",
-                    "Int" => "Int",
-                    "Real" => "Real",
-                    _ => {
-                        return Err(Error::Other(format!(
-                            "Unsupported variable type: {}",
-                            var_type
-                        )))
-                    }
-                };
-                program.push_str(&format!("(declare-const {} {})\n", name, smt_type));
-            }
-        }
-
-        // Add hypotheses - expect proper SMT-LIB format
+    if prove {
         if let Some(hypotheses) = &params.hypothesis {
-            for hypothesis in hypotheses {
-                // Validate basic SMT-LIB format
-                let trimmed = hypothesis.trim();
-                if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-                    return Err(Error::Other(format!(
-                        "Hypothesis must be in SMT-LIB format (enclosed in parentheses): {}",
-                        hypothesis
-                    )));
-                }
-                program.push_str(&format!("(assert {})\n", trimmed));
+            for h in hypotheses {
+                program.push_str(&format!("(assert {})\n", validate_sexpr("Hypothesis", h)?));
             }
         }
-
-        // Add general constraints - expect proper SMT-LIB format
-        if let Some(constraints) = &params.constraints {
-            for constraint in constraints {
-                // Validate basic SMT-LIB format
-                let trimmed = constraint.trim();
-                if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-                    return Err(Error::Other(format!(
-                        "Constraint must be in SMT-LIB format (enclosed in parentheses): {}",
-                        constraint
-                    )));
-                }
-                program.push_str(&format!("(assert {})\n", trimmed));
-            }
-        }
-
-        // Add negation of conclusion - expect proper SMT-LIB format
-        if let Some(conclusion) = &params.conclusion {
-            // Validate basic SMT-LIB format
-            let trimmed = conclusion.trim();
-            if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-                return Err(Error::Other(format!(
-                    "Conclusion must be in SMT-LIB format (enclosed in parentheses): {}",
-                    conclusion
-                )));
-            }
-            program.push_str(&format!("(assert (not {}))\n", trimmed));
-        } else {
-            return Err(Error::Other("Conclusion is required for proof".to_string()));
-        }
-
-        program.push_str("(check-sat)\n");
-        program.push_str("(get-model)\n");
-
-        Ok(program)
     }
 
-
-    fn run_z3(program: &str, timeout: u64) -> Result<String> {
-        use std::fs;
-        use std::process::{Command, Stdio};
-
-        // Write program to temporary file since Z3 -in flag doesn't work as expected
-        let temp_file = format!("/tmp/z3_input_{}.smt2", std::process::id());
-        fs::write(&temp_file, program)
-            .map_err(|e| Error::Other(format!("Failed to write temporary file: {}", e)))?;
-
-        let mut cmd = Command::new("z3");
-        cmd.arg(&temp_file);
-
-        if timeout > 0 {
-            cmd.arg(format!("-T:{}", timeout / 1000)); // Z3 timeout in seconds
+    if let Some(constraints) = &params.constraints {
+        for c in constraints {
+            program.push_str(&format!("(assert {})\n", validate_sexpr("Constraint", c)?));
         }
+    }
 
-        let output = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| {
-                Error::Other(format!(
-                    "Failed to start Z3: {}. Make sure Z3 is installed.",
-                    e
-                ))
-            })?;
+    if prove {
+        let conclusion = params
+            .conclusion
+            .as_ref()
+            .ok_or_else(|| Error::Tool("Conclusion is required for proof".to_string()))?;
+        // Prove by refuting the negation.
+        program.push_str(&format!(
+            "(assert (not {}))\n",
+            validate_sexpr("Conclusion", conclusion)?
+        ));
+    }
 
-        // Clean up temp file
-        let _ = fs::remove_file(&temp_file);
+    if optimize {
+        if let Some(objectives) = &params.optimize {
+            let mut objs: Vec<_> = objectives.iter().collect();
+            objs.sort();
+            for (var, direction) in objs {
+                match direction.as_str() {
+                    "minimize" => program.push_str(&format!("(minimize {})\n", var)),
+                    "maximize" => program.push_str(&format!("(maximize {})\n", var)),
+                    other => {
+                        return Err(Error::Tool(format!(
+                            "Invalid optimization direction: {}",
+                            other
+                        )))
+                    }
+                }
+            }
+        }
+    }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    program.push_str("(check-sat)\n(get-model)\n");
+    Ok(program)
+}
 
-        // Z3 might return success even with some errors in stderr, so combine both
-        let combined_output = if stderr.is_empty() {
-            stdout.to_string()
-        } else {
-            format!("{}\nSTDERR:\n{}", stdout, stderr)
+fn run_z3(program: &str, timeout_ms: u64) -> Result<String> {
+    use std::io::Write;
+    use std::process::Command;
+
+    let mut temp = tempfile::Builder::new()
+        .prefix("generalist-z3-")
+        .suffix(".smt2")
+        .tempfile()
+        .map_err(|e| Error::Tool(format!("Failed to create temp file: {}", e)))?;
+    temp.write_all(program.as_bytes())
+        .and_then(|_| temp.flush())
+        .map_err(|e| Error::Tool(format!("Failed to write SMT program: {}", e)))?;
+
+    let timeout_secs = timeout_ms.div_ceil(1000).max(1);
+    let output = Command::new("z3")
+        .arg(format!("-T:{}", timeout_secs))
+        .arg(temp.path())
+        .output()
+        .map_err(|e| Error::Tool(format!("Failed to start Z3: {}. Is Z3 installed?", e)))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stderr.is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{}\nSTDERR:\n{}", stdout, stderr)
+    };
+
+    if combined.trim().is_empty() && !output.status.success() {
+        return Err(Error::Tool(format!(
+            "Z3 execution failed with no output. Exit code: {}",
+            output.status.code().unwrap_or(-1)
+        )));
+    }
+    Ok(combined)
+}
+
+/// Read the verdict from Z3 output: the first line that is exactly
+/// sat/unsat/unknown. Substring matching would misfire (e.g. "unsat" contains
+/// "sat", and model variables can contain either word).
+fn parse_verdict(output: &str) -> Option<&'static str> {
+    for line in output.lines() {
+        match line.trim() {
+            "sat" => return Some("sat"),
+            "unsat" => return Some("unsat"),
+            "unknown" => return Some("unknown"),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn interpret(action: &str, output: &str) -> Z3Response {
+    let verdict = parse_verdict(output);
+    let (result, satisfiable) = match (action, verdict) {
+        ("prove", Some("unsat")) => ("theorem_proven".to_string(), true),
+        ("prove", Some("sat")) => ("theorem_disproven_see_counterexample".to_string(), false),
+        ("prove", _) => ("unknown".to_string(), false),
+        ("optimize", Some("sat")) => ("optimal".to_string(), true),
+        (_, Some("sat")) => ("satisfiable".to_string(), true),
+        (_, Some("unsat")) => ("unsatisfiable".to_string(), false),
+        (_, _) => ("unknown".to_string(), false),
+    };
+
+    let model = if verdict == Some("sat") {
+        extract_model(output)
+    } else {
+        None
+    };
+
+    Z3Response {
+        action: action.to_string(),
+        result,
+        satisfiable,
+        model,
+        z3_output: output.to_string(),
+    }
+}
+
+/// Parse `(define-fun name () Type value)` entries from a Z3 model.
+///
+/// Z3 usually prints these across multiple lines, so scan for balanced
+/// parentheses starting at each `(define-fun` and then split into tokens.
+fn extract_model(output: &str) -> Option<HashMap<String, String>> {
+    let mut model = HashMap::new();
+    let mut search_from = 0;
+    while let Some(pos) = output[search_from..].find("(define-fun") {
+        let start = search_from + pos;
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in output[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let tokens: Vec<&str> = output[start..end].split_whitespace().collect();
+        // ["(define-fun", name, "()", type, value...]
+        if tokens.len() >= 5 && tokens[2] == "()" {
+            let name = tokens[1].to_string();
+            let value = tokens[4..]
+                .join(" ")
+                .trim_end_matches(')')
+                .trim()
+                .to_string();
+            model.insert(name, value);
+        }
+        search_from = end;
+    }
+    if model.is_empty() {
+        None
+    } else {
+        Some(model)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_parsing_is_exact_line_match() {
+        assert_eq!(parse_verdict("sat\n(model ...)"), Some("sat"));
+        assert_eq!(parse_verdict("unsat\n"), Some("unsat"));
+        // A variable named "sat_count" must not read as a verdict.
+        assert_eq!(
+            parse_verdict("(define-fun sat_count () Int 1)\nunknown"),
+            Some("unknown")
+        );
+        assert_eq!(parse_verdict("garbage"), None);
+    }
+
+    #[test]
+    fn extracts_multi_line_models() {
+        let output =
+            "sat\n(\n  (define-fun x () Int\n    5)\n  (define-fun y () Real\n    (/ 1.0 2.0))\n)";
+        let model = extract_model(output).unwrap();
+        assert_eq!(model.get("x").unwrap(), "5");
+        assert!(model.get("y").unwrap().contains("1.0"));
+    }
+
+    #[test]
+    fn builds_proof_program_with_negated_conclusion() {
+        let params = Z3Input {
+            action: Some("prove".into()),
+            variables: Some([("x".to_string(), "Int".to_string())].into()),
+            constraints: None,
+            timeout: None,
+            logic: None,
+            optimize: None,
+            hypothesis: Some(vec!["(> x 0)".into()]),
+            conclusion: Some("(>= x 0)".into()),
         };
-
-        // Don't fail on non-zero exit code if we got some output, as Z3 might return
-        // error codes for logic issues rather than execution failures
-        if combined_output.trim().is_empty() && !output.status.success() {
-            return Err(Error::Other(format!(
-                "Z3 execution failed with no output. Exit code: {}",
-                output.status.code().unwrap_or(-1)
-            )));
-        }
-
-        Ok(combined_output)
+        let program = build_program(&params, false, true).unwrap();
+        assert!(program.contains("(declare-const x Int)"));
+        assert!(program.contains("(assert (> x 0))"));
+        assert!(program.contains("(assert (not (>= x 0)))"));
+        assert!(program.ends_with("(check-sat)\n(get-model)\n"));
     }
 
-    fn extract_model(output: &str) -> Option<HashMap<String, String>> {
-        let mut model = HashMap::new();
-        let lines: Vec<&str> = output.lines().collect();
-
-        for line in lines {
-            if line.trim().starts_with("(define-fun ") {
-                // Parse Z3 model output: "(define-fun x () Int 5)"
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    let var_name = parts[1].to_string();
-                    let value = parts[4].trim_end_matches(')').to_string();
-                    model.insert(var_name, value);
-                }
-            }
-        }
-
-        if model.is_empty() {
-            None
-        } else {
-            Some(model)
-        }
+    #[test]
+    fn rejects_non_sexpr_constraints() {
+        let params = Z3Input {
+            action: None,
+            variables: None,
+            constraints: Some(vec!["x > 0".into()]),
+            timeout: None,
+            logic: None,
+            optimize: None,
+            hypothesis: None,
+            conclusion: None,
+        };
+        assert!(build_program(&params, false, false).is_err());
     }
 }

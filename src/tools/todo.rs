@@ -83,10 +83,13 @@ impl TodoList {
 pub struct TodoTool;
 
 impl TodoTool {
+    /// Todos live in the home directory so they survive launching the agent
+    /// from different working directories.
     fn get_todo_file_path() -> PathBuf {
-        let mut path = PathBuf::from(".");
-        path.push("todos.json");
-        path
+        #[allow(deprecated)]
+        std::env::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".generalist_todos.json")
     }
 
     fn load_todos() -> Result<TodoList> {
@@ -222,12 +225,7 @@ impl Tool for TodoTool {
                         } else {
                             &todo.id
                         };
-                        output.push_str(&format!(
-                            "{} [{}] {}\n",
-                            status,
-                            short_id,
-                            todo.title
-                        ));
+                        output.push_str(&format!("{} [{}] {}\n", status, short_id, todo.title));
                     }
                     Ok(output.trim_end().to_string())
                 }

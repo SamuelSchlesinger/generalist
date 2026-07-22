@@ -78,7 +78,7 @@ impl Tool for WikipediaTool {
 
         let action = params.action.as_deref().unwrap_or("search");
         let language = params.language.as_deref().unwrap_or("en");
-        let limit = params.limit.unwrap_or(5).min(20).max(1);
+        let limit = params.limit.unwrap_or(5).clamp(1, 20);
 
         // Validate language code (basic validation)
         if language.len() != 2 || !language.chars().all(|c| c.is_ascii_lowercase()) {

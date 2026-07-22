@@ -41,8 +41,8 @@ impl Tool for ListDirectoryTool {
             .map_err(|e| Error::Other(format!("Failed to read directory: {}", e)))?;
 
         let mut results = Vec::new();
-        for entry in entries {
-            if let Ok(entry) = entry {
+        for entry in entries.flatten() {
+            {
                 let metadata = entry.metadata();
                 let file_type = if let Ok(meta) = metadata {
                     if meta.is_dir() {

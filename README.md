@@ -1,394 +1,182 @@
-# Generalist 🤖
+# generalist
 
-A powerful AI-powered command-line agent built with Rust that combines Claude's reasoning capabilities with 17 specialized tools. Designed for developers, researchers, and power users who need an intelligent assistant with real-world capabilities.
+A provider-agnostic CLI agent in Rust. Works with the Anthropic Messages API or any
+OpenAI-compatible endpoint (OpenAI, Ollama, Groq, Mistral, vLLM, LM Studio). The
+library is small: neutral conversation types, a `Provider` trait, a tool registry with
+permission gating, and an agent loop that reports progress through event callbacks.
 
-**Key Features:**
-- 🧠 **Intelligent Problem Solving** - Uses Claude's advanced reasoning with means-ends analysis
-- 🔧 **17 Built-in Tools** - File operations, web scraping, calculations, system administration, and more
-- 🔐 **Granular Permissions** - Complete control over what tools can execute
-- 💾 **Persistent Memory** - Enhanced memory system with tagging and search
-- 📝 **Conversation Management** - Save and resume conversations with full context
-- 🎨 **Beautiful CLI** - Real-time tool execution with progress indicators
+## Install and run
 
-## Quick Start
+```bash
+cargo build --release
 
-### Prerequisites
+# Keys go in the environment or ~/.generalist.env:
+echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.generalist.env
+echo 'OPENAI_API_KEY=sk-...'        >> ~/.generalist.env   # and/or
+echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 
-- **Rust** (latest stable version) - [Install Rust](https://rustup.rs/)
-- **Claude API Key** - Get one from [Anthropic Console](https://console.anthropic.com/)
-- **Firecrawl API Key** (optional) - Get one from [Firecrawl](https://firecrawl.dev/) for enhanced web scraping
-- **Z3 Solver** (optional) - Install for constraint solving: `brew install z3` (macOS) or `apt install z3` (Linux)
+./target/release/generalist
 
-### Installation
-
-1. **Clone and build**:
-   ```bash
-   git clone https://github.com/SamuelSchlesinger/generalist.git
-   cd generalist
-   cargo build --release
-   ```
-
-2. **Create configuration file** `~/.generalist.env`:
-   ```bash
-   echo "CLAUDE_API_KEY=your-claude-api-key-here" > ~/.generalist.env
-   echo "FIRECRAWL_API_KEY=your-firecrawl-api-key-here" >> ~/.generalist.env  # Optional
-   ```
-
-3. **Run the agent**:
-   ```bash
-   cargo run
-   # or use the built binary
-   ./target/release/generalist
-   ```
-
-### First Steps
-
-Try these example interactions to get started:
-
-**📊 Data & Calculations:**
-- "What's the weather in Tokyo?"
-- "Calculate the solution to: x + 2*y = 10, x - y = 1"
-- "Solve for the optimal values: minimize x + y subject to x >= 0, y >= 1, x + 2*y <= 5"
-
-**📁 File Operations:**
-- "Show me the files in my home directory"
-- "Read the contents of my .bashrc file"
-- "Create a simple Python script that prints 'Hello World'"
-
-**🌐 Web & Research:**
-- "Search Wikipedia for 'quantum computing' and summarize the key concepts"
-- "What are the latest developments in AI from Hacker News?"
-- "Extract the main content from https://example.com"
-
-**🧠 Productivity:**
-- "Remember that I prefer using tabs over spaces in Python code"
-- "Add 'Review quarterly budget' to my todo list"
-- "Think deeply about the trade-offs between microservices and monolithic architecture"
-
-## Key Features
-
-- **🛠️ 17 Built-in Tools** - Everything from file operations to web scraping
-- **🔐 Permission System** - You control what tools can run
-- **💾 Save Conversations** - Resume chats later with `/save` and `/load`
-- **🎨 Beautiful UI** - See exactly what the generalist is doing in real-time
-
-## Available Tools
-
-The generalist agent comes with 17 specialized tools organized into functional categories:
-
-### 📁 File Operations
-- **`read_file`** - Read content from any file on the system
-- **`patch_file`** - Apply diffs/patches to modify files safely
-- **`list_directory`** - Browse and explore directory structures
-
-### 💻 System Administration
-- **`bash`** - Execute shell commands with full output capture
-- **`system_info`** - Get detailed system information and diagnostics
-
-### 🧮 Computing & Mathematics
-- **`calculator`** - Evaluate mathematical expressions with support for trigonometry, logarithms, and more
-- **`z3_solver`** - Advanced constraint solving, optimization, and theorem proving using Microsoft's Z3 SMT solver
-
-### 🌐 Web & Data Retrieval
-- **`http_fetch`** - Make HTTP requests to APIs and web services
-- **`weather`** - Get current weather information for any city using Open-Meteo API
-- **`wikipedia`** - Search and retrieve Wikipedia content with intelligent summarization
-
-#### Advanced Web Scraping (Firecrawl Integration)
-- **`firecrawl_extract`** - Extract clean content from single web pages, handling JavaScript and removing ads
-- **`firecrawl_crawl`** - Systematically crawl entire websites with depth control and filtering
-- **`firecrawl_map`** - Discover and map website structure, creating comprehensive sitemaps
-- **`firecrawl_search`** - Enhanced web search that returns actual page content, not just links
-
-### 🧠 Productivity & Intelligence
-- **`enhanced_memory`** - Persistent memory system with tagging, search, and cross-session storage
-- **`todo`** - Task management system with JSON persistence and status tracking
-- **`think`** - Deep analysis and reasoning prompts for complex problem-solving
-
-### Tool Architecture
-
-Each tool implements a standardized interface with:
-- **JSON Schema Validation** - Ensures type safety and clear parameter requirements
-- **Permission Control** - Granular execution control with user consent
-- **Error Handling** - Comprehensive error messages with usage examples
-- **Documentation** - Self-describing tools with built-in help
-
-## Security & Permission System
-
-The generalist agent prioritizes safety through a comprehensive permission system that gives you complete control over tool execution.
-
-### How Permissions Work
-
-Before any tool is executed, you'll see a detailed permission prompt:
-
-```
-⚠️  Tool Permission Request
-──────────────────────────────────────────────────
-Tool: bash
-Description: Execute a bash command
-Input: {"command": "ls -la"}
-
-Allow this tool to execute?
-> Yes (always allow this tool)
-  Yes (just this once)
-  No (never allow this tool)
-  No (just this once)
+# Local models need no key:
+./target/release/generalist --local                    # qwen3.6:35b-a3b
+./target/release/generalist --local qwen2.5-coder:32b  # or name one
 ```
 
-### Permission Options
+`--local [model]` skips provider selection and uses `http://localhost:11434/v1`; set
+`OPENAI_BASE_URL` for other local servers. Tool calling requires a tool-capable model
+(`qwen3.6`, `qwen3`, `qwen2.5-coder`, `devstral`).
 
-- **Always Allow** - Trust this tool completely for the session
-- **Just This Once** - Allow this specific execution only
-- **Never Allow** - Block this tool type entirely
-- **Just This Once (No)** - Deny this execution but ask again next time
+Optional binaries: `z3` (constraint solver), `patch` (file editing; present on any Unix).
 
-### Permission Persistence
+Smoke tests, all live end-to-end: `cargo run --example smoke` (Anthropic),
+`smoke_ollama` (local tool loop), `smoke_codemode` (local code-mode bridge).
 
-- Permissions are remembered within a conversation session
-- When you save and load conversations, permission settings are preserved
-- This allows you to build trusted tool configurations over time
-- Each tool request shows complete input parameters for transparency
+## Usage
 
-### Safety Features
+Type a request; the agent calls tools and reports back. Tools: bash, python (code
+mode), file read/patch, directory listing, HTTP fetch, web search/scrape/crawl
+(Firecrawl), Wikipedia, weather, Z3, persistent memory, todo list. (Calculator,
+system-info, and think tools were retired: python and bash subsume them.)
 
-- **Full Transparency** - Every tool call shows exact parameters before execution
-- **Granular Control** - Approve or deny individual tool operations
-- **No Surprises** - The agent can't execute tools without explicit permission
-- **Audit Trail** - All tool executions are logged and can be reviewed
+Responses stream as they generate. Commands: `/save`, `/load`, `/model` (switch
+provider or model mid-conversation), `/compact` (summarize older history to free
+context), `/clear`, `/help`, `exit`. Every turn autosaves to
+`~/.generalist_history/autosave.json`. `/load` also reads the legacy
+`~/.chatbot_history` directory.
 
-## Built-in Commands
+## Permissions
 
-The agent supports several slash commands for session management:
+Every tool call prompts for approval and shows the full input (diffs rendered as
+diffs). Choices: allow always, allow once, deny always, deny once. Decisions persist
+across save/load.
 
-- **`/save [name]`** - Save current conversation with optional custom name (defaults to timestamp)
-- **`/load`** - Load a previously saved conversation from an interactive menu
-- **`/model`** - Switch between available Claude models (Claude-3 Haiku, Sonnet, Opus)
-- **`/help`** - Display available commands and usage information
-- **`exit` or `quit`** - Safely exit the agent
+Caveats:
 
-### Conversation Management
+- "Always allow" is per tool name. Always-allowing `bash` approves every future
+  command; the command is still printed before it runs.
+- The prompts are not a sandbox. An agent that can write and run code can circumvent
+  in-process fences; use a container or dedicated user for real isolation.
+- Fetched web content is untrusted input; the approval step exists mainly to catch
+  prompt injection acting on it.
+- `http_fetch` rejects localhost, private, and link-local addresses, including
+  redirect hops and DNS results. Best effort, not a guarantee.
 
-Conversations are automatically saved to `~/.chatbot_history/` as JSON files containing:
-- Complete message history
-- Tool execution records
-- Permission settings
-- Model configuration
+## Agent loop
 
-This allows you to resume complex problem-solving sessions exactly where you left off.
+Follows what pi, opencode, and Claude Code converged on:
 
-## Advanced Usage
+- History survives mid-turn API errors, including tool calls that already ran.
+- Transient API errors retry 3 times with exponential backoff.
+- Tool results are truncated before entering history. Bash and python keep the tail
+  (where errors are) and spill full output to a temp file the model can read back.
+- Tool calls in a response that hit the output-token limit are failed, not executed —
+  their arguments may be silently incomplete. The model is asked to re-issue them.
+- A denied tool call ends the turn so you can redirect. Denial is a structured
+  outcome, never inferred from result text.
+- On Anthropic, the system prompt and conversation prefix carry prompt-cache
+  breakpoints, which cuts input cost substantially in long sessions.
+- Responses stream (SSE) on both providers; a stream that dies mid-message is
+  retried rather than treated as a complete answer.
+- When context passes a threshold (default 150k tokens, configurable), older
+  history is summarized in place and recent turns stay verbatim. `/compact`
+  triggers it manually. Local models with small context windows may want a much
+  lower `compaction_threshold_tokens`.
 
-### Using as a Library
+## Code mode
 
-The generalist agent can also be used as a Rust library for building custom AI-powered applications.
+The agent advertises a `python` tool (Unix only). Scripts get a generated `tools`
+module exposing every registered tool as a function:
 
-Add to your `Cargo.toml`:
-```toml
-[dependencies]
-claude = "0.1.0"
+```python
+import tools
+pages = tools.firecrawl_search(query="rust async runtimes")
+# result stays in the script; the model never sees it unless printed
+print(extract_urls(pages))
 ```
 
-### Basic Library Example
+Calls are served over a Unix socket and pass through the same permission gate as
+direct calls. Results return to the script, not the model, so one script can process
+megabytes of tool output and print only the conclusion. Script errors come back as
+tool results, so the model can fix and re-run. This is the pattern from CodeAct,
+Cloudflare's Code Mode, Anthropic's code-execution-with-MCP, and the "Code as Agent
+Harness" survey (arXiv 2605.18747).
 
-```rust
-use claude::{Claude, ToolRegistry, tools::*};
+Relation to CaMeL: tool output that stays inside a script cannot prompt-inject the
+model, and per-call approval acts as the policy check. There is no data-flow/taint
+tracking, and scripts run unsandboxed with your privileges.
+
+## MCP
+
+Configure servers in `~/.generalist/mcp.json`; both Streamable HTTP and stdio
+transports are supported:
+
+```json
+{
+  "servers": {
+    "tickerfacts": { "url": "https://tickerfacts.com/mcp" },
+    "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] }
+  }
+}
+```
+
+Discovered tools register as `<server>_<tool>` and are **code-only**: they never enter
+the model-facing tool list (MCP schemas are heavy — often 10k+ tokens per server).
+Instead they are callable from code-mode scripts, which see full schemas in the
+generated module's docstrings (`print(tools.tickerfacts_get_fundamentals.__doc__)`).
+Context cost scales with what a script uses, not what a server offers. Bridged MCP
+calls pass through the permission gate like any other tool. A failed server logs a
+warning and is skipped. `cargo run --example smoke_mcp` verifies the stack live.
+
+## Library use
+
+```rust,no_run
+use generalist::{Agent, AgentEvent, ToolRegistry};
+use generalist::provider::OpenAiProvider;
+use generalist::tools::CalculatorTool;
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize Claude client
-    let client = Claude::new(
-        std::env::var("CLAUDE_API_KEY")?, 
-        "claude-3-7-sonnet-latest".to_string()
-    );
-    
-    // Create tool registry and add tools
+async fn main() -> generalist::Result<()> {
+    let provider = OpenAiProvider::new(
+        "unused".into(),
+        "http://localhost:11434/v1".into(),
+        "qwen3.6:35b-a3b".into(),
+    )?;
+
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(CalculatorTool))?;
-    registry.register(Arc::new(WeatherTool))?;
-    registry.register(Arc::new(WikipediaTool))?;
-    
-    // Run a conversation turn with tool support
-    let response = client.run_conversation_turn(
-        "What's the weather like in Paris and what's 25 * 4?",
-        &mut registry,
-        Some("You are a helpful assistant."),
-        None,
-        None,
-    ).await?;
-    
-    println!("Response: {}", response);
+
+    let mut agent = Agent::new(Box::new(provider), registry, "You are a helpful assistant.");
+    agent.run_turn("What is 17 * 43?", &mut |event| match event {
+        AgentEvent::AssistantTextDelta(text) => print!("{text}"), // streamed
+        AgentEvent::AssistantText(text) => println!("{text}"),    // non-streaming fallback
+        _ => {}
+    })
+    .await?;
     Ok(())
 }
 ```
 
-### Creating Custom Tools
+Custom tools implement the `Tool` trait: name, description, JSON schema, async
+execute. Put the trigger condition in the description — models decide when to call a
+tool from that text. Permission policy is pluggable via `ToolPermissionHandler`:
+`AlwaysAllow`, `AlwaysDeny`, name-based `PolicyPermissions`, or the interactive
+`MemoryPermissionHandler` the CLI uses.
 
-Implement the `Tool` trait to create your own tools:
+## Skills and project notes
 
-```rust
-use claude::{Tool, Result, Error};
-use async_trait::async_trait;
-use serde_json::{json, Value};
+Drop instruction folders in `~/.generalist/skills/<name>/SKILL.md` (optional
+`name:`/`description:` frontmatter). Only a one-line index enters the system prompt;
+the agent reads the full file when a task matches. A `./AGENTS.md` or `./CLAUDE.md`
+in the working directory is appended to the system prompt at startup.
 
-pub struct CustomTool;
+## Limits
 
-#[async_trait]
-impl Tool for CustomTool {
-    fn name(&self) -> &str {
-        "custom_tool"
-    }
-
-    fn description(&self) -> &str {
-        "A custom tool that demonstrates the Tool trait"
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "A message to process"
-                }
-            },
-            "required": ["message"]
-        })
-    }
-
-    async fn execute(&self, input: Value) -> Result<String> {
-        let message = input.get("message")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Other("Missing message field".to_string()))?;
-        
-        Ok(format!("Processed: {}", message))
-    }
-}
-```
-
-### Permission Handlers
-
-Customize permission handling for different use cases:
-
-```rust
-use claude::{ToolRegistry, AlwaysAllowPermissions, PolicyPermissions};
-
-// Always allow all tools (for trusted environments)
-let mut registry = ToolRegistry::with_permission_handler(
-    Box::new(AlwaysAllowPermissions)
-);
-
-// Or implement custom permission logic
-let policy = PolicyPermissions::new()
-    .allow_tool("calculator")
-    .allow_tool("weather")
-    .deny_tool("bash");
-
-let mut registry = ToolRegistry::with_permission_handler(
-    Box::new(policy)
-);
-```
-
-## Architecture & Design Philosophy
-
-### Problem-Solving Methodology
-
-The generalist agent implements a sophisticated problem-solving approach based on **means-ends analysis**, a methodology pioneered in early AI research:
-
-1. **State Assessment** - Analyze the current situation and desired outcome
-2. **Gap Identification** - Determine what differs between current and goal states  
-3. **Operator Selection** - Choose appropriate tools to reduce the differences
-4. **Execution & Iteration** - Apply tools systematically and monitor progress
-
-### Historical Inspiration
-
-This architecture draws from pioneering AI systems:
-
-- **General Problem Solver (GPS)** (Newell & Simon, 1957) - Introduced means-ends analysis for systematic problem decomposition
-- **STRIPS** (Stanford Research Institute, 1971) - Advanced automated planning with operator-based state space search
-- **SHRDLU** (Winograd, 1970) - Demonstrated sophisticated reasoning about goals and actions
-
-### Modern Implementation
-
-The generalist agent modernizes these classical approaches by:
-
-- **Tool Ecosystem** - 17 specialized tools covering file operations, web scraping, mathematics, and system administration
-- **Safety First** - Comprehensive permission system prevents unwanted tool execution
-- **Real-world Integration** - Direct integration with APIs, file systems, and external services
-- **Conversational Interface** - Natural language interaction with full context preservation
-
-### Core Components
-
-- **`Claude`** - Main API client handling communication with Anthropic's models
-- **`ToolRegistry`** - Manages available tools and tracks execution history
-- **`PermissionHandler`** - Controls tool execution with user consent
-- **`ChatbotState`** - Maintains conversation history and session state
-- **`Tool` Trait** - Standardized interface for all tool implementations
-
-## Contributing
-
-We welcome contributions from the community! Here are some ways to get involved:
-
-### Adding New Tools
-
-1. **Implement the `Tool` trait** - Create a new file in `src/tools/`
-2. **Add comprehensive tests** - Ensure your tool handles edge cases gracefully
-3. **Update documentation** - Include clear examples and usage patterns
-4. **Follow the established patterns** - Look at existing tools for architectural guidance
-
-### Improving Core Features
-
-- **Enhanced UI/UX** - Better progress indicators, error handling, or visual design
-- **Performance Optimizations** - Faster tool execution or reduced memory usage
-- **New Permission Handlers** - More sophisticated access control mechanisms
-- **Extended CLI Commands** - Additional slash commands for power users
-
-### Documentation & Examples
-
-- **Tutorial Content** - Step-by-step guides for common use cases
-- **Tool-specific Documentation** - Detailed guides for complex tools like Z3 solver
-- **Integration Examples** - Demonstrations of using the agent with other systems
-- **Video Tutorials** - Screen recordings showing real-world problem solving
-
-### Quality Improvements
-
-- **Test Coverage** - Unit tests, integration tests, and property-based testing
-- **Error Handling** - Better error messages and recovery mechanisms
-- **Code Organization** - Refactoring for maintainability and extensibility
-- **Accessibility** - Making the CLI more accessible to users with different needs
-
-### Development Setup
-
-```bash
-# Clone and setup development environment
-git clone https://github.com/SamuelSchlesinger/generalist.git
-cd generalist
-
-# Install dependencies (including optional ones for development)
-cargo build
-
-# Run tests
-cargo test
-
-# Check code formatting
-cargo fmt --check
-
-# Run linter
-cargo clippy
-```
-
-### Submitting Changes
-
-1. **Fork the repository** and create a feature branch
-2. **Write tests** for any new functionality
-3. **Update documentation** to reflect your changes
-4. **Submit a pull request** with a clear description of the changes
-5. **Respond to feedback** during the review process
+- The OpenAI provider sends no `max_tokens`, for compatibility across servers.
+- Compaction uses a chars/4 token estimate between provider measurements; treat
+  thresholds as approximate.
+- Code-mode scripts run unsandboxed (see Permissions).
 
 ## License
 
-MIT License - see LICENSE file
-
----
-
-Built with ❤️ using [Claude API](https://www.anthropic.com/) and [Firecrawl](https://firecrawl.com/)
+MIT.

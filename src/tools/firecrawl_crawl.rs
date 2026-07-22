@@ -128,8 +128,10 @@ impl Tool for FirecrawlCrawlTool {
             scrape_options.timeout = Some(timeout);
         }
 
-        let mut crawl_options = CrawlOptions::default();
-        crawl_options.scrape_options = Some(scrape_options);
+        let mut crawl_options = CrawlOptions {
+            scrape_options: Some(scrape_options),
+            ..Default::default()
+        };
 
         if let Some(max_depth) = params.max_depth {
             crawl_options.max_depth = Some(max_depth);
