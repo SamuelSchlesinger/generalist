@@ -301,8 +301,8 @@ async fn main() -> Result<()> {
     let permission_handler = MemoryPermissionHandler::new();
     let mut registry = build_registry(&permission_handler)?;
 
-    // MCP servers from ~/.generalist/mcp.json; their tools are code-only
-    // (callable from scripts via the tools module, not direct tool calls).
+    // MCP servers from ~/.generalist/mcp.json; their schemas use progressive
+    // disclosure and are available from scripts via tools-module docstrings.
     if let Some(config) = generalist::mcp::McpConfig::load(&home_dir().join(".generalist/mcp.json"))
     {
         for line in generalist::mcp::register_servers(&mut registry, &config).await {
@@ -325,7 +325,7 @@ async fn main() -> Result<()> {
     let mut agent = Agent::new(provider, registry, system_prompt);
 
     ui.print_welcome(
-        agent.provider().id(),
+        agent.provider().display_name(),
         agent.provider().model(),
         &agent.registry.tool_names(),
     );
@@ -411,7 +411,7 @@ async fn main() -> Result<()> {
                     ui.print_info(&format!(
                         "Loaded {} messages on {} / {}",
                         agent.history.len(),
-                        agent.provider().id(),
+                        agent.provider().display_name(),
                         agent.provider().model()
                     ));
                     for msg in &agent.history {
@@ -443,7 +443,7 @@ async fn main() -> Result<()> {
                     agent.set_provider(provider);
                     ui.print_info(&format!(
                         "Switched to {} / {}",
-                        agent.provider().id(),
+                        agent.provider().display_name(),
                         agent.provider().model()
                     ));
                 }

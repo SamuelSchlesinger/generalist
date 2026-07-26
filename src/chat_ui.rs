@@ -29,13 +29,13 @@ impl ChatUI {
         }
     }
 
-    pub fn print_welcome(&self, provider: &str, model: &str, tools: &[String]) {
+    pub fn print_welcome(&self, api: &str, model: &str, tools: &[String]) {
         println!();
         println!("{}", "generalist — a provider-agnostic CLI agent".bold());
         println!(
             "{} {} {} {}",
-            "Provider:".dimmed(),
-            provider.cyan(),
+            "API:".dimmed(),
+            api.cyan(),
             "Model:".dimmed(),
             model.cyan()
         );

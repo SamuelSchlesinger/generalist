@@ -28,8 +28,17 @@ use async_trait::async_trait;
 /// inside a `LocalSet` if you need to spawn it.
 #[async_trait(?Send)]
 pub trait Provider: Send + Sync {
-    /// Short stable identifier, e.g. `"anthropic"` or `"openai"`.
+    /// Short stable identifier used for persistence and provider selection,
+    /// e.g. `"anthropic"` or `"openai"`. This identifies the adapter, not
+    /// necessarily the service behind a compatible endpoint.
     fn id(&self) -> &'static str;
+
+    /// Human-facing API/backend label. Custom providers default to their
+    /// stable ID; protocol adapters should override this when the ID could
+    /// misleadingly imply a particular service.
+    fn display_name(&self) -> &str {
+        self.id()
+    }
 
     /// The model this provider instance targets.
     fn model(&self) -> &str;

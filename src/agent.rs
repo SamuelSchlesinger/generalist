@@ -18,7 +18,7 @@
 
 use crate::error::Result;
 use crate::provider::Provider;
-use crate::tool::{ToolCallOutcome, ToolRegistry};
+use crate::tool::{ToolCallOutcome, ToolCallResult, ToolRegistry};
 use crate::types::{
     estimate_tokens, truncate_middle, CompletionRequest, ContentBlock, Message, StopReason, Usage,
 };
@@ -86,9 +86,10 @@ pub struct Agent {
     pub max_tool_result_chars: usize,
     /// Retries for transient API errors, with exponential backoff.
     pub max_retries: u32,
-    /// Code mode (Unix only): advertise a `python` tool whose scripts can
+    /// Code mode (Unix only): advertise only a `python` tool. Its scripts can
     /// call every registered tool via a generated `tools` module, keeping
-    /// intermediate tool results out of the model's context.
+    /// intermediate tool results out of the model's context and allowing one
+    /// model round-trip to orchestrate many tool calls.
     pub code_mode: bool,
     /// Compact (summarize) older history when the context reaches this many
     /// tokens. `u64::MAX` disables compaction.
@@ -129,11 +130,29 @@ impl Agent {
             .unwrap_or_else(|| estimate_tokens(&self.history))
     }
 
-    /// Whether a tool call should be routed to the code-mode runner instead
-    /// of the registry. A registered tool named `python` always wins, so
-    /// library users can override the built-in behavior.
+    /// Whether the built-in code-mode runner owns the model-facing tool
+    /// interface. A registered tool named `python` always wins, so library
+    /// users can override the built-in behavior.
+    fn builtin_code_mode_enabled(&self) -> bool {
+        cfg!(unix) && self.code_mode && !self.registry.has_tool("python")
+    }
+
     fn is_code_mode_call(&self, name: &str) -> bool {
-        cfg!(unix) && self.code_mode && name == "python" && !self.registry.has_tool(name)
+        self.builtin_code_mode_enabled() && name == "python"
+    }
+
+    /// Tool definitions sent to the provider. In code mode, ordinary tool
+    /// schemas are folded into the python tool's description rather than
+    /// advertised as independently callable tools.
+    fn model_tool_defs(&self) -> Vec<crate::types::ToolDef> {
+        #[cfg(unix)]
+        if self.builtin_code_mode_enabled() {
+            let available = self.registry.get_tool_defs();
+            let code_only = self.registry.code_only_tool_defs();
+            return vec![crate::codemode::python_tool_def(&available, &code_only)];
+        }
+
+        self.registry.get_tool_defs()
     }
 
     pub fn provider(&self) -> &dyn Provider {
@@ -248,6 +267,22 @@ impl Agent {
 
                 let mut result = if self.is_code_mode_call(&name) {
                     self.execute_code_mode(input, id, on_event).await
+                } else if self.builtin_code_mode_enabled() {
+                    // Providers should only produce calls to advertised tools,
+                    // but reject an unadvertised direct call defensively so
+                    // code mode remains a real boundary rather than a hint.
+                    ToolCallResult {
+                        block: ContentBlock::ToolResult {
+                            content: format!(
+                                "Direct tool calls are disabled in code mode. Run this through \
+                                 the python tool instead, using `import tools; tools.{}(...)`.",
+                                name
+                            ),
+                            tool_use_id: id,
+                            is_error: Some(true),
+                        },
+                        outcome: ToolCallOutcome::Failed,
+                    }
                 } else {
                     self.registry.execute_tool(&name, input, id).await
                 };
@@ -299,8 +334,6 @@ impl Agent {
         on_event: &mut dyn FnMut(AgentEvent),
     ) -> crate::tool::ToolCallResult {
         use crate::permissions::{PermissionDecision, ToolExecutionRequest};
-        use crate::tool::ToolCallResult;
-
         let make_result = |content: String, outcome: ToolCallOutcome, id: String| ToolCallResult {
             block: ContentBlock::ToolResult {
                 content,
@@ -463,13 +496,7 @@ impl Agent {
         &self,
         on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<(crate::types::CompletionResponse, bool)> {
-        #[allow(unused_mut)]
-        let mut tools = self.registry.get_tool_defs();
-        #[cfg(unix)]
-        if self.code_mode && !self.registry.has_tool("python") {
-            let code_only = self.registry.code_only_tool_defs();
-            tools.push(crate::codemode::python_tool_def(&tools, &code_only));
-        }
+        let tools = self.model_tool_defs();
         let mut attempt: u32 = 0;
         loop {
             on_event(AgentEvent::ApiCallStarted);
@@ -603,7 +630,62 @@ mod tests {
     fn agent_with(script: Script) -> Agent {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(Echo)).unwrap();
-        Agent::new(Box::new(script), registry, "test")
+        let mut agent = Agent::new(Box::new(script), registry, "test");
+        // Most tests in this helper exercise the legacy/direct execution
+        // path specifically. Code-mode tests construct their own agent.
+        agent.code_mode = false;
+        agent
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn code_mode_advertises_only_python() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Mirror)).unwrap();
+        let agent = Agent::new(Box::new(Script::new(vec![])), registry, "test");
+
+        let defs = agent.model_tool_defs();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "python");
+        assert!(defs[0].description.contains("tools.mirror"));
+        assert!(defs[0].description.contains("Input schema"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn code_mode_rejects_unadvertised_direct_tool_calls() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Mirror)).unwrap();
+        let direct_call = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                name: "mirror".into(),
+                input: json!({"marker": "must-not-run"}),
+                id: "t1".into(),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        };
+        let mut agent = Agent::new(
+            Box::new(Script::new(vec![
+                Ok(direct_call),
+                Ok(text_response("done")),
+            ])),
+            registry,
+            "test",
+        );
+
+        let outcome = agent.run_turn("go", &mut |_| {}).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert!(agent.registry.execution_history().is_empty());
+        match &agent.history[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(*is_error, Some(true));
+                assert!(content.contains("disabled in code mode"));
+            }
+            other => panic!("expected tool result, got {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -674,10 +756,10 @@ mod tests {
         assert!(retried);
     }
 
-    /// End-to-end code mode: the model "writes" a script that calls the echo
-    /// tool through the generated `tools` module; the bridged result must
-    /// reach the script (not the model context) and the script's stdout must
-    /// become the tool result. Requires python3 on PATH.
+    /// End-to-end code mode: the model "writes" one script that calls a tool
+    /// several times through the generated `tools` module. All bridged calls
+    /// happen before the next provider round-trip; only the script's stdout
+    /// becomes the outer tool result. Requires python3 on PATH.
     /// Echoes its input back — small output, unlike `Echo` above.
     struct Mirror;
 
@@ -702,8 +784,8 @@ mod tests {
     async fn code_mode_bridges_tool_calls_into_scripts() {
         let code = r#"
 import tools
-result = tools.mirror(marker="xyzzy")
-print("BRIDGED:", result)
+results = [tools.mirror(marker=f"xyzzy-{i}") for i in range(3)]
+print("BRIDGED:", "|".join(results))
 try:
     tools.mirror_not_a_tool()
 except Exception as e:
@@ -747,8 +829,8 @@ except Exception as e:
             other => panic!("expected tool result, got {:?}", other),
         };
         assert_eq!(
-            bridged_calls, 1,
-            "no bridged call; script output: {}",
+            bridged_calls, 3,
+            "script did not batch calls: {}",
             result_text
         );
         assert!(
@@ -756,7 +838,8 @@ except Exception as e:
             "missing bridge output: {}",
             result_text
         );
-        assert!(result_text.contains("xyzzy"));
+        assert!(result_text.contains("xyzzy-0"));
+        assert!(result_text.contains("xyzzy-2"));
         assert!(
             result_text.contains("RAISED OK"),
             "bad tool name must raise: {}",

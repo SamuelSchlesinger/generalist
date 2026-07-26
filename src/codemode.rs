@@ -1,10 +1,10 @@
 //! Code mode: scripts that call tools as code APIs.
 //!
-//! Instead of the model emitting one JSON tool call per step, it writes a
-//! Python script that imports a generated `tools` module and calls any
-//! registered tool as a function (Cloudflare's "Code Mode" / Anthropic's
-//! code-execution-with-MCP pattern; the AutoHarness pattern in the "Code as
-//! Agent Harness" survey). The payoff:
+//! Instead of the model emitting one JSON tool call per step, it gets one
+//! model-facing `python` tool. The script imports a generated `tools` module
+//! and calls any registered tool as a function (Cloudflare's "Code Mode" /
+//! Anthropic's code-execution-with-MCP pattern; the AutoHarness pattern in
+//! the "Code as Agent Harness" survey). The payoff:
 //!
 //! - one script replaces N model round-trips (loop/branch/retry in code)
 //! - tool results are processed *inside* the script and never enter the
@@ -32,23 +32,38 @@ pub(crate) const PY_TOOL_NAME: &str = "python";
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub(crate) const MAX_TIMEOUT_SECS: u64 = 600;
 
-/// Tool definition advertised to the model when code mode is on.
+/// The sole tool definition advertised to the model when code mode is on.
 ///
-/// `code_only_tools` are listed by name only — their full schemas live in
-/// the generated module's docstrings (progressive disclosure), so heavy
-/// (e.g. MCP) schemas never enter the model's context unrequested.
+/// Ordinary registered tools include their descriptions and schemas here so
+/// the model can use them in its first script without a discovery round-trip.
+/// `code_only_tools` are listed by name only — their full schemas live in the
+/// generated module's docstrings (progressive disclosure), so heavy (e.g.
+/// MCP) schemas never enter the model's context unrequested.
 pub(crate) fn python_tool_def(available_tools: &[ToolDef], code_only_tools: &[ToolDef]) -> ToolDef {
-    let tool_list = available_tools
-        .iter()
-        .map(|t| format!("tools.{}(...)", t.name))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let tool_docs = if available_tools.is_empty() {
+        "No ordinary bridge tools are registered; Python's standard library is still available."
+            .to_string()
+    } else {
+        available_tools
+            .iter()
+            .map(|tool| {
+                format!(
+                    "- tools.{name}(**kwargs): {description}\n  Input schema: {schema}",
+                    name = tool.name,
+                    description = tool.description,
+                    schema = serde_json::to_string(&tool.input_schema).unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let code_only_note = if code_only_tools.is_empty() {
         String::new()
     } else {
         format!(
-            " These additional tools exist ONLY inside scripts (not as direct tool calls); \
-             read a tool's usage with print(tools.<name>.__doc__) before first use: {}.",
+            "\nAdditional progressive-disclosure tools are also available only inside scripts. \
+             Their schemas are intentionally omitted here; inspect a tool at runtime with \
+             print(tools.<name>.__doc__) when needed: {}.",
             code_only_tools
                 .iter()
                 .map(|t| format!("tools.{}", t.name))
@@ -59,24 +74,25 @@ pub(crate) fn python_tool_def(available_tools: &[ToolDef], code_only_tools: &[To
     ToolDef {
         name: PY_TOOL_NAME.to_string(),
         description: format!(
-            "Execute a Python 3 script and return its stdout/stderr. Prefer one script over \
-             chains of separate tool calls: code can loop, branch, retry, and check its own \
-             results. The script can call every other available tool as a function via the \
-             pre-generated `tools` module — `import tools` then keyword arguments matching \
-             each tool's input schema, returning the result as a str (raises RuntimeError on \
-             failure): {}.{} Tool results stay inside the script: process them in code and \
-             print only what matters. Write large intermediate results to files and print \
-             summaries and file paths, not raw dumps. Output is truncated to the last 50,000 \
-             characters (full output saved to a temp file whose path is included). Default \
-             timeout 120s (override with timeout_seconds, max 600).",
-            tool_list, code_only_note
+            "Execute a Python 3 script and return its stdout/stderr. This is the only \
+             model-facing tool while code mode is enabled: perform all tool work inside the \
+             script via the pre-generated `tools` module. Start with `import tools`, then call \
+             bridge functions with keyword arguments; they return str and raise RuntimeError \
+             on failure. Complete the largest coherent work phase in one script instead of \
+             returning after one bridged call: loop, branch, retry, validate, and combine \
+             results in code. Tool results stay inside the script unless printed. Print only \
+             conclusions, compact evidence, and paths; write large intermediate results to \
+             files. Output is truncated to the last 50,000 characters (full output is saved \
+             to a temp file whose path is included). Default timeout 120s (override with \
+             timeout_seconds, max 600).\n\nAvailable bridge tools:\n{}{}",
+            tool_docs, code_only_note
         ),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "The Python 3 script to execute"
+                    "description": "A self-contained Python 3 script that completes as much of the requested tool work as possible"
                 },
                 "timeout_seconds": {
                     "type": "integer",

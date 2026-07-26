@@ -271,7 +271,17 @@ impl ChunkState {
 #[async_trait(?Send)]
 impl Provider for OpenAiProvider {
     fn id(&self) -> &'static str {
+        // Persistence key for this adapter. Do not use as a UI label: a
+        // compatible endpoint may be Ollama, LM Studio, vLLM, etc.
         "openai"
+    }
+
+    fn display_name(&self) -> &str {
+        if self.base_url == DEFAULT_BASE_URL {
+            "OpenAI"
+        } else {
+            "OpenAI-compatible"
+        }
     }
 
     fn model(&self) -> &str {
@@ -398,6 +408,23 @@ impl Provider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_name_describes_service_or_protocol_without_changing_stable_id() {
+        let official =
+            OpenAiProvider::new("key".into(), DEFAULT_BASE_URL.into(), "gpt-4o".into()).unwrap();
+        let compatible = OpenAiProvider::new(
+            "unused".into(),
+            "http://localhost:11434/v1".into(),
+            "qwen3.6:35b-a3b".into(),
+        )
+        .unwrap();
+
+        assert_eq!(official.id(), "openai");
+        assert_eq!(official.display_name(), "OpenAI");
+        assert_eq!(compatible.id(), "openai");
+        assert_eq!(compatible.display_name(), "OpenAI-compatible");
+    }
 
     #[test]
     fn wire_messages_map_tool_results_to_tool_role() {

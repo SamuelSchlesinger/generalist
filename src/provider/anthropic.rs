@@ -278,6 +278,10 @@ impl Provider for AnthropicProvider {
         "anthropic"
     }
 
+    fn display_name(&self) -> &str {
+        "Anthropic"
+    }
+
     fn model(&self) -> &str {
         &self.model
     }

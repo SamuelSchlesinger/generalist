@@ -33,10 +33,12 @@ Smoke tests, all live end-to-end: `cargo run --example smoke` (Anthropic),
 
 ## Usage
 
-Type a request; the agent calls tools and reports back. Tools: bash, python (code
-mode), file read/patch, directory listing, HTTP fetch, web search/scrape/crawl
-(Firecrawl), Wikipedia, weather, Z3, persistent memory, todo list. (Calculator,
-system-info, and think tools were retired: python and bash subsume them.)
+Type a request; the agent calls tools and reports back. On Unix, code mode is on by
+default and `python` is the only model-facing tool. Scripts reach all registered
+capabilities through `import tools`: bash, file read/patch, directory listing, HTTP
+fetch, web search/scrape/crawl (Firecrawl), Wikipedia, weather, Z3, persistent memory,
+and todo list. (Calculator, system-info, and think tools were retired from the CLI:
+python and bash subsume them.)
 
 Responses stream as they generate. Commands: `/save`, `/load`, `/model` (switch
 provider or model mid-conversation), `/compact` (summarize older history to free
@@ -84,8 +86,9 @@ Follows what pi, opencode, and Claude Code converged on:
 
 ## Code mode
 
-The agent advertises a `python` tool (Unix only). Scripts get a generated `tools`
-module exposing every registered tool as a function:
+The agent advertises exactly one tool, `python`, when code mode is enabled (the Unix
+default). Every registered tool is available only to scripts through a generated
+`tools` module:
 
 ```python
 import tools
@@ -94,12 +97,18 @@ pages = tools.firecrawl_search(query="rust async runtimes")
 print(extract_urls(pages))
 ```
 
-Calls are served over a Unix socket and pass through the same permission gate as
-direct calls. Results return to the script, not the model, so one script can process
-megabytes of tool output and print only the conclusion. Script errors come back as
-tool results, so the model can fix and re-run. This is the pattern from CodeAct,
-Cloudflare's Code Mode, Anthropic's code-execution-with-MCP, and the "Code as Agent
-Harness" survey (arXiv 2605.18747).
+Ordinary tool descriptions and schemas are folded into the `python` tool description,
+so the model can use them in its first script without a discovery round-trip. Calls are
+served over a Unix socket and pass through the same permission gate as direct mode.
+Results return to the script, not the model, so one script can perform a long sequence,
+process megabytes of output, validate the result, and print only the conclusion. Script
+errors come back as tool results, so the model can fix and re-run. This is the pattern
+from CodeAct, Cloudflare's Code Mode, Anthropic's code-execution-with-MCP, and the
+"Code as Agent Harness" survey (arXiv 2605.18747).
+
+Library users can opt back into independently advertised direct tools with
+`agent.code_mode = false`. Registering a custom tool named `python` also overrides the
+built-in runner.
 
 Relation to CaMeL: tool output that stays inside a script cannot prompt-inject the
 model, and per-call approval acts as the policy check. There is no data-flow/taint
@@ -119,13 +128,14 @@ transports are supported:
 }
 ```
 
-Discovered tools register as `<server>_<tool>` and are **code-only**: they never enter
-the model-facing tool list (MCP schemas are heavy — often 10k+ tokens per server).
-Instead they are callable from code-mode scripts, which see full schemas in the
-generated module's docstrings (`print(tools.tickerfacts_get_fundamentals.__doc__)`).
-Context cost scales with what a script uses, not what a server offers. Bridged MCP
-calls pass through the permission gate like any other tool. A failed server logs a
-warning and is skipped. `cargo run --example smoke_mcp` verifies the stack live.
+Discovered tools register as `<server>_<tool>` with progressive disclosure. Like every
+registered tool in code mode, they are callable only from scripts; unlike ordinary
+tools, their heavy schemas (often 10k+ tokens per server) are omitted from the
+model-facing `python` description. Full schemas remain in the generated module's
+docstrings (`print(tools.tickerfacts_get_fundamentals.__doc__)`). Context cost scales
+with what a script uses, not what a server offers. Bridged MCP calls pass through the
+permission gate like any other tool. A failed server logs a warning and is skipped.
+`cargo run --example smoke_mcp` verifies the stack live.
 
 ## Library use
 
@@ -158,8 +168,9 @@ async fn main() -> generalist::Result<()> {
 ```
 
 Custom tools implement the `Tool` trait: name, description, JSON schema, async
-execute. Put the trigger condition in the description — models decide when to call a
-tool from that text. Permission policy is pluggable via `ToolPermissionHandler`:
+execute. Put the trigger condition in the description — in code mode that text is
+included in the `python` tool's bridge-function documentation. Permission policy is
+pluggable via `ToolPermissionHandler`:
 `AlwaysAllow`, `AlwaysDeny`, name-based `PolicyPermissions`, or the interactive
 `MemoryPermissionHandler` the CLI uses.
 

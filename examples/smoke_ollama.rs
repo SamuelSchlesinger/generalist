@@ -29,7 +29,7 @@ async fn main() -> generalist::Result<()> {
     let mut agent = Agent::new(
         Box::new(provider),
         registry,
-        "You are a terse assistant. Use the calculator tool for any arithmetic.",
+        "You are a terse assistant. Use code mode and call tools.calculator for arithmetic.",
     );
 
     let said = std::cell::RefCell::new(String::new());

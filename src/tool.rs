@@ -27,10 +27,12 @@ pub trait Tool: Send + Sync {
     /// Execute with validated-by-the-model input; return output text.
     async fn execute(&self, input: Value) -> Result<String>;
 
-    /// Code-only tools are excluded from the model-facing tool list but
-    /// remain callable from code-mode scripts (progressive disclosure —
-    /// their schemas live in the generated `tools` module's docstrings).
-    /// MCP tools use this to keep heavy schemas out of the context.
+    /// Progressive-disclosure tools are excluded from the direct tool list
+    /// but remain callable from code-mode scripts. In built-in code mode all
+    /// tools are script-only; this flag additionally keeps the full schema
+    /// out of the `python` tool description and leaves it in the generated
+    /// `tools` module's docstring instead. MCP tools use this to keep heavy
+    /// schemas out of the context.
     fn code_only(&self) -> bool {
         false
     }
@@ -132,8 +134,10 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Model-facing tool definitions in registration order, excluding
-    /// code-only tools.
+    /// Direct tool definitions in registration order, excluding code-only
+    /// tools. When built-in code mode is active, these definitions are folded
+    /// into the sole model-facing `python` tool instead of being independently
+    /// callable.
     ///
     /// The order is deterministic on purpose: providers that cache the prompt
     /// prefix would otherwise miss the cache whenever a HashMap iteration
@@ -157,7 +161,8 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Definitions of code-only tools (for listing their names to the model).
+    /// Definitions of progressive-disclosure tools, used to list their names
+    /// without folding their full schemas into the `python` description.
     pub fn code_only_tool_defs(&self) -> Vec<ToolDef> {
         self.order
             .iter()

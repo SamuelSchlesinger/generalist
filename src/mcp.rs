@@ -1,12 +1,12 @@
 //! Minimal MCP (Model Context Protocol) client.
 //!
-//! Discovered MCP tools are wrapped as regular [`Tool`]s and registered as
-//! *code-only*: they do not appear in the model-facing tool list (MCP
-//! schemas are heavy), but they are callable from code-mode scripts via the
-//! generated `tools` module, whose docstrings carry the full schemas. This
-//! is the progressive-disclosure pattern from Anthropic's
-//! code-execution-with-MCP: context cost scales with what a script uses,
-//! not with what a server offers.
+//! Discovered MCP tools are wrapped as regular [`Tool`]s and registered for
+//! progressive disclosure. Like every tool in code mode, they are callable
+//! only from scripts; unlike ordinary tools, their heavy schemas are omitted
+//! from the model-facing `python` description and live only in the generated
+//! `tools` module's docstrings. This is the progressive-disclosure pattern
+//! from Anthropic's code-execution-with-MCP: context cost scales with what a
+//! script uses, not with what a server offers.
 //!
 //! Transports:
 //! - **Streamable HTTP** — JSON-RPC POSTs; handles both `application/json`

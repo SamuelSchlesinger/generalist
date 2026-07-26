@@ -27,7 +27,7 @@ async fn main() -> generalist::Result<()> {
     let mut agent = Agent::new(
         Box::new(provider),
         registry,
-        "You are a terse assistant. Use the calculator tool for any arithmetic.",
+        "You are a terse assistant. Use code mode and call tools.calculator for arithmetic.",
     );
 
     let mut on_event = |event: AgentEvent| match event {
@@ -47,7 +47,7 @@ async fn main() -> generalist::Result<()> {
         _ => {}
     };
 
-    // Turn 1: forces a tool round-trip.
+    // Turn 1: forces one code-mode round-trip with a bridged calculator call.
     let outcome = agent
         .run_turn("Use the calculator to compute 111 * 111.", &mut on_event)
         .await?;
