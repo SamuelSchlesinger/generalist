@@ -1,5 +1,6 @@
 //! Full-screen Ratatui frontend for the interactive agent CLI.
 
+use crate::command::COMMAND_SPECS;
 use crate::permissions::{PermissionChoice, ToolExecutionRequest};
 use crate::runtime::{DeliveryMode, PromptId, PromptQueue, QueuedPrompt};
 use crate::types::{truncate_middle, ContentBlock, Message};
@@ -116,12 +117,20 @@ struct QueueEditor {
     cursor: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptEditorAction {
+    Continue,
+    Submit,
+    Cancel,
+}
+
 #[derive(Debug)]
 struct AppState {
     api: String,
     model: String,
     bridge_count: usize,
     context_tokens: u64,
+    goal: Option<String>,
     chat: Vec<ChatEntry>,
     activity: Vec<ActivityEntry>,
     active_tools: Vec<(String, usize)>,
@@ -151,6 +160,7 @@ impl AppState {
             model,
             bridge_count: 0,
             context_tokens: 0,
+            goal: None,
             chat: Vec::new(),
             activity: Vec::new(),
             active_tools: Vec::new(),
@@ -685,6 +695,15 @@ impl TerminalUi {
         self.dirty = true;
     }
 
+    pub fn set_goal(&mut self, goal: Option<&str>) {
+        let goal = goal.map(sanitize_terminal_text);
+        if self.app.goal == goal {
+            return;
+        }
+        self.app.goal = goal;
+        self.dirty = true;
+    }
+
     pub fn set_busy(&mut self, busy: bool, status: &str) {
         let status = sanitize_terminal_text(status);
         let changed = self.app.busy != busy || self.app.status != status;
@@ -908,32 +927,17 @@ impl TerminalUi {
                             else {
                                 unreachable!()
                             };
-                            match key.code {
-                                KeyCode::Char('c')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
+                            match handle_prompt_editor_key(value, cursor, key) {
+                                PromptEditorAction::Cancel => {
                                     self.app.modal = None;
                                     return Ok(None);
                                 }
-                                KeyCode::Enter => {
+                                PromptEditorAction::Submit => {
                                     let value = value.clone();
                                     self.app.modal = None;
                                     return Ok(Some(value));
                                 }
-                                KeyCode::Esc => {
-                                    self.app.modal = None;
-                                    return Ok(None);
-                                }
-                                KeyCode::Char(ch) => insert_char(value, cursor, ch),
-                                KeyCode::Backspace => backspace(value, cursor),
-                                KeyCode::Delete => delete_at_cursor(value, *cursor),
-                                KeyCode::Left => *cursor = cursor.saturating_sub(1),
-                                KeyCode::Right => {
-                                    *cursor = (*cursor + 1).min(value.chars().count())
-                                }
-                                KeyCode::Home => *cursor = 0,
-                                KeyCode::End => *cursor = value.chars().count(),
-                                _ => {}
+                                PromptEditorAction::Continue => {}
                             }
                         }
                         _ => {}
@@ -1400,8 +1404,10 @@ fn render_header(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .style(Style::default().bg(PANEL));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let [top, goal_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
     let [identity, state] =
-        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(inner);
+        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(top);
     let context = if app.context_tokens == 0 {
         "context —".to_string()
     } else {
@@ -1438,6 +1444,25 @@ fn render_header(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .bg(PANEL),
         ),
         state,
+    );
+    let goal = app.goal.as_deref().map_or_else(
+        || {
+            Line::from(vec![
+                Span::styled(" Goal ", Style::default().fg(MUTED).bold()),
+                Span::styled("none · use /goal to set one", Style::default().fg(MUTED)),
+            ])
+        },
+        |goal| {
+            Line::from(vec![
+                Span::styled(" Goal ", Style::default().fg(BG).bg(GREEN).bold()),
+                Span::raw("  "),
+                Span::styled(goal.replace('\n', " ↵ "), Style::default().fg(TEXT)),
+            ])
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(goal).style(Style::default().bg(PANEL)),
+        goal_area,
     );
 }
 
@@ -1555,19 +1580,34 @@ fn render_activity(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let hint = if app.busy {
-        "Enter steer · Tab/Alt+Enter follow-up · Ctrl+J newline"
+    let command_mode = app.input.trim_start().starts_with('/');
+    let (label, hint, accent) = if command_mode {
+        (
+            " Command ",
+            if app.busy {
+                "Enter queue until idle · /help lists commands"
+            } else {
+                "Enter run · /help lists commands"
+            },
+            PURPLE,
+        )
+    } else if app.busy {
+        (
+            " Message ",
+            "Enter steer · Tab/Alt+Enter follow-up · Ctrl+J newline",
+            CYAN,
+        )
     } else {
-        "Enter send · Ctrl+J newline"
+        (" Message ", "Enter send · Ctrl+J newline", CYAN)
     };
     let block = Block::new()
         .title(Line::from(vec![
-            Span::styled(" Message ", Style::default().fg(CYAN).bold()),
+            Span::styled(label, Style::default().fg(accent).bold()),
             Span::styled(hint, Style::default().fg(MUTED)),
         ]))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(CYAN))
+        .border_style(Style::default().fg(accent))
         .style(Style::default().bg(PANEL_ALT));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1594,7 +1634,18 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let left = if app.busy {
+    let command_hint;
+    let left = if app.input.trim_start().starts_with('/') {
+        command_hint = format!(
+            " {}",
+            COMMAND_SPECS
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+        command_hint.as_str()
+    } else if app.busy {
         " F1 help  F2 queue  Alt+↑ restore  Esc/Ctrl+C interrupt"
     } else {
         " F1 help  F2 queue  Alt+↑ restore  Ctrl+C quit"
@@ -1644,20 +1695,39 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal, queue: &[QueuedPrompt]
 }
 
 fn render_help(frame: &mut Frame<'_>) {
-    let area = centered(frame.area(), 78, 80, 62, 20);
+    let area = centered(frame.area(), 88, 84, 70, 20);
     frame.render_widget(Clear, area);
     let block = modal_block(" Help & shortcuts ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let lines = vec![
-        Line::from(Span::styled("Commands", Style::default().fg(CYAN).bold())),
-        Line::from("  /save       save this conversation"),
-        Line::from("  /load       load a saved conversation"),
-        Line::from("  /model      switch API or model"),
-        Line::from("  /compact    summarize older context"),
-        Line::from("  /clear      clear conversation history"),
-        Line::from("  exit        close generalist"),
-        Line::from(""),
+    let [content_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [commands_area, shortcuts_area] =
+        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .spacing(1)
+            .areas(content_area);
+
+    let mut command_lines = vec![Line::from(Span::styled(
+        "Slash commands",
+        Style::default().fg(CYAN).bold(),
+    ))];
+    command_lines.extend(COMMAND_SPECS.iter().map(|command| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {:<9}", command.name),
+                Style::default().fg(PURPLE),
+            ),
+            Span::styled(command.description, Style::default().fg(TEXT)),
+        ])
+    }));
+    frame.render_widget(
+        Paragraph::new(command_lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(PANEL_ALT)),
+        commands_area,
+    );
+
+    let shortcut_lines = vec![
         Line::from(Span::styled("While idle", Style::default().fg(CYAN).bold())),
         Line::from("  Enter send · Ctrl+J newline · ↑/↓ input history"),
         Line::from(""),
@@ -1677,17 +1747,18 @@ fn render_help(frame: &mut Frame<'_>) {
         Line::from(Span::styled("Editor", Style::default().fg(CYAN).bold())),
         Line::from("  Ctrl+A/E home/end · Ctrl+U clear · Ctrl+W delete word"),
         Line::from("  PgUp/PgDn scroll conversation · mouse wheel also works"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Esc, Enter, or F1 closes this window",
-            Style::default().fg(MUTED),
-        )),
     ];
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(shortcut_lines)
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(TEXT).bg(PANEL_ALT)),
-        inner,
+        shortcuts_area,
+    );
+    frame.render_widget(
+        Paragraph::new("Esc, Enter, or F1 closes this window")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(MUTED).bg(PANEL_ALT)),
+        hint_area,
     );
 }
 
@@ -2130,6 +2201,62 @@ fn insert_text(value: &mut String, cursor: &mut usize, text: &str) {
     *cursor += inserted_chars;
 }
 
+fn handle_prompt_editor_key(
+    value: &mut String,
+    cursor: &mut usize,
+    key: KeyEvent,
+) -> PromptEditorAction {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => return PromptEditorAction::Cancel,
+            KeyCode::Char('a') => *cursor = 0,
+            KeyCode::Char('e') => *cursor = value.chars().count(),
+            KeyCode::Char('u') => {
+                value.clear();
+                *cursor = 0;
+            }
+            KeyCode::Char('k') => truncate_at_char(value, *cursor),
+            KeyCode::Char('w') => delete_previous_word(value, cursor),
+            _ => {}
+        }
+        return PromptEditorAction::Continue;
+    }
+
+    match key.code {
+        KeyCode::Enter => PromptEditorAction::Submit,
+        KeyCode::Esc => PromptEditorAction::Cancel,
+        KeyCode::Char(ch) => {
+            insert_char(value, cursor, ch);
+            PromptEditorAction::Continue
+        }
+        KeyCode::Backspace => {
+            backspace(value, cursor);
+            PromptEditorAction::Continue
+        }
+        KeyCode::Delete => {
+            delete_at_cursor(value, *cursor);
+            PromptEditorAction::Continue
+        }
+        KeyCode::Left => {
+            *cursor = cursor.saturating_sub(1);
+            PromptEditorAction::Continue
+        }
+        KeyCode::Right => {
+            *cursor = (*cursor + 1).min(value.chars().count());
+            PromptEditorAction::Continue
+        }
+        KeyCode::Home => {
+            *cursor = 0;
+            PromptEditorAction::Continue
+        }
+        KeyCode::End => {
+            *cursor = value.chars().count();
+            PromptEditorAction::Continue
+        }
+        _ => PromptEditorAction::Continue,
+    }
+}
+
 fn insert_char(value: &mut String, cursor: &mut usize, ch: char) {
     let byte = byte_index(value, *cursor);
     value.insert(byte, ch);
@@ -2266,6 +2393,39 @@ mod tests {
         backspace(&mut value, &mut cursor);
         assert_eq!(value, "ac");
         assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn prompt_editor_can_replace_a_prefilled_goal_with_shell_keys() {
+        let mut value = "old goal".to_string();
+        let mut cursor = value.chars().count();
+        assert_eq!(
+            handle_prompt_editor_key(
+                &mut value,
+                &mut cursor,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            ),
+            PromptEditorAction::Continue
+        );
+        assert!(value.is_empty());
+        assert_eq!(cursor, 0);
+
+        for ch in "new goal".chars() {
+            handle_prompt_editor_key(
+                &mut value,
+                &mut cursor,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(value, "new goal");
+        assert_eq!(
+            handle_prompt_editor_key(
+                &mut value,
+                &mut cursor,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ),
+            PromptEditorAction::Submit
+        );
     }
 
     #[test]
@@ -2507,6 +2667,7 @@ mod tests {
         let mut app = AppState::new("OpenAI-compatible", "qwen3.6:35b-a3b");
         app.bridge_count = 14;
         app.context_tokens = 12_400;
+        app.goal = Some("Ship the async TUI".into());
         app.push_user("Build a better interface");
         app.push_chat(ChatKind::Assistant, "Working on it.");
         let backend = TestBackend::new(120, 32);
@@ -2516,9 +2677,36 @@ mod tests {
         assert!(rendered.contains("GENERALIST"));
         assert!(rendered.contains("OpenAI-compatible"));
         assert!(rendered.contains("code mode"));
+        assert!(rendered.contains("Ship the async TUI"));
         assert!(rendered.contains("Conversation"));
         assert!(rendered.contains("Tool activity"));
         assert!(rendered.contains("Build a better interface"));
+    }
+
+    #[test]
+    fn slash_input_is_visibly_command_mode() {
+        let mut app = AppState::new("api", "model");
+        app.input = "/goal edit".into();
+        app.input_cursor = app.input.chars().count();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Command"));
+        assert!(rendered.contains("Enter run"));
+        assert!(rendered.contains("/goal"));
+    }
+
+    #[test]
+    fn help_discovers_goal_edit_from_the_command_catalog() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(render_help).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Slash commands"));
+        assert!(rendered.contains("/goal"));
+        assert!(rendered.contains("edit/show/clear/set objective"));
+        assert!(rendered.contains("/exit"));
     }
 
     #[test]

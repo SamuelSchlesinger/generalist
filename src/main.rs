@@ -3,9 +3,10 @@ use generalist::provider::{anthropic, AnthropicProvider, OpenAiProvider, Provide
 use generalist::tools::*;
 use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
-    history_tool_protocol_is_valid, Agent, AgentEvent, DeliveryMode, Error,
-    MemoryPermissionHandler, PermissionBrokerPrompt, PermissionChoice, PermissionRequest,
-    PermissionUiEvent, PromptQueue, Result, SavedState, ToolRegistry, TurnControl, TurnOutcome,
+    history_tool_protocol_is_valid, is_local_command, parse_local_command, truncate_middle, Agent,
+    AgentEvent, DeliveryMode, Error, GoalCommand, LocalCommand, MemoryPermissionHandler,
+    PermissionBrokerPrompt, PermissionChoice, PermissionRequest, PermissionUiEvent, PromptQueue,
+    Result, SavedState, ToolRegistry, TurnControl, TurnOutcome,
 };
 use std::env;
 use std::fs;
@@ -230,6 +231,7 @@ fn make_saved_state(
     SavedState {
         provider: agent.provider().id().to_string(),
         model: agent.provider().model().to_string(),
+        goal: agent.goal().map(str::to_string),
         conversation_history: agent.history.clone(),
         always_allow_tools: handler.always_allow().lock().unwrap().clone(),
         always_deny_tools: handler.always_deny().lock().unwrap().clone(),
@@ -240,6 +242,7 @@ fn make_saved_state(
 struct DurableBoundary {
     provider: String,
     model: String,
+    goal: Option<String>,
     history: Vec<generalist::Message>,
 }
 
@@ -248,6 +251,7 @@ impl DurableBoundary {
         Self {
             provider: agent.provider().id().to_string(),
             model: agent.provider().model().to_string(),
+            goal: agent.goal().map(str::to_string),
             history: agent.history.clone(),
         }
     }
@@ -261,6 +265,7 @@ impl DurableBoundary {
             &SavedState {
                 provider: self.provider.clone(),
                 model: self.model.clone(),
+                goal: self.goal.clone(),
                 conversation_history: self.history.clone(),
                 always_allow_tools: permission_handler.always_allow().lock().unwrap().clone(),
                 always_deny_tools: permission_handler.always_deny().lock().unwrap().clone(),
@@ -390,13 +395,6 @@ async fn choose_provider_and_model(
         return Ok(None);
     };
     Ok(Some((provider, model)))
-}
-
-fn is_local_command(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.starts_with('/')
-        || trimmed.eq_ignore_ascii_case("exit")
-        || trimmed.eq_ignore_ascii_case("quit")
 }
 
 fn enqueue_submission(
@@ -719,6 +717,17 @@ enum CommandFlow {
     Exit,
 }
 
+fn replace_goal(agent: &mut Agent, ui: &mut TerminalUi, goal: Option<String>) {
+    agent.set_goal(goal);
+    ui.set_goal(agent.goal());
+    ui.set_context_tokens(agent.context_tokens());
+    if let Some(goal) = agent.goal() {
+        ui.info(&format!("Active goal set: {}", truncate_middle(goal, 400)));
+    } else {
+        ui.info("Active goal cleared.");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_command(
     text: &str,
@@ -730,91 +739,116 @@ async fn execute_command(
     keys: &ApiKeys,
     available: &[&'static str],
 ) -> Result<CommandFlow> {
-    let command = text.trim();
-    if command.eq_ignore_ascii_case("exit") || command.eq_ignore_ascii_case("quit") {
-        return Ok(CommandFlow::Exit);
-    }
-    if command.eq_ignore_ascii_case("/help") {
-        terminal(ui.show_help().await)?;
-    } else if command.eq_ignore_ascii_case("/compact") {
-        if drive_compaction(agent, ui, queue, permission_rx, permission_handler).await? {
-            return Ok(CommandFlow::Exit);
-        }
-    } else if command.eq_ignore_ascii_case("/clear") {
-        agent.clear_history();
-        ui.clear_conversation();
-        ui.set_context_tokens(0);
-        ui.info("Conversation cleared.");
-    } else if command.eq_ignore_ascii_case("/save") {
-        let default = format!("chat_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-        if let Some(name) = terminal(ui.prompt("Save conversation as", &default).await)? {
-            match save_state(&make_saved_state(agent, permission_handler, queue), &name) {
-                Ok(path) => ui.info(&format!("Saved to {}", path.display())),
-                Err(error) => ui.error(&format!("Failed to save: {error}")),
+    let command = parse_local_command(text).unwrap_or(LocalCommand::Unknown(text.trim()));
+    match command {
+        LocalCommand::Exit => return Ok(CommandFlow::Exit),
+        LocalCommand::Help => terminal(ui.show_help().await)?,
+        LocalCommand::Compact => {
+            if drive_compaction(agent, ui, queue, permission_rx, permission_handler).await? {
+                return Ok(CommandFlow::Exit);
             }
         }
-    } else if command.eq_ignore_ascii_case("/load") {
-        let saved = list_saved_conversations();
-        if saved.is_empty() {
-            ui.info("No saved conversations found.");
-        } else if let Some(index) = terminal(ui.select("Load conversation", &saved).await)? {
-            match load_state(&saved[index]) {
-                Ok(state) => {
-                    let SavedState {
-                        provider,
-                        model,
-                        conversation_history,
-                        always_allow_tools,
-                        always_deny_tools,
-                        queued_prompts,
-                    } = state;
-                    if !history_tool_protocol_is_valid(&conversation_history) {
-                        ui.error(
-                            "Saved conversation has an unpaired tool use/result; refusing to load it.",
+        LocalCommand::Clear => {
+            agent.clear_history();
+            ui.clear_conversation();
+            ui.set_context_tokens(0);
+            ui.info("Conversation cleared. The active goal was preserved.");
+        }
+        LocalCommand::Save => {
+            let default = format!("chat_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+            if let Some(name) = terminal(ui.prompt("Save conversation as", &default).await)? {
+                match save_state(&make_saved_state(agent, permission_handler, queue), &name) {
+                    Ok(path) => ui.info(&format!("Saved to {}", path.display())),
+                    Err(error) => ui.error(&format!("Failed to save: {error}")),
+                }
+            }
+        }
+        LocalCommand::Load => {
+            let saved = list_saved_conversations();
+            if saved.is_empty() {
+                ui.info("No saved conversations found.");
+            } else if let Some(index) = terminal(ui.select("Load conversation", &saved).await)? {
+                match load_state(&saved[index]) {
+                    Ok(state) => {
+                        let SavedState {
+                            provider,
+                            model,
+                            goal,
+                            conversation_history,
+                            always_allow_tools,
+                            always_deny_tools,
+                            queued_prompts,
+                        } = state;
+                        if !history_tool_protocol_is_valid(&conversation_history) {
+                            ui.error(
+                                "Saved conversation has an unpaired tool use/result; refusing to load it.",
+                            );
+                            return Ok(CommandFlow::Continue);
+                        }
+                        match build_provider(keys, &provider, model) {
+                            Ok(provider) => agent.set_provider(provider),
+                            Err(error) => ui.error(&format!(
+                                "Saved API '{provider}' is unavailable ({error}); keeping the current API."
+                            )),
+                        }
+                        permission_handler.set_always_allow(always_allow_tools);
+                        permission_handler.set_always_deny(always_deny_tools);
+                        agent.set_goal(goal);
+                        agent.replace_history(conversation_history);
+                        queue.replace(queued_prompts);
+                        ui.load_history(&agent.history);
+                        ui.set_goal(agent.goal());
+                        ui.sync_queue(queue);
+                        ui.set_session(
+                            agent.provider().display_name(),
+                            agent.provider().model(),
+                            agent.registry.tool_names().len(),
                         );
-                        return Ok(CommandFlow::Continue);
+                        ui.set_context_tokens(agent.context_tokens());
+                        ui.info(&format!("Loaded {} messages", agent.history.len()));
                     }
-                    match build_provider(keys, &provider, model) {
-                        Ok(provider) => agent.set_provider(provider),
-                        Err(error) => ui.error(&format!(
-                            "Saved API '{provider}' is unavailable ({error}); keeping the current API."
-                        )),
-                    }
-                    permission_handler.set_always_allow(always_allow_tools);
-                    permission_handler.set_always_deny(always_deny_tools);
-                    agent.replace_history(conversation_history);
-                    queue.replace(queued_prompts);
-                    ui.load_history(&agent.history);
-                    ui.sync_queue(queue);
-                    ui.set_session(
-                        agent.provider().display_name(),
-                        agent.provider().model(),
-                        agent.registry.tool_names().len(),
-                    );
-                    ui.set_context_tokens(agent.context_tokens());
-                    ui.info(&format!("Loaded {} messages", agent.history.len()));
+                    Err(error) => ui.error(&format!("Failed to load: {error}")),
                 }
-                Err(error) => ui.error(&format!("Failed to load: {error}")),
             }
         }
-    } else if command.eq_ignore_ascii_case("/model") {
-        if let Some((provider_name, model)) = choose_provider_and_model(ui, keys, available).await?
-        {
-            match build_provider(keys, &provider_name, model) {
-                Ok(provider) => {
-                    agent.set_provider(provider);
-                    ui.set_session(
-                        agent.provider().display_name(),
-                        agent.provider().model(),
-                        agent.registry.tool_names().len(),
-                    );
-                    ui.info("Model switched.");
+        LocalCommand::Model => {
+            if let Some((provider_name, model)) =
+                choose_provider_and_model(ui, keys, available).await?
+            {
+                match build_provider(keys, &provider_name, model) {
+                    Ok(provider) => {
+                        agent.set_provider(provider);
+                        ui.set_session(
+                            agent.provider().display_name(),
+                            agent.provider().model(),
+                            agent.registry.tool_names().len(),
+                        );
+                        ui.info("Model switched.");
+                    }
+                    Err(error) => ui.error(&format!("Failed to switch model: {error}")),
                 }
-                Err(error) => ui.error(&format!("Failed to switch model: {error}")),
             }
         }
-    } else {
-        ui.info(&format!("Unknown local command: {command}"));
+        LocalCommand::Goal(GoalCommand::Edit) => {
+            let current = agent.goal().unwrap_or_default();
+            if let Some(goal) = terminal(ui.prompt("Active goal (empty clears)", current).await)? {
+                replace_goal(agent, ui, Some(goal));
+            }
+        }
+        LocalCommand::Goal(GoalCommand::Show) => {
+            if let Some(goal) = agent.goal() {
+                ui.info(&format!("Active goal: {goal}"));
+            } else {
+                ui.info("No active goal. Use /goal <objective> to set one.");
+            }
+        }
+        LocalCommand::Goal(GoalCommand::Clear) => replace_goal(agent, ui, None),
+        LocalCommand::Goal(GoalCommand::Set(goal)) => {
+            replace_goal(agent, ui, Some(goal.to_string()))
+        }
+        LocalCommand::Unknown(command) => {
+            ui.info(&format!("Unknown local command: {command}. Use /help."));
+        }
     }
     Ok(CommandFlow::Continue)
 }
@@ -885,8 +919,13 @@ async fn main() -> Result<()> {
 
     let mut agent = Agent::new(provider, registry, system_prompt);
     let queue = match load_state(AUTOSAVE_NAME) {
-        Ok(state) if !state.queued_prompts.is_empty() => {
-            if history_tool_protocol_is_valid(&state.conversation_history) {
+        Ok(mut state) => {
+            // The active goal is independent of crash recovery: preserve it
+            // across restarts even when there is no queued turn to resume.
+            agent.set_goal(state.goal.take());
+            if state.queued_prompts.is_empty() {
+                PromptQueue::default()
+            } else if history_tool_protocol_is_valid(&state.conversation_history) {
                 let SavedState {
                     conversation_history,
                     always_allow_tools,
@@ -914,6 +953,7 @@ async fn main() -> Result<()> {
     };
     queue.normalize_steers();
     ui.sync_queue(&queue);
+    ui.set_goal(agent.goal());
     ui.set_session(
         agent.provider().display_name(),
         agent.provider().model(),
@@ -1061,5 +1101,31 @@ mod tests {
 
         let error = serialize_state(&state).unwrap_err().to_string();
         assert!(error.contains("unpaired tool use/result"));
+    }
+
+    #[test]
+    fn goal_slash_commands_parse_without_losing_objective_text() {
+        assert_eq!(
+            parse_local_command("/goal"),
+            Some(LocalCommand::Goal(GoalCommand::Edit))
+        );
+        assert_eq!(
+            parse_local_command("/GOAL edit"),
+            Some(LocalCommand::Goal(GoalCommand::Edit))
+        );
+        assert_eq!(
+            parse_local_command("/goal show"),
+            Some(LocalCommand::Goal(GoalCommand::Show))
+        );
+        assert_eq!(
+            parse_local_command("/goal clear"),
+            Some(LocalCommand::Goal(GoalCommand::Clear))
+        );
+        assert_eq!(
+            parse_local_command("  /goal   ship the async TUI  "),
+            Some(LocalCommand::Goal(GoalCommand::Set("ship the async TUI")))
+        );
+        assert_eq!(parse_local_command("/exit"), Some(LocalCommand::Exit));
+        assert_eq!(parse_local_command("ordinary prompt"), None);
     }
 }

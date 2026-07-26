@@ -49,6 +49,7 @@ compile_error!("generalist supports Unix-like systems only");
 
 pub mod agent;
 pub(crate) mod codemode;
+pub mod command;
 pub mod error;
 pub mod execution;
 pub mod mcp;
@@ -63,6 +64,9 @@ pub mod tui;
 pub mod types;
 
 pub use agent::{history_tool_protocol_is_valid, Agent, AgentEvent, TurnOutcome};
+pub use command::{
+    is_local_command, parse_local_command, CommandSpec, GoalCommand, LocalCommand, COMMAND_SPECS,
+};
 pub use error::{Error, Result};
 pub use execution::{ExecutionState, ToolExecution};
 pub use permissions::{

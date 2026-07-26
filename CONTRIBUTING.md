@@ -21,9 +21,9 @@ state/action/invariant mapping is in
 `docs/runtime-traceability.md`. Treat that file as review evidence, not as
 architecture prose that can be updated from memory.
 
-For every change touching `src/main.rs`, `src/tui.rs`, `src/runtime.rs`,
-`src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`, `src/tool.rs`, or
-queue-bearing persistence in `src/state.rs`:
+For every change touching `src/main.rs`, `src/command.rs`, `src/tui.rs`,
+`src/runtime.rs`, `src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`,
+`src/tool.rs`, or queue/goal-bearing persistence in `src/state.rs`:
 
 1. Read the changed Rust paths and the entire TLA+ action they refine. Do not
    infer equivalence from names.
@@ -93,6 +93,8 @@ commits must answer in a terminal.
   matching result.
 - Keep local commands out of model-visible history and execute them only while
   no turn owns the agent.
+- Keep slash-command parsing, composer discovery, and help sourced from
+  `COMMAND_SPECS`; test subcommands such as `/goal edit` explicitly.
 - Preserve user changes in a dirty worktree and keep commits focused.
 - New shell scripts must be POSIX `sh`, executable, and included in ShellCheck.
 - Pin downloaded development artifacts and verify their checksums.

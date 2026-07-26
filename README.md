@@ -42,14 +42,21 @@ fetch, web search/scrape/crawl (Firecrawl), Wikipedia, weather, Z3, persistent m
 and todo list. (Calculator, system-info, and think tools were retired from the CLI:
 python and bash subsume them.)
 
-Responses stream as they generate. Commands: `/save`, `/load`, `/model` (switch
-provider or model mid-conversation), `/compact` (summarize older history to free
-context), `/clear`, `/help`, `exit`. History-valid boundaries and queue edits
-are atomically autosaved to `~/.generalist/history/autosave.json`. If the
-process exits with queued work, the next run recovers that queue together with
-its conversation context. `/load` also reads the legacy `~/.chatbot_history`
-and `~/.generalist_history` directories. If `~/.generalist_history` is instead
-a regular input-history file, it is left untouched.
+Responses stream as they generate. Type `/` to enter visible command mode; the
+footer lists the available slash commands from the same catalog used by the
+parser and help window. `/goal <objective>` sets durable instruction context,
+`/goal edit` opens the editor, `/goal show` displays it, and `/goal clear`
+removes it. Other commands are `/save`, `/load`, `/model`, `/compact`,
+`/clear`, `/help`, and `/exit`.
+
+History-valid boundaries, the active goal, and queue edits are atomically
+autosaved to `~/.generalist/history/autosave.json`. The goal survives restart
+even with no queued work. If the process exits with queued work, the next run
+also recovers that queue together with its conversation context. `/load` reads
+the goal stored in a named session and also supports the legacy
+`~/.chatbot_history` and `~/.generalist_history` directories. If
+`~/.generalist_history` is instead a regular input-history file, it is left
+untouched.
 
 ## Terminal UI
 
@@ -57,9 +64,9 @@ The Ratatui dashboard keeps conversation, live model status, context usage, the
 prompt queue, and recent tool activity visible at once. A single current-thread
 Tokio reactor polls the active model/tool future, terminal events, permission
 requests, and frame ticks together. You can keep editing and scrolling while a
-response is in flight. The header says `code mode / N bridges`: `python` remains
-the sole model-facing tool, while nested bridge activity is shown as
-`↳ tools.<name>`.
+response is in flight. The header keeps the active goal visible and says
+`code mode / N bridges`: `python` remains the sole model-facing tool, while
+nested bridge activity is shown as `↳ tools.<name>`.
 
 Keyboard and mouse controls:
 

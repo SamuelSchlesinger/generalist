@@ -56,10 +56,28 @@ Its viewport follows the stable-ID selection even when the queue is longer than
 the modal. Restore is refused while the composer contains a draft, so moving
 text out of the queue cannot silently destroy unsent input.
 
-Local commands are parsed as commands before dispatch; queueing `/clear` must
-never accidentally turn it into model-visible text. Help may open immediately.
-Commands that require mutable agent state wait in the same visible queue until
-the active turn releases that state.
+Local commands are parsed through the typed catalog in `src/command.rs` before
+dispatch; queueing `/clear` or `/goal edit` must never accidentally turn it
+into model-visible text. Typing `/` gives the composer a distinct command
+border/title and lists catalog entries in the footer. The help window renders
+the same catalog, so parser and discovery cannot silently drift. Help may open
+immediately. Commands that require mutable agent state wait in the same visible
+queue until the active turn releases that state.
+
+### Active goal
+
+`/goal <objective>` sets a user-authored objective, `/goal edit` (or bare
+`/goal`) opens a prefilled editor, `/goal show` displays it, and `/goal clear`
+removes it. `Agent` is the authority for the raw goal. It appends the goal to
+the effective system instructions for every ordinary provider request without
+inserting a synthetic conversation message. Changing it invalidates cached
+context accounting, while `/clear` deliberately preserves it. The prefilled
+editor supports the same Ctrl+A/E/U/K/W replacement controls as the composer.
+
+The TUI holds only a sanitized render copy and displays it on the second header
+row. Saved sessions and autosave carry the raw optional goal. Startup restores
+it even when there is no queued turn; named `/load` replaces the current goal
+with the loaded session's value.
 
 ## Ownership model
 
@@ -214,13 +232,15 @@ the controller when the turn returns.
 
 ## Persistence
 
-Autosave happens after every committed boundary and every visible queue edit,
-not only after a whole multi-turn queue drains. The controller retains a clone
-of the latest history-valid boundary while the agent future owns the live
-history. It writes that boundary and the current queue together to one file
-using flush, atomic rename, and parent-directory flush. A restart recovers
-queued work only with the conversation history from the same atomic snapshot;
-residual steers become follow-ups because their target turn no longer exists.
+Autosave happens after every committed boundary, local state command, and
+visible queue edit, not only after a whole multi-turn queue drains. The
+controller retains a clone of the latest history-valid boundary and active goal
+while the agent future owns the live history. It writes that boundary, goal,
+and current queue together to one file using flush, atomic rename, and
+parent-directory flush. A restart recovers queued work only with the
+conversation history from the same atomic snapshot; residual steers become
+follow-ups because their target turn no longer exists. Goal restoration is
+independent of queued-work recovery.
 
 Terminal actions explicitly report whether they changed the queue. Submission,
 edit, delete, reclassification, reorder, and restore trigger the atomic write;

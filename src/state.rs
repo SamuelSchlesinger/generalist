@@ -10,7 +10,7 @@ fn default_provider() -> String {
 }
 
 /// Everything needed to resume a conversation: history, provider/model,
-/// remembered permission decisions, and uncommitted prompts.
+/// active goal, remembered permission decisions, and uncommitted prompts.
 ///
 /// Older save files (which lacked `provider` and carried extra fields) load
 /// via serde defaults; files that are just a bare `Vec<Message>` are handled
@@ -20,6 +20,9 @@ pub struct SavedState {
     #[serde(default = "default_provider")]
     pub provider: String,
     pub model: String,
+    /// User-authored objective supplied to every model request.
+    #[serde(default)]
+    pub goal: Option<String>,
     pub conversation_history: Vec<Message>,
     #[serde(default)]
     pub always_allow_tools: HashSet<String>,
@@ -35,6 +38,7 @@ impl SavedState {
         Self {
             provider,
             model,
+            goal: None,
             conversation_history: Vec::new(),
             always_allow_tools: HashSet::new(),
             always_deny_tools: HashSet::new(),
@@ -52,6 +56,7 @@ impl SavedState {
         Some(Self {
             provider: default_provider(),
             model: fallback_model.to_string(),
+            goal: None,
             conversation_history: messages,
             always_allow_tools: HashSet::new(),
             always_deny_tools: HashSet::new(),
@@ -105,8 +110,9 @@ mod tests {
     }
 
     #[test]
-    fn queued_prompts_round_trip_and_old_saves_default_empty() {
+    fn goal_and_queued_prompts_round_trip_while_old_saves_default_empty() {
         let mut state = SavedState::new("openai".into(), "model".into());
+        state.goal = Some("ship the TUI".into());
         state.queued_prompts.push(QueuedPrompt {
             id: 7,
             text: "do this next".into(),
@@ -114,6 +120,7 @@ mod tests {
         });
         let json = serde_json::to_string(&state).unwrap();
         let loaded = SavedState::from_legacy_json(&json, "fallback").unwrap();
+        assert_eq!(loaded.goal.as_deref(), Some("ship the TUI"));
         assert_eq!(loaded.queued_prompts, state.queued_prompts);
 
         let old = r#"{
@@ -122,6 +129,7 @@ mod tests {
             "conversation_history": []
         }"#;
         let loaded = SavedState::from_legacy_json(old, "fallback").unwrap();
+        assert!(loaded.goal.is_none());
         assert!(loaded.queued_prompts.is_empty());
     }
 }

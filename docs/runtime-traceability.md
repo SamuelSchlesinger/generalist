@@ -17,10 +17,11 @@ wire formats, disk writes, and tool side effects.
 The model deliberately permits `Enqueue` in every runtime phase. Permission,
 help, and queue modals temporarily accept a smaller set of terminal keys, so
 the TUI refines that environment by disabling some user transitions; it never
-adds an enqueue transition forbidden by the model. Local commands, manual
-save/load/compaction, startup tool discovery, and provider selection execute
-only outside a mutation-capable turn and are reviewed separately for that
-ownership guard.
+adds an enqueue transition forbidden by the model. Local commands, goal
+editing, manual save/load/compaction, startup tool discovery, and provider
+selection execute only outside a mutation-capable turn and are reviewed
+separately for that ownership guard. Goal text and other provider payloads are
+hidden data in this model: an idle goal mutation refines a TLA+ stutter step.
 
 ## State mapping
 
@@ -84,18 +85,21 @@ ownership guard.
 ## Durable-boundary refinement
 
 Disk state is an implementation strengthening, not a TLA+ variable. The
-controller keeps a clone of the latest history-valid boundary while the agent
-future owns `&mut Agent`. Queue edits write that boundary and the current queue
-together to `~/.generalist/history/autosave.json` using flush, atomic rename,
-and parent-directory flush. `HistoryCheckpoint` replaces the boundary only after
-`history_tool_protocol_is_valid` holds. On restart, queued work is recovered
-only together with that autosaved conversation; because no turn survives a
-process exit, residual steers are normalized to follow-ups. The
+controller keeps a clone of the latest history-valid boundary and active goal
+while the agent future owns `&mut Agent`. Queue edits write that boundary, goal,
+and current queue together to `~/.generalist/history/autosave.json` using
+flush, atomic rename, and parent-directory flush. `HistoryCheckpoint` replaces
+the history boundary only after `history_tool_protocol_is_valid` holds. On
+restart, the goal is restored independently; queued work is recovered only
+together with that autosaved conversation. Because no turn survives a process
+exit, residual steers are normalized to follow-ups. The
 `structured_state_does_not_collide_with_legacy_input_history_file` and
 `persistence_rejects_an_invalid_tool_protocol_boundary` tests exercise the
-filesystem and protocol guards. `UiAction::QueueChanged` and `Submit` are the
-only terminal-event effects that request an autosave; display-only actions are
-covered by `only_queue_mutations_request_terminal_event_persistence`.
+filesystem and protocol guards; the state round-trip test covers the optional
+goal. `UiAction::QueueChanged` and `Submit` are the only terminal-event effects
+that request an autosave; idle local commands are persisted by the controller
+after execution. Display-only actions are covered by
+`only_queue_mutations_request_terminal_event_persistence`.
 
 ## Deliberate abstraction boundaries and residual risks
 
@@ -120,8 +124,11 @@ covered by `only_queue_mutations_request_terminal_event_persistence`.
 - Code-mode bridge calls are flattened into the active tool batch. Their
   permission denials are propagated, but their intermediate payloads and
   subprocess/socket mechanics are outside the model.
-- Local commands and `/load` mutate session state only while idle. They are
-  outside the active-turn model and must retain that guard.
+- Typed local commands, including `/goal edit`, and `/load` mutate session
+  state only while idle. They are outside the active-turn model and must retain
+  that guard. The active goal is host instruction state, not conversation
+  history; `active_goal_is_injected_without_entering_conversation_history`
+  checks that boundary.
 - TLC's state space is finite and its fingerprint collision probability is
   nonzero. A green run is model evidence, not a proof of Rust refinement or
   external tool termination.
@@ -204,3 +211,14 @@ visible; restore made no autosave and preserved the draft; the tiny layout
 survived; the partial response was visibly uncommitted and absent from the
 autosave; and normal exit restored canonical/echo modes, bracketed paste, and
 the alternate screen.
+
+The goal-command review rebuilt the exact binary and drove it through a PTY
+against a loopback OpenAI-compatible SSE server. It set a goal directly,
+opened `/goal edit`, replaced the prefilled value with Ctrl+U, ran `/goal
+show`, and intercepted the next provider request. The edited value appeared
+only in the system message, every request still advertised exactly `python`,
+and no `/goal` command entered conversation history. The atomic autosave held
+the edited value; a fresh process with no queued work rendered the recovered
+goal, and `/goal clear` persisted `null`. Preparing this run found that generic
+prompt modals treated Ctrl+U as a literal `u`; prompt editing now shares the
+composer's shell-style replacement controls and has deterministic coverage.

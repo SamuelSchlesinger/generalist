@@ -11,6 +11,11 @@
 \*   * permission replies are correlated with a live request;
 \*   * cancellation pairs every outstanding tool use before returning idle.
 \*
+\* Idle local commands (including goal edits), goal text, terminal rendering,
+\* and provider payloads are hidden data represented by stuttering steps.  Their
+\* idle ownership and history-isolation guards are traced separately in
+\* docs/runtime-traceability.md.
+\*
 \* See docs/async-tui.md for the corresponding implementation architecture.
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC

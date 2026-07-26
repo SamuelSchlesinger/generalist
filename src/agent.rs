@@ -24,6 +24,7 @@ use crate::types::{
     estimate_tokens, truncate_middle, CompletionRequest, ContentBlock, Message, StopReason, Usage,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -102,7 +103,10 @@ pub enum TurnOutcome {
 pub struct Agent {
     provider: Box<dyn Provider>,
     pub registry: ToolRegistry,
+    /// Base instructions shared by every provider request.
     pub system_prompt: String,
+    /// Durable user-authored objective appended to the base instructions.
+    goal: Option<String>,
     pub history: Vec<Message>,
     /// Cap on request → tool → request rounds within a single turn.
     pub max_iterations: usize,
@@ -137,6 +141,7 @@ impl Agent {
             provider,
             registry,
             system_prompt: system_prompt.into(),
+            goal: None,
             history: Vec::new(),
             max_iterations: 100,
             max_tokens: 16_000,
@@ -186,6 +191,40 @@ impl Agent {
 
     pub fn set_provider(&mut self, provider: Box<dyn Provider>) {
         self.provider = provider;
+    }
+
+    /// The active session objective, if one has been set with the host UI.
+    pub fn goal(&self) -> Option<&str> {
+        self.goal.as_deref()
+    }
+
+    /// Replace or clear the active session objective.
+    ///
+    /// Goals are instruction context rather than conversation messages, so
+    /// changing one does not rewrite history. Provider token accounting is
+    /// invalidated because the next request has a different system prompt.
+    pub fn set_goal(&mut self, goal: Option<String>) {
+        let goal = goal.and_then(|goal| {
+            let trimmed = goal.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        if self.goal != goal {
+            self.goal = goal;
+            self.last_context_tokens = None;
+        }
+    }
+
+    fn effective_system_prompt(&self) -> Cow<'_, str> {
+        let Some(goal) = self.goal() else {
+            return Cow::Borrowed(&self.system_prompt);
+        };
+        Cow::Owned(format!(
+            "{}\n\n## Active session goal\n\n{}\n\n\
+             Treat this as durable user intent. Keep making concrete progress toward it \
+             unless the user changes or clears the goal. Verify completion against the \
+             actual workspace state before claiming it is done.",
+            self.system_prompt, goal
+        ))
     }
 
     /// Replace persisted conversation history and discard the provider's
@@ -699,11 +738,12 @@ impl Agent {
         control: &mut TurnControl,
     ) -> Result<Option<(crate::types::CompletionResponse, bool)>> {
         let tools = self.model_tool_defs();
+        let system_prompt = self.effective_system_prompt();
         let mut attempt: u32 = 0;
         loop {
             on_event(AgentEvent::ApiCallStarted);
             let request = CompletionRequest {
-                system: Some(&self.system_prompt),
+                system: Some(system_prompt.as_ref()),
                 messages: &self.history,
                 tools: &tools,
                 max_tokens: self.max_tokens,
@@ -1796,6 +1836,54 @@ except Exception as e:
             .unwrap();
         assert_eq!(deltas, "hello");
         assert_eq!(full_blocks, 0, "streamed text must not be re-emitted whole");
+    }
+
+    #[tokio::test]
+    async fn active_goal_is_injected_without_entering_conversation_history() {
+        struct CaptureSystem {
+            systems: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait(?Send)]
+        impl Provider for CaptureSystem {
+            fn id(&self) -> &'static str {
+                "capture-system"
+            }
+
+            fn model(&self) -> &str {
+                "capture-system"
+            }
+
+            async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse> {
+                self.systems
+                    .lock()
+                    .unwrap()
+                    .push(request.system.unwrap_or_default().to_string());
+                Ok(text_response("done"))
+            }
+        }
+
+        let systems = Arc::new(Mutex::new(Vec::new()));
+        let provider = CaptureSystem {
+            systems: Arc::clone(&systems),
+        };
+        let mut agent = Agent::new(Box::new(provider), ToolRegistry::new(), "base instructions");
+        agent.set_goal(Some("  ship the async TUI  ".into()));
+        assert_eq!(agent.goal(), Some("ship the async TUI"));
+
+        agent.run_turn("first", &mut |_| {}).await.unwrap();
+        assert!(agent
+            .history
+            .iter()
+            .all(|message| !message.text().contains("Active session goal")));
+
+        agent.set_goal(None);
+        agent.run_turn("second", &mut |_| {}).await.unwrap();
+        let systems = systems.lock().unwrap();
+        assert!(systems[0].contains("base instructions"));
+        assert!(systems[0].contains("## Active session goal"));
+        assert!(systems[0].contains("ship the async TUI"));
+        assert_eq!(systems[1], "base instructions");
     }
 
     #[tokio::test]
