@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+make lint
+
+acknowledgement="Yes, I have updated the TLA+ model to reflect the current architecture"
+
+if [ "${GENERALIST_TLA_ACK:-}" = "1" ]; then
+    printf 'Architecture acknowledgement supplied by automation.\n'
+    exit 0
+fi
+
+if [ ! -r /dev/tty ]; then
+    printf '%s\n' \
+        "Commit cancelled: architecture acknowledgement requires a terminal." \
+        "For deliberate automation only, set GENERALIST_TLA_ACK=1." >&2
+    exit 1
+fi
+
+printf '\nArchitecture acknowledgement\n'
+printf '  Review CONTRIBUTING.md and docs/runtime-traceability.md first.\n'
+printf '  [y] %s\n' "$acknowledgement"
+printf '  [n] Cancel this commit and update the model\n'
+printf 'Select [y/N]: '
+IFS= read -r answer </dev/tty
+
+case "$answer" in
+    y | Y | yes | YES | Yes)
+        printf 'Acknowledged.\n'
+        ;;
+    *)
+        printf 'Commit cancelled. Update spec/AsyncRuntime.tla, then try again.\n' >&2
+        exit 1
+        ;;
+esac

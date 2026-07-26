@@ -1,4 +1,6 @@
 .env
 target/
+.tools/
 .*.sw*
 todos.json
+.generalist.env

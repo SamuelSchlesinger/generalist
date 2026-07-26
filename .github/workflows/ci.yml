@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Rust and runtime model
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java for TLC
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Rust lint components
+        run: rustup component add rustfmt clippy
+
+      - name: Install pinned TLA+ tools
+        run: make tla-tools
+
+      - name: Run all checks
+        env:
+          TLC_WORKERS: auto
+        run: make check

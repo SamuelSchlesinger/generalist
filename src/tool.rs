@@ -54,6 +54,7 @@ pub enum ToolCallOutcome {
     Success,
     Failed,
     Denied,
+    Cancelled,
 }
 
 /// The result block to feed back to the model, plus what actually happened.

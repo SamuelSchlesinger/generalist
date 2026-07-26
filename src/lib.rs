@@ -44,29 +44,36 @@ The full conversation lives in `agent.history` and survives errors, so a
 failed request never loses the record of tool calls that already ran.
 */
 
+#[cfg(not(unix))]
+compile_error!("generalist supports Unix-like systems only");
+
 pub mod agent;
-pub mod chat_ui;
-#[cfg(unix)]
 pub(crate) mod codemode;
 pub mod error;
 pub mod execution;
 pub mod mcp;
 pub mod permissions;
 pub mod provider;
+pub mod runtime;
 pub mod skills;
 pub mod state;
 pub mod tool;
 pub mod tools;
+pub mod tui;
 pub mod types;
 
-pub use agent::{Agent, AgentEvent, TurnOutcome};
+pub use agent::{history_tool_protocol_is_valid, Agent, AgentEvent, TurnOutcome};
 pub use error::{Error, Result};
 pub use execution::{ExecutionState, ToolExecution};
 pub use permissions::{
-    AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler, PermissionDecision,
+    AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler, PermissionBrokerPrompt,
+    PermissionChoice, PermissionDecision, PermissionPrompt, PermissionRequest, PermissionUiEvent,
     PolicyPermissions, ToolExecutionRequest, ToolPermissionHandler,
 };
 pub use provider::Provider;
+pub use runtime::{
+    CancelHandle, DeliveryMode, PromptClaim, PromptId, PromptQueue, QueuedPrompt, TurnControl,
+};
 pub use state::SavedState;
 pub use tool::{Tool, ToolCallOutcome, ToolCallResult, ToolRegistry};
 pub use types::{

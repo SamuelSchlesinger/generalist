@@ -1,6 +1,7 @@
 # generalist
 
-A provider-agnostic CLI agent in Rust. Works with the Anthropic Messages API or any
+A provider-agnostic terminal agent in Rust with a full-screen Ratatui interface. Works
+with the Anthropic Messages API or any
 OpenAI-compatible endpoint (OpenAI, Ollama, Groq, Mistral, vLLM, LM Studio). The
 library is small: neutral conversation types, a `Provider` trait, a tool registry with
 permission gating, and an agent loop that reports progress through event callbacks.
@@ -33,29 +34,71 @@ Smoke tests, all live end-to-end: `cargo run --example smoke` (Anthropic),
 
 ## Usage
 
-Type a request; the agent calls tools and reports back. On Unix, code mode is on by
-default and `python` is the only model-facing tool. Scripts reach all registered
-capabilities through `import tools`: bash, file read/patch, directory listing, HTTP
+Type a request; the agent calls tools and reports back. Generalist targets Unix-like
+systems; code mode is on by default and `python` is the only model-facing tool.
+Scripts reach all registered capabilities through `import tools`: bash, file
+read/patch, directory listing, HTTP
 fetch, web search/scrape/crawl (Firecrawl), Wikipedia, weather, Z3, persistent memory,
 and todo list. (Calculator, system-info, and think tools were retired from the CLI:
 python and bash subsume them.)
 
 Responses stream as they generate. Commands: `/save`, `/load`, `/model` (switch
 provider or model mid-conversation), `/compact` (summarize older history to free
-context), `/clear`, `/help`, `exit`. Every turn autosaves to
-`~/.generalist_history/autosave.json`. `/load` also reads the legacy
-`~/.chatbot_history` directory.
+context), `/clear`, `/help`, `exit`. History-valid boundaries and queue edits
+are atomically autosaved to `~/.generalist/history/autosave.json`. If the
+process exits with queued work, the next run recovers that queue together with
+its conversation context. `/load` also reads the legacy `~/.chatbot_history`
+and `~/.generalist_history` directories. If `~/.generalist_history` is instead
+a regular input-history file, it is left untouched.
+
+## Terminal UI
+
+The Ratatui dashboard keeps conversation, live model status, context usage, the
+prompt queue, and recent tool activity visible at once. A single current-thread
+Tokio reactor polls the active model/tool future, terminal events, permission
+requests, and frame ticks together. You can keep editing and scrolling while a
+response is in flight. The header says `code mode / N bridges`: `python` remains
+the sole model-facing tool, while nested bridge activity is shown as
+`↳ tools.<name>`.
+
+Keyboard and mouse controls:
+
+- While idle, `Enter` starts a turn. While busy, `Enter` queues a steer for the
+  next history-valid boundary.
+- `Tab` or `Alt+Enter` queues a separate follow-up. `Shift+Enter` or `Ctrl+J`
+  inserts a newline.
+- `Up`/`Down` browse input history. `Ctrl+A`/`Ctrl+E`, `Ctrl+U`, and `Ctrl+W`
+  provide familiar shell-style editing.
+- `PageUp`/`PageDown` or the mouse wheel scroll the conversation. A paused
+  viewport stays anchored while new text streams; scrolling to the bottom
+  resumes follow-latest.
+- `F2` opens the queue manager: edit, delete, change steer/follow-up mode,
+  reorder, or restore a queued message. The mouse wheel moves long queue
+  selections. `Alt+Up` restores the latest queued message directly to an empty
+  composer; restore never overwrites an unsent draft.
+- `F1` opens help. With no modal, `Esc`/`Ctrl+C` interrupts a busy turn safely;
+  while idle, `Esc` clears the editor and `Ctrl+C` exits. A permission modal
+  consumes its own keys first.
+
+The exact async semantics, TLA+ model, and maintained model-to-Rust review are
+documented in [the architecture note](docs/async-tui.md) and
+[runtime traceability matrix](docs/runtime-traceability.md).
 
 ## Permissions
 
-Every tool call prompts for approval and shows the full input (diffs rendered as
-diffs). Choices: allow always, allow once, deny always, deny once. Decisions persist
-across save/load.
+New tool calls open a permission modal showing the full input (patches are rendered as
+colored diffs). Choices are allow always, allow once, deny always, and deny once.
+Decisions persist across save/load; remembered decisions are surfaced in the status
+bar while every execution remains visible in the tool-activity panel.
+
+All model, tool, queue, provider, and MCP text is control-character-sanitized at
+the display boundary so untrusted content cannot emit terminal escape commands.
+The raw text retained in conversation history and passed to tools is unchanged.
 
 Caveats:
 
 - "Always allow" is per tool name. Always-allowing `bash` approves every future
-  command; the command is still printed before it runs.
+  command; each command is still shown in tool activity before it runs.
 - The prompts are not a sandbox. An agent that can write and run code can circumvent
   in-process fences; use a container or dedicated user for real isolation.
 - Fetched web content is untrusted input; the approval step exists mainly to catch
@@ -78,7 +121,8 @@ Follows what pi, opencode, and Claude Code converged on:
 - On Anthropic, the system prompt and conversation prefix carry prompt-cache
   breakpoints, which cuts input cost substantially in long sessions.
 - Responses stream (SSE) on both providers; a stream that dies mid-message is
-  retried rather than treated as a complete answer.
+  visibly marked uncommitted and retried rather than treated as a complete
+  answer or persisted as assistant history.
 - When context passes a threshold (default 150k tokens, configurable), older
   history is summarized in place and recent turns stay verbatim. `/compact`
   triggers it manually. Local models with small context windows may want a much
@@ -86,7 +130,7 @@ Follows what pi, opencode, and Claude Code converged on:
 
 ## Code mode
 
-The agent advertises exactly one tool, `python`, when code mode is enabled (the Unix
+The agent advertises exactly one tool, `python`, when code mode is enabled (the
 default). Every registered tool is available only to scripts through a generated
 `tools` module:
 
@@ -105,6 +149,12 @@ process megabytes of output, validate the result, and print only the conclusion.
 errors come back as tool results, so the model can fix and re-run. This is the pattern
 from CodeAct, Cloudflare's Code Mode, Anthropic's code-execution-with-MCP, and the
 "Code as Agent Harness" survey (arXiv 2605.18747).
+
+Some OpenAI-compatible models return a bridge expression such as
+`tools.firecrawl_search` as an undeclared native call despite receiving only the
+`python` schema. Generalist treats that as a provider-protocol violation: it records a
+paired error so history stays valid, but does not request permission or execute the
+named tool.
 
 Library users can opt back into independently advertised direct tools with
 `agent.code_mode = false`. Registering a custom tool named `python` also overrides the
@@ -187,6 +237,12 @@ in the working directory is appended to the system prompt at startup.
 - Compaction uses a chars/4 token estimate between provider measurements; treat
   thresholds as approximate.
 - Code-mode scripts run unsandboxed (see Permissions).
+
+## Development
+
+Run `make setup` once to install the pinned TLA+ tools and checked-in Git hooks,
+then `make check` before contributing. The full methodology—including the
+required TUI-to-TLA+ trace review—is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

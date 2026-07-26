@@ -19,9 +19,11 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dialoguer = "0.11"
-indicatif = "0.17"
-console = "0.15"
 colored = "2.2"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+unicode-width = "0.1"
 dotenv = "0.15.0"
 exmex = "0.20"
 urlencoding = "2.1"

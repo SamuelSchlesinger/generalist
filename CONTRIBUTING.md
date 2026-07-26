@@ -1,0 +1,98 @@
+# Contributing
+
+Generalist supports Unix-like systems only. Install the development tools and
+the checked-in Git hooks once:
+
+```sh
+make setup
+make doctor
+```
+
+Use `make check` before sending a change. It runs formatting, Clippy with
+warnings denied, ShellCheck, the documentation traceability lint, TLC, and the
+complete Rust test suite. The pre-commit hook runs `make lint`; the pre-push
+hook runs `make check`.
+
+## Runtime model review
+
+Changes to the TUI or conversation runtime are not complete until the Rust
+control flow has been traced against `spec/AsyncRuntime.tla`. The living
+state/action/invariant mapping is in
+`docs/runtime-traceability.md`. Treat that file as review evidence, not as
+architecture prose that can be updated from memory.
+
+For every change touching `src/main.rs`, `src/tui.rs`, `src/runtime.rs`,
+`src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`, `src/tool.rs`, or
+queue-bearing persistence in `src/state.rs`:
+
+1. Read the changed Rust paths and the entire TLA+ action they refine. Do not
+   infer equivalence from names.
+2. Write down the precondition, authoritative state mutation, await or
+   cancellation boundary, rollback path, durable checkpoint, and visible TUI
+   effect.
+3. Update the model before weakening or adding a transition. If the code is a
+   deliberate refinement of an over-approximating model action, record the
+   refinement boundary in `docs/runtime-traceability.md`.
+4. Update every affected row of the state, action, and invariant matrices.
+   `make traceability` catches missing names but cannot judge whether a row is
+   truthful.
+5. Add deterministic Rust evidence for the concrete path. Exercise stable IDs,
+   duplicate text, claim rollback, FIFO order, safe steering, correlated
+   permissions, cancellation repair, iteration limits, and history-valid
+   checkpoints as applicable.
+6. Re-run TLC with `make tla`. A green finite model check establishes the
+   configured model properties; it does not prove that Rust refines the model.
+7. For interaction changes, build the exact source under review with
+   `cargo build --bin generalist --locked`, then run that binary in a PTY
+   against a deliberately stalled fake provider. While it is stalled, type in
+   the composer, enqueue both delivery modes, edit/reorder/delete the queue,
+   rapidly scroll a long transcript, answer or cancel a permission request, and
+   interrupt the turn. Confirm that display-only scrolling does not change the
+   autosave, then confirm the subsequent provider request and queue-changing
+   autosave, not only the rendered frame. Never infer PTY coverage from a
+   pre-existing `target/` binary.
+   Include a bursty streaming response, a queue longer than the modal, a draft
+   beneath restore, and a resize below the normal layout. On exit, verify raw
+   mode, echo/canonical input, bracketed paste, and the alternate screen were
+   restored.
+8. Run `make check`, inspect the complete diff, and repeat the trace for any
+   fix made during validation.
+
+Pay particular attention to the races that have found real defects before:
+
+- terminal input becoming ready at the same time as a provider response;
+- cancellation becoming ready with the final permission reply;
+- cancellation during the running and not-yet-started members of a tool batch;
+- a denial inside a code-mode script that catches the Python exception;
+- an OpenAI-compatible model returning a native tool name that was not
+  advertised; it must be paired but never permission-checked or executed;
+- steering after a final answer, refusal, denial, or the last iteration;
+- process failure before and after a prompt claim or history checkpoint;
+- stale permission IDs and duplicate prompt text.
+- display-event floods starving terminal input, paused scrolling drifting during
+  streaming, selection leaving a long queue viewport, and modal input leaking
+  into the obscured conversation;
+- partial streamed text appearing committed after cancellation, untrusted
+  control bytes reaching the terminal, and startup-error paths skipping terminal
+  cleanup.
+
+The checked-in pre-commit hook always presents this exact acknowledgement:
+
+> Yes, I have updated the TLA+ model to reflect the current architecture
+
+Answering yes means either the model changed or you painstakingly confirmed
+that the current model and traceability matrix still cover the change. The
+prompt is an acknowledgement, not a substitute for the review. Deliberate
+non-interactive automation may set `GENERALIST_TLA_ACK=1`; ordinary local
+commits must answer in a terminal.
+
+## Change hygiene
+
+- Keep one authoritative queue and one terminal reader.
+- Do not persist a history checkpoint between an assistant tool use and its
+  matching result.
+- Keep local commands out of model-visible history and execute them only while
+  no turn owns the agent.
+- Preserve user changes in a dirty worktree and keep commits focused.
+- New shell scripts must be POSIX `sh`, executable, and included in ShellCheck.
+- Pin downloaded development artifacts and verify their checksums.

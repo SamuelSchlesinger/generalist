@@ -6,7 +6,9 @@ use colored::*;
 use dialoguer::{theme::ColorfulTheme, Select};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 /// Decision on whether a tool call may run.
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +16,15 @@ pub enum PermissionDecision {
     Allow,
     Deny,
     DenyWithReason(String),
+}
+
+/// The four choices presented by an interactive permission prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionChoice {
+    AllowAlways,
+    AllowOnce,
+    DenyAlways,
+    DenyOnce,
 }
 
 /// Everything a handler needs to decide about one tool call.
@@ -30,6 +41,20 @@ pub struct ToolExecutionRequest {
 #[async_trait]
 pub trait ToolPermissionHandler: Send + Sync {
     async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision;
+}
+
+/// UI adapter used by [`MemoryPermissionHandler`] for decisions that have not
+/// already been remembered.
+///
+/// This is asynchronous so a terminal frontend can broker the request to its
+/// single event reactor without blocking model progress or adding a second
+/// terminal reader.
+#[async_trait]
+pub trait PermissionPrompt: Send + Sync {
+    async fn choose(&self, request: &ToolExecutionRequest) -> PermissionChoice;
+
+    /// Surface a remembered choice without opening another prompt.
+    fn automatic_decision(&self, _request: &ToolExecutionRequest, _allowed: bool) {}
 }
 
 /// Allows everything. The default for library use; do not pair with tools
@@ -103,57 +128,9 @@ fn format_diff_for_display(diff: &str) -> String {
     formatted
 }
 
-/// Interactive handler with remembered always/never decisions per tool.
-///
-/// Remembered "always allow" is per tool *name*, which means a remembered
-/// `bash` approval covers every future command. To keep that meaningful, the
-/// auto-allow path still prints the full input before execution.
-pub struct MemoryPermissionHandler {
-    always_allow: Arc<Mutex<HashSet<String>>>,
-    always_deny: Arc<Mutex<HashSet<String>>>,
-}
+struct ConsolePermissionPrompt;
 
-impl Default for MemoryPermissionHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MemoryPermissionHandler {
-    pub fn new() -> Self {
-        Self {
-            always_allow: Arc::new(Mutex::new(HashSet::new())),
-            always_deny: Arc::new(Mutex::new(HashSet::new())),
-        }
-    }
-
-    /// Create a handler sharing decision state with another.
-    pub fn with_shared_state(
-        always_allow: Arc<Mutex<HashSet<String>>>,
-        always_deny: Arc<Mutex<HashSet<String>>>,
-    ) -> Self {
-        Self {
-            always_allow,
-            always_deny,
-        }
-    }
-
-    pub fn always_allow(&self) -> Arc<Mutex<HashSet<String>>> {
-        Arc::clone(&self.always_allow)
-    }
-
-    pub fn always_deny(&self) -> Arc<Mutex<HashSet<String>>> {
-        Arc::clone(&self.always_deny)
-    }
-
-    pub fn set_always_allow(&self, tools: HashSet<String>) {
-        *self.always_allow.lock().unwrap() = tools;
-    }
-
-    pub fn set_always_deny(&self, tools: HashSet<String>) {
-        *self.always_deny.lock().unwrap() = tools;
-    }
-
+impl ConsolePermissionPrompt {
     fn print_request(request: &ToolExecutionRequest) {
         println!("\n{}", "⚠️  Tool Permission Request".yellow().bold());
         println!("{}", "─".repeat(50).dimmed());
@@ -185,19 +162,202 @@ impl MemoryPermissionHandler {
 }
 
 #[async_trait]
+impl PermissionPrompt for ConsolePermissionPrompt {
+    async fn choose(&self, request: &ToolExecutionRequest) -> PermissionChoice {
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::print_request(&request);
+            Self::choose_blocking()
+        })
+        .await
+        .unwrap_or(PermissionChoice::DenyOnce)
+    }
+
+    fn automatic_decision(&self, request: &ToolExecutionRequest, allowed: bool) {
+        let compact = serde_json::to_string(&request.input).unwrap_or_default();
+        if allowed {
+            eprintln!(
+                "{} Auto-allowing {} {}",
+                "✓".green(),
+                request.tool_name.cyan(),
+                truncate_middle(&compact, 300).dimmed()
+            );
+        } else {
+            eprintln!(
+                "{} Auto-denying '{}' (previously set to never allow)",
+                "✗".red(),
+                request.tool_name.cyan()
+            );
+        }
+    }
+}
+
+impl ConsolePermissionPrompt {
+    fn choose_blocking() -> PermissionChoice {
+        let choices = [
+            "Yes (always allow this tool)",
+            "Yes (just this once)",
+            "No (never allow this tool)",
+            "No (just this once)",
+        ];
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Allow this tool to execute?")
+            .items(&choices)
+            .default(1)
+            .interact()
+            .unwrap_or(3);
+        match selection {
+            0 => PermissionChoice::AllowAlways,
+            1 => PermissionChoice::AllowOnce,
+            2 => PermissionChoice::DenyAlways,
+            _ => PermissionChoice::DenyOnce,
+        }
+    }
+}
+
+/// Request sent by an asynchronous permission prompt to the UI reactor.
+#[derive(Debug)]
+pub struct PermissionRequest {
+    pub id: u64,
+    pub request: ToolExecutionRequest,
+    pub reply: oneshot::Sender<PermissionChoice>,
+}
+
+/// Permission-related events consumed by the UI reactor.
+#[derive(Debug)]
+pub enum PermissionUiEvent {
+    Request(PermissionRequest),
+    Automatic {
+        request: ToolExecutionRequest,
+        allowed: bool,
+    },
+}
+
+/// Prompt implementation that delegates every interactive choice to a single
+/// UI event loop and awaits its correlated one-shot reply.
+pub struct PermissionBrokerPrompt {
+    sender: mpsc::UnboundedSender<PermissionUiEvent>,
+    next_id: AtomicU64,
+}
+
+impl PermissionBrokerPrompt {
+    pub fn new(sender: mpsc::UnboundedSender<PermissionUiEvent>) -> Self {
+        Self {
+            sender,
+            next_id: AtomicU64::new(1),
+        }
+    }
+}
+
+#[async_trait]
+impl PermissionPrompt for PermissionBrokerPrompt {
+    async fn choose(&self, request: &ToolExecutionRequest) -> PermissionChoice {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (reply, answer) = oneshot::channel();
+        let event = PermissionUiEvent::Request(PermissionRequest {
+            id,
+            request: request.clone(),
+            reply,
+        });
+        if self.sender.send(event).is_err() {
+            return PermissionChoice::DenyOnce;
+        }
+        answer.await.unwrap_or(PermissionChoice::DenyOnce)
+    }
+
+    fn automatic_decision(&self, request: &ToolExecutionRequest, allowed: bool) {
+        let _ = self.sender.send(PermissionUiEvent::Automatic {
+            request: request.clone(),
+            allowed,
+        });
+    }
+}
+
+/// Interactive handler with remembered always/never decisions per tool.
+///
+/// Remembered "always allow" is per tool *name*, which means a remembered
+/// `bash` approval covers every future command. To keep that meaningful, the
+/// auto-allow path still prints the full input before execution.
+#[derive(Clone)]
+pub struct MemoryPermissionHandler {
+    always_allow: Arc<Mutex<HashSet<String>>>,
+    always_deny: Arc<Mutex<HashSet<String>>>,
+    prompt: Arc<dyn PermissionPrompt>,
+}
+
+impl Default for MemoryPermissionHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemoryPermissionHandler {
+    pub fn new() -> Self {
+        Self {
+            always_allow: Arc::new(Mutex::new(HashSet::new())),
+            always_deny: Arc::new(Mutex::new(HashSet::new())),
+            prompt: Arc::new(ConsolePermissionPrompt),
+        }
+    }
+
+    /// Create an empty remembered policy using a custom interactive frontend.
+    pub fn with_prompt(prompt: Arc<dyn PermissionPrompt>) -> Self {
+        Self {
+            always_allow: Arc::new(Mutex::new(HashSet::new())),
+            always_deny: Arc::new(Mutex::new(HashSet::new())),
+            prompt,
+        }
+    }
+
+    /// Create a handler sharing decision state with another.
+    pub fn with_shared_state(
+        always_allow: Arc<Mutex<HashSet<String>>>,
+        always_deny: Arc<Mutex<HashSet<String>>>,
+    ) -> Self {
+        Self {
+            always_allow,
+            always_deny,
+            prompt: Arc::new(ConsolePermissionPrompt),
+        }
+    }
+
+    /// Create a handler sharing both remembered state and a custom frontend.
+    pub fn with_shared_state_and_prompt(
+        always_allow: Arc<Mutex<HashSet<String>>>,
+        always_deny: Arc<Mutex<HashSet<String>>>,
+        prompt: Arc<dyn PermissionPrompt>,
+    ) -> Self {
+        Self {
+            always_allow,
+            always_deny,
+            prompt,
+        }
+    }
+
+    pub fn always_allow(&self) -> Arc<Mutex<HashSet<String>>> {
+        Arc::clone(&self.always_allow)
+    }
+
+    pub fn always_deny(&self) -> Arc<Mutex<HashSet<String>>> {
+        Arc::clone(&self.always_deny)
+    }
+
+    pub fn set_always_allow(&self, tools: HashSet<String>) {
+        *self.always_allow.lock().unwrap() = tools;
+    }
+
+    pub fn set_always_deny(&self, tools: HashSet<String>) {
+        *self.always_deny.lock().unwrap() = tools;
+    }
+}
+
+#[async_trait]
 impl ToolPermissionHandler for MemoryPermissionHandler {
     async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision {
         {
             let always_allow = self.always_allow.lock().unwrap();
             if always_allow.contains(&request.tool_name) {
-                // Auto-approved, but always show what is about to run.
-                let compact = serde_json::to_string(&request.input).unwrap_or_default();
-                eprintln!(
-                    "{} Auto-allowing {} {}",
-                    "✓".green(),
-                    request.tool_name.cyan(),
-                    truncate_middle(&compact, 300).dimmed()
-                );
+                self.prompt.automatic_decision(request, true);
                 return PermissionDecision::Allow;
             }
         }
@@ -205,64 +365,32 @@ impl ToolPermissionHandler for MemoryPermissionHandler {
         {
             let always_deny = self.always_deny.lock().unwrap();
             if always_deny.contains(&request.tool_name) {
-                eprintln!(
-                    "{} Auto-denying '{}' (previously set to never allow)",
-                    "✗".red(),
-                    request.tool_name.cyan()
-                );
+                self.prompt.automatic_decision(request, false);
                 return PermissionDecision::DenyWithReason(
                     "Tool was previously set to never allow".to_string(),
                 );
             }
         }
 
-        Self::print_request(request);
-
-        let choices = vec![
-            "Yes (always allow this tool)",
-            "Yes (just this once)",
-            "No (never allow this tool)",
-            "No (just this once)",
-        ];
-
-        // On prompt failure (e.g. Ctrl-C at the prompt) fall through to a
-        // one-time denial rather than panicking.
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Allow this tool to execute?")
-            .items(&choices)
-            .default(1)
-            .interact()
-            .unwrap_or(3);
-
-        match selection {
-            0 => {
+        match self.prompt.choose(request).await {
+            PermissionChoice::AllowAlways => {
                 self.always_allow
                     .lock()
                     .unwrap()
                     .insert(request.tool_name.clone());
-                println!(
-                    "{} Tool '{}' will be automatically allowed in the future",
-                    "✓".green(),
-                    request.tool_name.cyan()
-                );
                 PermissionDecision::Allow
             }
-            1 => PermissionDecision::Allow,
-            2 => {
+            PermissionChoice::AllowOnce => PermissionDecision::Allow,
+            PermissionChoice::DenyAlways => {
                 self.always_deny
                     .lock()
                     .unwrap()
                     .insert(request.tool_name.clone());
-                println!(
-                    "{} Tool '{}' will be automatically denied in the future",
-                    "✗".red(),
-                    request.tool_name.cyan()
-                );
                 PermissionDecision::DenyWithReason(
                     "User chose to never allow this tool".to_string(),
                 )
             }
-            _ => PermissionDecision::DenyWithReason(
+            PermissionChoice::DenyOnce => PermissionDecision::DenyWithReason(
                 "User denied permission for this execution".to_string(),
             ),
         }
@@ -316,5 +444,74 @@ mod tests {
             handler.check_permission(&request("bash")).await,
             PermissionDecision::DenyWithReason(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn broker_correlates_the_ui_reply_with_its_request() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let handler =
+            MemoryPermissionHandler::with_prompt(Arc::new(PermissionBrokerPrompt::new(sender)));
+        let task =
+            tokio::spawn(async move { handler.check_permission(&request("patch_file")).await });
+
+        let PermissionUiEvent::Request(pending) =
+            receiver.recv().await.expect("permission request")
+        else {
+            panic!("expected interactive request");
+        };
+        assert_eq!(pending.id, 1);
+        assert_eq!(pending.request.tool_name, "patch_file");
+        pending.reply.send(PermissionChoice::AllowOnce).unwrap();
+        assert_eq!(task.await.unwrap(), PermissionDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn dropped_broker_reply_denies_instead_of_hanging() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let handler =
+            MemoryPermissionHandler::with_prompt(Arc::new(PermissionBrokerPrompt::new(sender)));
+        let task = tokio::spawn(async move { handler.check_permission(&request("bash")).await });
+
+        let PermissionUiEvent::Request(pending) =
+            receiver.recv().await.expect("permission request")
+        else {
+            panic!("expected interactive request");
+        };
+        drop(pending.reply);
+        assert!(matches!(
+            task.await.unwrap(),
+            PermissionDecision::DenyWithReason(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn broker_request_ids_keep_out_of_order_replies_correlated() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let prompt = Arc::new(PermissionBrokerPrompt::new(sender));
+        let first_prompt = Arc::clone(&prompt);
+        let first = tokio::spawn(async move { first_prompt.choose(&request("first")).await });
+        let second_prompt = Arc::clone(&prompt);
+        let second = tokio::spawn(async move { second_prompt.choose(&request("second")).await });
+
+        let PermissionUiEvent::Request(request_a) = receiver.recv().await.expect("first request")
+        else {
+            panic!("expected interactive request");
+        };
+        let PermissionUiEvent::Request(request_b) = receiver.recv().await.expect("second request")
+        else {
+            panic!("expected interactive request");
+        };
+        assert_ne!(request_a.id, request_b.id);
+
+        let (first_reply, second_reply) = if request_a.request.tool_name == "first" {
+            (request_a.reply, request_b.reply)
+        } else {
+            (request_b.reply, request_a.reply)
+        };
+        second_reply.send(PermissionChoice::DenyOnce).unwrap();
+        first_reply.send(PermissionChoice::AllowOnce).unwrap();
+
+        assert_eq!(first.await.unwrap(), PermissionChoice::AllowOnce);
+        assert_eq!(second.await.unwrap(), PermissionChoice::DenyOnce);
     }
 }

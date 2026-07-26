@@ -18,12 +18,24 @@
 
 use crate::error::Result;
 use crate::provider::Provider;
+use crate::runtime::{QueuedPrompt, TurnControl};
 use crate::tool::{ToolCallOutcome, ToolCallResult, ToolRegistry};
 use crate::types::{
     estimate_tokens, truncate_middle, CompletionRequest, ContentBlock, Message, StopReason, Usage,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::Duration;
+
+fn cancelled_tool_result(tool_use_id: String) -> ContentBlock {
+    ContentBlock::ToolResult {
+        content: "This tool call was cancelled before completion. Its side effects, if any, \
+                  may be incomplete; inspect the relevant state before retrying."
+            .to_string(),
+        tool_use_id,
+        is_error: Some(true),
+    }
+}
 
 /// Progress notifications emitted during [`Agent::run_turn`].
 #[derive(Debug)]
@@ -40,6 +52,9 @@ pub enum AgentEvent {
     /// A streamed fragment of assistant text. Render incrementally; a final
     /// `ApiCallFinished` closes the message.
     AssistantTextDelta(String),
+    /// A provider attempt emitted visible deltas but failed or was cancelled
+    /// before a complete response could enter conversation history.
+    AssistantStreamAborted { reason: String },
     /// A tool call is about to be checked for permission and executed.
     /// Emitted *before* execution so the user always sees the input first.
     ToolCallStarted { name: String, input: Value },
@@ -58,6 +73,14 @@ pub enum AgentEvent {
     },
     /// Something the user should know (truncation, refusal, ...).
     Notice(String),
+    /// Steering prompts were committed to history at a safe boundary.
+    SteeringCommitted { prompts: Vec<QueuedPrompt> },
+    /// A history-valid boundary suitable for durable autosave. This is never
+    /// emitted between an assistant tool use and its user tool result.
+    HistoryCheckpoint {
+        history: Vec<Message>,
+        context_tokens: u64,
+    },
 }
 
 /// How a turn ended.
@@ -71,6 +94,9 @@ pub enum TurnOutcome {
     MaxIterationsReached,
     /// The provider refused to answer (safety).
     Refused,
+    /// The controller interrupted the turn after repairing any unfinished
+    /// tool-use/result pairs.
+    Interrupted,
 }
 
 pub struct Agent {
@@ -86,7 +112,7 @@ pub struct Agent {
     pub max_tool_result_chars: usize,
     /// Retries for transient API errors, with exponential backoff.
     pub max_retries: u32,
-    /// Code mode (Unix only): advertise only a `python` tool. Its scripts can
+    /// Code mode: advertise only a `python` tool. Its scripts can
     /// call every registered tool via a generated `tools` module, keeping
     /// intermediate tool results out of the model's context and allowing one
     /// model round-trip to orchestrate many tool calls.
@@ -116,7 +142,7 @@ impl Agent {
             max_tokens: 16_000,
             max_tool_result_chars: 40_000,
             max_retries: 3,
-            code_mode: cfg!(unix),
+            code_mode: true,
             compaction_threshold_tokens: 150_000,
             compaction_keep_recent_tokens: 20_000,
             last_context_tokens: None,
@@ -134,7 +160,7 @@ impl Agent {
     /// interface. A registered tool named `python` always wins, so library
     /// users can override the built-in behavior.
     fn builtin_code_mode_enabled(&self) -> bool {
-        cfg!(unix) && self.code_mode && !self.registry.has_tool("python")
+        self.code_mode && !self.registry.has_tool("python")
     }
 
     fn is_code_mode_call(&self, name: &str) -> bool {
@@ -145,7 +171,6 @@ impl Agent {
     /// schemas are folded into the python tool's description rather than
     /// advertised as independently callable tools.
     fn model_tool_defs(&self) -> Vec<crate::types::ToolDef> {
-        #[cfg(unix)]
         if self.builtin_code_mode_enabled() {
             let available = self.registry.get_tool_defs();
             let code_only = self.registry.code_only_tool_defs();
@@ -163,6 +188,27 @@ impl Agent {
         self.provider = provider;
     }
 
+    /// Replace persisted conversation history and discard the provider's
+    /// measurement of the previous history.
+    pub fn replace_history(&mut self, history: Vec<Message>) {
+        self.history = history;
+        self.last_context_tokens = None;
+    }
+
+    /// Clear conversation history and its cached context measurement.
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.last_context_tokens = None;
+    }
+
+    /// Record the initial user message without crossing an await boundary.
+    ///
+    /// The TUI uses this to commit a two-phase queue claim only after the
+    /// conversation owns the prompt.
+    pub fn begin_turn(&mut self, user_input: &str) {
+        self.history.push(Message::user_text(user_input));
+    }
+
     /// Run one user turn to completion (or pause/refusal/cap).
     ///
     /// On `Err`, the history still contains everything that happened up to
@@ -173,16 +219,48 @@ impl Agent {
         user_input: &str,
         on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<TurnOutcome> {
-        self.history.push(Message::user_text(user_input));
+        self.begin_turn(user_input);
+        let mut control = TurnControl::detached();
+        self.run_started_turn(on_event, &mut control).await
+    }
 
-        for _ in 0..self.max_iterations {
+    /// Continue a turn whose initial user message has already been recorded.
+    ///
+    /// The asynchronous TUI supplies a real [`TurnControl`] so terminal input,
+    /// steering, and cooperative cancellation keep progressing while this
+    /// future is pending. Library callers normally use [`Agent::run_turn`].
+    pub async fn run_started_turn(
+        &mut self,
+        on_event: &mut dyn FnMut(AgentEvent),
+        control: &mut TurnControl,
+    ) -> Result<TurnOutcome> {
+        for iteration in 0..self.max_iterations {
+            if control.is_cancelled() {
+                return Ok(TurnOutcome::Interrupted);
+            }
+
             if self.context_tokens() > self.compaction_threshold_tokens {
-                if let Err(e) = self.compact(on_event).await {
-                    on_event(AgentEvent::Notice(format!("Compaction failed: {}", e)));
+                let compacted = {
+                    let compact = self.compact(on_event);
+                    tokio::pin!(compact);
+                    tokio::select! {
+                        result = &mut compact => Some(result),
+                        _ = control.cancelled() => None,
+                    }
+                };
+                match compacted {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        on_event(AgentEvent::Notice(format!("Compaction failed: {error}")));
+                    }
+                    None => return Ok(TurnOutcome::Interrupted),
                 }
             }
 
-            let (response, streamed) = self.complete_with_retry(on_event).await?;
+            let Some((response, streamed)) = self.complete_with_retry(on_event, control).await?
+            else {
+                return Ok(TurnOutcome::Interrupted);
+            };
             if let Some(usage) = &response.usage {
                 self.last_context_tokens = Some(
                     usage.input_tokens
@@ -205,13 +283,6 @@ impl Agent {
                 }
             }
 
-            if response.stop_reason == StopReason::Refusal {
-                on_event(AgentEvent::Notice(
-                    "The model declined to continue with this request.".to_string(),
-                ));
-                return Ok(TurnOutcome::Refused);
-            }
-
             let tool_uses: Vec<_> = response
                 .content
                 .iter()
@@ -223,13 +294,42 @@ impl Agent {
                 })
                 .collect();
 
+            if response.stop_reason == StopReason::Refusal {
+                if !tool_uses.is_empty() {
+                    let results = tool_uses
+                        .iter()
+                        .map(|(_, _, id)| ContentBlock::ToolResult {
+                            content: "This tool call was not executed because the model refused \
+                                      the request."
+                                .to_string(),
+                            tool_use_id: id.clone(),
+                            is_error: Some(true),
+                        })
+                        .collect();
+                    self.history.push(Message::user(results));
+                }
+                on_event(AgentEvent::Notice(
+                    "The model declined to continue with this request.".to_string(),
+                ));
+                self.emit_checkpoint(on_event);
+                return Ok(TurnOutcome::Refused);
+            }
+
             if tool_uses.is_empty() {
+                if control.is_cancelled() {
+                    self.emit_checkpoint(on_event);
+                    return Ok(TurnOutcome::Interrupted);
+                }
+                if iteration + 1 < self.max_iterations && self.commit_steering(control, on_event) {
+                    continue;
+                }
                 if response.stop_reason == StopReason::MaxTokens {
                     on_event(AgentEvent::Notice(
                         "Response was cut off at the output-token limit and may be incomplete."
                             .to_string(),
                     ));
                 }
+                self.emit_checkpoint(on_event);
                 return Ok(TurnOutcome::Completed);
             }
 
@@ -254,37 +354,89 @@ impl Agent {
                     })
                     .collect();
                 self.history.push(Message::user(results));
+                let steered =
+                    iteration + 1 < self.max_iterations && self.commit_steering(control, on_event);
+                if !steered {
+                    self.emit_checkpoint(on_event);
+                }
                 continue;
             }
 
             let mut results = Vec::with_capacity(tool_uses.len());
             let mut denied = false;
-            for (name, input, id) in tool_uses {
+            let mut cancelled = false;
+            let mut index = 0;
+            while index < tool_uses.len() {
+                if control.is_cancelled() {
+                    for (_, _, id) in &tool_uses[index..] {
+                        results.push(cancelled_tool_result(id.clone()));
+                    }
+                    cancelled = true;
+                    break;
+                }
+
+                let (name, input, id) = tool_uses[index].clone();
+                if self.builtin_code_mode_enabled() && !self.is_code_mode_call(&name) {
+                    // A compatible server/model may still emit a function name
+                    // that was never advertised (some models copy a
+                    // `tools.foo(...)` expression out of the prompt). Treat
+                    // that as a provider-protocol violation, never as tool
+                    // activity: pair it for history validity, explain the
+                    // required boundary, and let the next model round retry.
+                    let bridge_name = name.strip_prefix("tools.").unwrap_or(&name);
+                    let content = format!(
+                        "The provider emitted undeclared native tool call `{name}`. It was not \
+                         executed: code mode permits only the model-facing `python` tool. Retry \
+                         with a Python script using `import tools; tools.{bridge_name}(...)`."
+                    );
+                    on_event(AgentEvent::Notice(format!(
+                        "Rejected undeclared native tool call `{name}` before execution; asking \
+                         the model to retry through code mode."
+                    )));
+                    results.push(ContentBlock::ToolResult {
+                        content,
+                        tool_use_id: id,
+                        is_error: Some(true),
+                    });
+                    index += 1;
+                    continue;
+                }
+
                 on_event(AgentEvent::ToolCallStarted {
                     name: name.clone(),
                     input: input.clone(),
                 });
 
-                let mut result = if self.is_code_mode_call(&name) {
-                    self.execute_code_mode(input, id, on_event).await
-                } else if self.builtin_code_mode_enabled() {
-                    // Providers should only produce calls to advertised tools,
-                    // but reject an unadvertised direct call defensively so
-                    // code mode remains a real boundary rather than a hint.
-                    ToolCallResult {
-                        block: ContentBlock::ToolResult {
-                            content: format!(
-                                "Direct tool calls are disabled in code mode. Run this through \
-                                 the python tool instead, using `import tools; tools.{}(...)`.",
-                                name
-                            ),
-                            tool_use_id: id,
-                            is_error: Some(true),
-                        },
-                        outcome: ToolCallOutcome::Failed,
+                let cancellation_id = id.clone();
+                let maybe_result = {
+                    let execution = async {
+                        if self.is_code_mode_call(&name) {
+                            self.execute_code_mode(input, id, on_event).await
+                        } else {
+                            self.registry.execute_tool(&name, input, id).await
+                        }
+                    };
+                    tokio::pin!(execution);
+                    tokio::select! {
+                        result = &mut execution => Some(result),
+                        _ = control.cancelled() => None,
                     }
-                } else {
-                    self.registry.execute_tool(&name, input, id).await
+                };
+
+                let Some(mut result) = maybe_result else {
+                    let content =
+                        "Tool execution was interrupted; its completion is unknown.".to_string();
+                    on_event(AgentEvent::ToolCallFinished {
+                        name,
+                        outcome: ToolCallOutcome::Cancelled,
+                        content,
+                    });
+                    results.push(cancelled_tool_result(cancellation_id));
+                    for (_, _, id) in &tool_uses[index + 1..] {
+                        results.push(cancelled_tool_result(id.clone()));
+                    }
+                    cancelled = true;
+                    break;
                 };
                 if let ContentBlock::ToolResult { content, .. } = &mut result.block {
                     *content = truncate_middle(content, self.max_tool_result_chars);
@@ -303,18 +455,38 @@ impl Agent {
                     denied = true;
                 }
                 results.push(result.block);
+                index += 1;
             }
 
             // Every tool_use gets a result — required by the APIs even when
-            // a call was denied.
+            // a call was denied or cancellation interrupts the batch.
             self.history.push(Message::user(results));
+
+            // The controller may have processed an interrupt while the final
+            // tool or permission future became ready. Do not steer merely
+            // because that future won the inner select race.
+            cancelled |= control.is_cancelled();
+            if cancelled {
+                on_event(AgentEvent::Notice(
+                    "Turn interrupted; unfinished tool calls were recorded as cancelled."
+                        .to_string(),
+                ));
+                self.emit_checkpoint(on_event);
+                return Ok(TurnOutcome::Interrupted);
+            }
+
+            if iteration + 1 < self.max_iterations && self.commit_steering(control, on_event) {
+                continue;
+            }
 
             if denied {
                 on_event(AgentEvent::Notice(
                     "Tool call denied — pausing so you can redirect.".to_string(),
                 ));
+                self.emit_checkpoint(on_event);
                 return Ok(TurnOutcome::PausedOnDenial);
             }
+            self.emit_checkpoint(on_event);
         }
 
         on_event(AgentEvent::Notice(format!(
@@ -324,9 +496,52 @@ impl Agent {
         Ok(TurnOutcome::MaxIterationsReached)
     }
 
+    /// Commit every queued steer at a history-valid boundary. There is no
+    /// await between claiming the stable IDs, updating history, and committing
+    /// the claim, so cancellation cannot strand a prompt mid-transition.
+    fn commit_steering(
+        &mut self,
+        control: &TurnControl,
+        on_event: &mut dyn FnMut(AgentEvent),
+    ) -> bool {
+        let Some(claim) = control.claim_steering() else {
+            return false;
+        };
+        let prompts = claim.prompts().to_vec();
+        let text_blocks = prompts
+            .iter()
+            .map(|prompt| ContentBlock::Text {
+                text: prompt.text.clone(),
+            })
+            .collect::<Vec<_>>();
+        if let Some(last) = self
+            .history
+            .last_mut()
+            .filter(|message| message.role == "user")
+        {
+            last.content.extend(text_blocks);
+        } else {
+            self.history.push(Message::user(text_blocks));
+        }
+        let prompts = claim.commit();
+        on_event(AgentEvent::SteeringCommitted { prompts });
+        self.emit_checkpoint(on_event);
+        true
+    }
+
+    fn emit_checkpoint(&self, on_event: &mut dyn FnMut(AgentEvent)) {
+        debug_assert!(
+            history_tool_protocol_is_valid(&self.history),
+            "attempted to checkpoint history with an unpaired tool use/result"
+        );
+        on_event(AgentEvent::HistoryCheckpoint {
+            history: self.history.clone(),
+            context_tokens: self.context_tokens(),
+        });
+    }
+
     /// Execute a code-mode `python` call: permission-check it like any other
     /// tool, then run the script with the tool bridge attached.
-    #[cfg(unix)]
     async fn execute_code_mode(
         &mut self,
         input: serde_json::Value,
@@ -383,29 +598,14 @@ impl Agent {
 
         let script =
             crate::codemode::run_script(code, timeout_secs, &mut self.registry, on_event).await;
-        let outcome = if script.failed {
+        let outcome = if script.denied {
+            ToolCallOutcome::Denied
+        } else if script.failed {
             ToolCallOutcome::Failed
         } else {
             ToolCallOutcome::Success
         };
         make_result(script.content, outcome, id)
-    }
-
-    #[cfg(not(unix))]
-    async fn execute_code_mode(
-        &mut self,
-        _input: serde_json::Value,
-        id: String,
-        _on_event: &mut dyn FnMut(AgentEvent),
-    ) -> crate::tool::ToolCallResult {
-        crate::tool::ToolCallResult {
-            block: ContentBlock::ToolResult {
-                content: "Code mode is unavailable on this platform".to_string(),
-                tool_use_id: id,
-                is_error: Some(true),
-            },
-            outcome: ToolCallOutcome::Failed,
-        }
     }
 
     /// Summarize older history into a single message, keeping recent turns
@@ -458,6 +658,7 @@ impl Agent {
             replaced,
             estimate_tokens(&self.history) / 1000,
         )));
+        self.emit_checkpoint(on_event);
         Ok(true)
     }
 
@@ -495,7 +696,8 @@ impl Agent {
     async fn complete_with_retry(
         &self,
         on_event: &mut dyn FnMut(AgentEvent),
-    ) -> Result<(crate::types::CompletionResponse, bool)> {
+        control: &mut TurnControl,
+    ) -> Result<Option<(crate::types::CompletionResponse, bool)>> {
         let tools = self.model_tool_defs();
         let mut attempt: u32 = 0;
         loop {
@@ -507,23 +709,40 @@ impl Agent {
                 max_tokens: self.max_tokens,
             };
             let mut streamed = false;
-            let result = {
+            let maybe_result = {
                 let mut forward = |text: String| {
                     streamed = true;
                     on_event(AgentEvent::AssistantTextDelta(text));
                 };
-                self.provider
-                    .complete_streaming(request, &mut forward)
-                    .await
+                let completion = self.provider.complete_streaming(request, &mut forward);
+                tokio::pin!(completion);
+                tokio::select! {
+                    result = &mut completion => Some(result),
+                    _ = control.cancelled() => None,
+                }
+            };
+            let Some(result) = maybe_result else {
+                if streamed {
+                    on_event(AgentEvent::AssistantStreamAborted {
+                        reason: "interrupted before the response was committed".to_string(),
+                    });
+                }
+                on_event(AgentEvent::ApiCallFinished { usage: None });
+                return Ok(None);
             };
             match result {
                 Ok(response) => {
                     on_event(AgentEvent::ApiCallFinished {
                         usage: response.usage.clone(),
                     });
-                    return Ok((response, streamed));
+                    return Ok(Some((response, streamed)));
                 }
                 Err(e) if e.is_retryable() && attempt < self.max_retries => {
+                    if streamed {
+                        on_event(AgentEvent::AssistantStreamAborted {
+                            reason: format!("stream failed before it was committed: {e}"),
+                        });
+                    }
                     on_event(AgentEvent::ApiCallFinished { usage: None });
                     let delay_secs = 1u64 << attempt; // 1, 2, 4 ...
                     on_event(AgentEvent::Retrying {
@@ -532,10 +751,18 @@ impl Agent {
                         delay_secs,
                         error: e.to_string(),
                     });
-                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(delay_secs)) => {}
+                        _ = control.cancelled() => return Ok(None),
+                    }
                     attempt += 1;
                 }
                 Err(e) => {
+                    if streamed {
+                        on_event(AgentEvent::AssistantStreamAborted {
+                            reason: format!("stream failed before it was committed: {e}"),
+                        });
+                    }
                     on_event(AgentEvent::ApiCallFinished { usage: None });
                     return Err(e);
                 }
@@ -544,17 +771,77 @@ impl Agent {
     }
 }
 
+/// Whether every assistant tool use has exactly one result in the immediately
+/// following user message, with no orphan results or role inversions.
+///
+/// This is the executable counterpart of `ToolHistoryIsValid` in
+/// `spec/AsyncRuntime.tla`.
+pub fn history_tool_protocol_is_valid(history: &[Message]) -> bool {
+    let mut expected_results: Option<HashSet<&str>> = None;
+
+    for message in history {
+        let tool_uses = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let tool_results = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        if !tool_uses.is_empty() && message.role != "assistant" {
+            return false;
+        }
+        if !tool_results.is_empty() && message.role != "user" {
+            return false;
+        }
+
+        if let Some(expected) = expected_results.take() {
+            let actual = tool_results.iter().copied().collect::<HashSet<_>>();
+            if message.role != "user" || actual.len() != tool_results.len() || actual != expected {
+                return false;
+            }
+        } else if !tool_results.is_empty() {
+            return false;
+        }
+
+        if !tool_uses.is_empty() {
+            let expected = tool_uses.iter().copied().collect::<HashSet<_>>();
+            if expected.len() != tool_uses.len() {
+                return false;
+            }
+            expected_results = Some(expected);
+        }
+    }
+
+    expected_results.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::Error;
+    use crate::permissions::{
+        PermissionDecision, PolicyPermissions, ToolExecutionRequest, ToolPermissionHandler,
+    };
     use crate::provider::Provider;
+    use crate::runtime::{DeliveryMode, PromptQueue};
     use crate::tool::Tool;
     use crate::types::CompletionResponse;
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::{oneshot, Notify};
+    use tokio::task::LocalSet;
 
     /// A provider that plays back scripted responses (or errors).
     struct Script {
@@ -637,7 +924,521 @@ mod tests {
         agent
     }
 
-    #[cfg(unix)]
+    struct GatedFinalProvider {
+        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        first_started: Arc<Notify>,
+        first_release: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for GatedFinalProvider {
+        fn id(&self) -> &'static str {
+            "gated"
+        }
+
+        fn model(&self) -> &str {
+            "gated"
+        }
+
+        async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            if call == 0 {
+                self.first_started.notify_one();
+                let release = self.first_release.lock().unwrap().take();
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                Ok(text_response("first answer"))
+            } else {
+                Ok(text_response("answer after steer"))
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn steering_queued_during_final_response_gets_another_model_call() {
+        LocalSet::new()
+            .run_until(async {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let first_started = Arc::new(Notify::new());
+                let (release, first_release) = oneshot::channel();
+                let provider = GatedFinalProvider {
+                    calls: Arc::clone(&calls),
+                    requests: Arc::clone(&requests),
+                    first_started: Arc::clone(&first_started),
+                    first_release: Mutex::new(Some(first_release)),
+                };
+                let queue = PromptQueue::default();
+                let queue_for_turn = queue.clone();
+
+                let task = tokio::task::spawn_local(async move {
+                    let mut agent = Agent::new(Box::new(provider), ToolRegistry::new(), "test");
+                    agent.begin_turn("initial");
+                    let (_cancel, mut control) = TurnControl::for_turn(queue_for_turn);
+                    let mut events = Vec::new();
+                    let outcome = agent
+                        .run_started_turn(&mut |event| events.push(event), &mut control)
+                        .await
+                        .unwrap();
+                    (agent, outcome, events)
+                });
+
+                first_started.notified().await;
+                let steer_id = queue.enqueue("correct that", DeliveryMode::Steer);
+                release.send(()).unwrap();
+                let (agent, outcome, events) = task.await.unwrap();
+
+                assert_eq!(outcome, TurnOutcome::Completed);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert!(queue.is_empty());
+                assert!(events.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::SteeringCommitted { prompts }
+                            if prompts.iter().any(|prompt| prompt.id == steer_id)
+                    )
+                }));
+                assert_eq!(agent.history.len(), 4);
+                assert_eq!(agent.history[2].role, "user");
+                assert!(agent.history[2].text().contains("correct that"));
+                let captured = requests.lock().unwrap();
+                assert_eq!(captured.len(), 2);
+                assert!(captured[1]
+                    .iter()
+                    .any(|message| message.text().contains("correct that")));
+            })
+            .await;
+    }
+
+    struct WaitTool {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for WaitTool {
+        fn name(&self) -> &str {
+            "wait"
+        }
+
+        fn description(&self) -> &str {
+            "wait forever"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, _input: Value) -> Result<String> {
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interruption_pairs_the_running_and_unstarted_tool_uses() {
+        LocalSet::new()
+            .run_until(async {
+                let started = Arc::new(Notify::new());
+                let response = CompletionResponse {
+                    content: vec![
+                        ContentBlock::ToolUse {
+                            name: "wait".into(),
+                            input: json!({}),
+                            id: "running".into(),
+                        },
+                        ContentBlock::ToolUse {
+                            name: "wait".into(),
+                            input: json!({}),
+                            id: "not-started".into(),
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: None,
+                };
+                let mut registry = ToolRegistry::new();
+                registry
+                    .register(Arc::new(WaitTool {
+                        started: Arc::clone(&started),
+                    }))
+                    .unwrap();
+                let queue = PromptQueue::default();
+                let (cancel, mut control) = TurnControl::for_turn(queue);
+
+                let task = tokio::task::spawn_local(async move {
+                    let mut agent =
+                        Agent::new(Box::new(Script::new(vec![Ok(response)])), registry, "test");
+                    agent.code_mode = false;
+                    agent.begin_turn("go");
+                    let mut events = Vec::new();
+                    let outcome = agent
+                        .run_started_turn(&mut |event| events.push(event), &mut control)
+                        .await
+                        .unwrap();
+                    (agent, outcome, events)
+                });
+
+                started.notified().await;
+                cancel.cancel();
+                let (agent, outcome, events) = task.await.unwrap();
+                assert_eq!(outcome, TurnOutcome::Interrupted);
+                assert!(events.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::ToolCallFinished {
+                            outcome: ToolCallOutcome::Cancelled,
+                            ..
+                        }
+                    )
+                }));
+
+                let result_message = &agent.history[2];
+                let result_ids = result_message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(result_ids, vec!["running", "not-started"]);
+                assert!(result_message.content.iter().all(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolResult {
+                            is_error: Some(true),
+                            ..
+                        }
+                    )
+                }));
+                assert!(history_tool_protocol_is_valid(&agent.history));
+                for event in events {
+                    if let AgentEvent::HistoryCheckpoint { history, .. } = event {
+                        assert!(history_tool_protocol_is_valid(&history));
+                    }
+                }
+            })
+            .await;
+    }
+
+    struct GatedPermission {
+        started: Arc<Notify>,
+        answer: Mutex<Option<oneshot::Receiver<PermissionDecision>>>,
+    }
+
+    #[async_trait]
+    impl ToolPermissionHandler for GatedPermission {
+        async fn check_permission(&self, _request: &ToolExecutionRequest) -> PermissionDecision {
+            self.started.notify_one();
+            let answer = self
+                .answer
+                .lock()
+                .unwrap()
+                .take()
+                .expect("one permission request");
+            answer.await.unwrap_or(PermissionDecision::Deny)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_wins_over_a_ready_permission_before_steering() {
+        LocalSet::new()
+            .run_until(async {
+                let started = Arc::new(Notify::new());
+                let (answer, answer_rx) = oneshot::channel();
+                let mut registry =
+                    ToolRegistry::with_permission_handler(Box::new(GatedPermission {
+                        started: Arc::clone(&started),
+                        answer: Mutex::new(Some(answer_rx)),
+                    }));
+                registry.register(Arc::new(Echo)).unwrap();
+                let queue = PromptQueue::default();
+                let steer = queue.enqueue("do not commit me", DeliveryMode::Steer);
+                let (cancel, mut control) = TurnControl::for_turn(queue.clone());
+                let response = tool_response();
+
+                let task = tokio::task::spawn_local(async move {
+                    let mut agent =
+                        Agent::new(Box::new(Script::new(vec![Ok(response)])), registry, "test");
+                    agent.code_mode = false;
+                    agent.begin_turn("go");
+                    let mut events = Vec::new();
+                    let outcome = agent
+                        .run_started_turn(&mut |event| events.push(event), &mut control)
+                        .await
+                        .unwrap();
+                    (agent, outcome, events)
+                });
+
+                started.notified().await;
+                answer.send(PermissionDecision::Allow).unwrap();
+                cancel.cancel();
+                let (agent, outcome, events) = task.await.unwrap();
+
+                assert_eq!(outcome, TurnOutcome::Interrupted);
+                assert_eq!(queue.snapshot()[0].id, steer);
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::SteeringCommitted { .. })));
+                assert!(history_tool_protocol_is_valid(&agent.history));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_cancellation_commits_no_partial_assistant_message() {
+        LocalSet::new()
+            .run_until(async {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let first_started = Arc::new(Notify::new());
+                let (_release, first_release) = oneshot::channel();
+                let provider = GatedFinalProvider {
+                    calls,
+                    requests,
+                    first_started: Arc::clone(&first_started),
+                    first_release: Mutex::new(Some(first_release)),
+                };
+                let queue = PromptQueue::default();
+                let steer = queue.enqueue("still queued", DeliveryMode::Steer);
+                let queue_for_turn = queue.clone();
+                let (cancel, mut control) = TurnControl::for_turn(queue_for_turn);
+
+                let task = tokio::task::spawn_local(async move {
+                    let mut agent = Agent::new(Box::new(provider), ToolRegistry::new(), "test");
+                    agent.begin_turn("initial");
+                    let outcome = agent
+                        .run_started_turn(&mut |_| {}, &mut control)
+                        .await
+                        .unwrap();
+                    (agent, outcome)
+                });
+
+                first_started.notified().await;
+                cancel.cancel();
+                let (agent, outcome) = task.await.unwrap();
+
+                assert_eq!(outcome, TurnOutcome::Interrupted);
+                assert_eq!(agent.history.len(), 1);
+                assert_eq!(queue.snapshot()[0].id, steer);
+                assert!(history_tool_protocol_is_valid(&agent.history));
+            })
+            .await;
+    }
+
+    struct GatedStreamingProvider {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for GatedStreamingProvider {
+        fn id(&self) -> &'static str {
+            "gated-stream"
+        }
+
+        fn model(&self) -> &str {
+            "gated-stream"
+        }
+
+        async fn complete(&self, _request: CompletionRequest<'_>) -> Result<CompletionResponse> {
+            unreachable!("streaming path only")
+        }
+
+        async fn complete_streaming(
+            &self,
+            _request: CompletionRequest<'_>,
+            on_delta: &mut dyn FnMut(String),
+        ) -> Result<CompletionResponse> {
+            on_delta("visible but uncommitted".to_string());
+            self.started.notify_one();
+            std::future::pending::<Result<CompletionResponse>>().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_a_partial_stream_marks_the_visible_text_uncommitted() {
+        LocalSet::new()
+            .run_until(async {
+                let started = Arc::new(Notify::new());
+                let queue = PromptQueue::default();
+                let (cancel, mut control) = TurnControl::for_turn(queue);
+                let provider = GatedStreamingProvider {
+                    started: Arc::clone(&started),
+                };
+
+                let task = tokio::task::spawn_local(async move {
+                    let mut agent = Agent::new(Box::new(provider), ToolRegistry::new(), "test");
+                    agent.begin_turn("initial");
+                    let mut events = Vec::new();
+                    let outcome = agent
+                        .run_started_turn(&mut |event| events.push(event), &mut control)
+                        .await
+                        .unwrap();
+                    (agent, outcome, events)
+                });
+
+                started.notified().await;
+                cancel.cancel();
+                let (agent, outcome, events) = task.await.unwrap();
+
+                assert_eq!(outcome, TurnOutcome::Interrupted);
+                assert_eq!(agent.history.len(), 1);
+                assert!(events.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::AssistantStreamAborted { reason }
+                            if reason.contains("interrupted before")
+                    )
+                }));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn iteration_limit_leaves_late_steering_for_controller_normalization() {
+        let queue = PromptQueue::default();
+        let steer = queue.enqueue("too late", DeliveryMode::Steer);
+        let (_cancel, mut control) = TurnControl::for_turn(queue.clone());
+        let mut agent = agent_with(Script::new(vec![Ok(tool_response())]));
+        agent.max_iterations = 1;
+        agent.begin_turn("go");
+
+        let outcome = agent
+            .run_started_turn(&mut |_| {}, &mut control)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::MaxIterationsReached);
+        assert_eq!(queue.snapshot()[0].id, steer);
+        assert_eq!(queue.snapshot()[0].delivery, DeliveryMode::Steer);
+        assert!(history_tool_protocol_is_valid(&agent.history));
+
+        queue.normalize_steers();
+        assert_eq!(queue.snapshot()[0].delivery, DeliveryMode::FollowUp);
+    }
+
+    #[tokio::test]
+    async fn refusal_with_tool_uses_is_repaired_before_checkpointing() {
+        let response = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                name: "echo".into(),
+                input: json!({}),
+                id: "refused-tool".into(),
+            }],
+            stop_reason: StopReason::Refusal,
+            usage: None,
+        };
+        let mut agent = agent_with(Script::new(vec![Ok(response)]));
+        let mut checkpoints = Vec::new();
+        let outcome = agent
+            .run_turn("go", &mut |event| {
+                if let AgentEvent::HistoryCheckpoint { history, .. } = event {
+                    checkpoints.push(history);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Refused);
+        assert!(agent.registry.execution_history().is_empty());
+        assert!(history_tool_protocol_is_valid(&agent.history));
+        assert!(!checkpoints.is_empty());
+        assert!(checkpoints
+            .iter()
+            .all(|history| history_tool_protocol_is_valid(history)));
+    }
+
+    #[tokio::test]
+    async fn denial_inside_code_mode_pauses_the_outer_turn() {
+        let code = r#"
+import tools
+try:
+    tools.mirror(marker="denied")
+except Exception:
+    pass
+print("script continued")
+"#;
+        let response = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                name: "python".into(),
+                input: json!({"code": code}),
+                id: "python-call".into(),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        };
+        let mut registry = ToolRegistry::with_permission_handler(Box::new(PolicyPermissions::new(
+            vec!["python".into()],
+            false,
+        )));
+        registry.register(Arc::new(Mirror)).unwrap();
+        let mut agent = Agent::new(Box::new(Script::new(vec![Ok(response)])), registry, "test");
+        let mut saw_nested_denial = false;
+
+        let outcome = agent
+            .run_turn("go", &mut |event| {
+                if matches!(
+                    event,
+                    AgentEvent::ToolCallFinished {
+                        ref name,
+                        outcome: ToolCallOutcome::Denied,
+                        ..
+                    } if name == "mirror"
+                ) {
+                    saw_nested_denial = true;
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::PausedOnDenial);
+        assert!(saw_nested_denial);
+        assert!(history_tool_protocol_is_valid(&agent.history));
+        assert!(matches!(
+            &agent.history[2].content[0],
+            ContentBlock::ToolResult {
+                is_error: Some(true),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn history_validator_rejects_dangling_or_orphan_tool_blocks() {
+        let assistant_use = Message::assistant(vec![ContentBlock::ToolUse {
+            name: "echo".into(),
+            input: json!({}),
+            id: "tool".into(),
+        }]);
+        let matching_result = Message::user(vec![ContentBlock::ToolResult {
+            content: "ok".into(),
+            tool_use_id: "tool".into(),
+            is_error: None,
+        }]);
+        let orphan_result = Message::user(vec![ContentBlock::ToolResult {
+            content: "bad".into(),
+            tool_use_id: "other".into(),
+            is_error: Some(true),
+        }]);
+
+        assert!(!history_tool_protocol_is_valid(std::slice::from_ref(
+            &assistant_use
+        )));
+        assert!(!history_tool_protocol_is_valid(std::slice::from_ref(
+            &orphan_result
+        )));
+        assert!(history_tool_protocol_is_valid(&[
+            assistant_use,
+            matching_result
+        ]));
+    }
+
     #[test]
     fn code_mode_advertises_only_python() {
         let mut registry = ToolRegistry::new();
@@ -649,16 +1450,20 @@ mod tests {
         assert_eq!(defs[0].name, "python");
         assert!(defs[0].description.contains("tools.mirror"));
         assert!(defs[0].description.contains("Input schema"));
+        assert!(defs[0]
+            .description
+            .contains("never emit `<name>` or `tools.<name>` as a native tool call"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn code_mode_rejects_unadvertised_direct_tool_calls() {
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(Mirror)).unwrap();
         let direct_call = CompletionResponse {
             content: vec![ContentBlock::ToolUse {
-                name: "mirror".into(),
+                // Some OpenAI-compatible models copy the Python expression
+                // out of the prompt and return it as a native function name.
+                name: "tools.mirror".into(),
                 input: json!({"marker": "must-not-run"}),
                 id: "t1".into(),
             }],
@@ -674,18 +1479,38 @@ mod tests {
             "test",
         );
 
-        let outcome = agent.run_turn("go", &mut |_| {}).await.unwrap();
+        let mut events = Vec::new();
+        let outcome = agent
+            .run_turn("go", &mut |event| events.push(event))
+            .await
+            .unwrap();
         assert_eq!(outcome, TurnOutcome::Completed);
         assert!(agent.registry.execution_history().is_empty());
+        assert!(!events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolCallStarted { name, .. } if name == "tools.mirror"
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::Notice(message)
+                    if message.contains("Rejected undeclared native tool call `tools.mirror`")
+            )
+        }));
         match &agent.history[2].content[0] {
             ContentBlock::ToolResult {
                 content, is_error, ..
             } => {
                 assert_eq!(*is_error, Some(true));
-                assert!(content.contains("disabled in code mode"));
+                assert!(content.contains("code mode permits only"));
+                assert!(content.contains("tools.mirror(...)"));
+                assert!(!content.contains("tools.tools.mirror"));
             }
             other => panic!("expected tool result, got {:?}", other),
         }
+        assert!(history_tool_protocol_is_valid(&agent.history));
     }
 
     #[tokio::test]
@@ -779,7 +1604,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn code_mode_bridges_tool_calls_into_scripts() {
         let code = r#"

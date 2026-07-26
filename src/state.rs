@@ -1,5 +1,6 @@
-//! Persistent session state for the CLI.
+//! Persistent conversation and prompt-queue state for the TUI.
 
+use crate::runtime::QueuedPrompt;
 use crate::types::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -8,8 +9,8 @@ fn default_provider() -> String {
     "anthropic".to_string()
 }
 
-/// Everything needed to resume a conversation: history, provider/model, and
-/// remembered permission decisions.
+/// Everything needed to resume a conversation: history, provider/model,
+/// remembered permission decisions, and uncommitted prompts.
 ///
 /// Older save files (which lacked `provider` and carried extra fields) load
 /// via serde defaults; files that are just a bare `Vec<Message>` are handled
@@ -24,6 +25,9 @@ pub struct SavedState {
     pub always_allow_tools: HashSet<String>,
     #[serde(default)]
     pub always_deny_tools: HashSet<String>,
+    /// Prompts acknowledged by the TUI but not yet committed to history.
+    #[serde(default)]
+    pub queued_prompts: Vec<QueuedPrompt>,
 }
 
 impl SavedState {
@@ -34,6 +38,7 @@ impl SavedState {
             conversation_history: Vec::new(),
             always_allow_tools: HashSet::new(),
             always_deny_tools: HashSet::new(),
+            queued_prompts: Vec::new(),
         }
     }
 
@@ -50,6 +55,7 @@ impl SavedState {
             conversation_history: messages,
             always_allow_tools: HashSet::new(),
             always_deny_tools: HashSet::new(),
+            queued_prompts: Vec::new(),
         })
     }
 }
@@ -57,6 +63,7 @@ impl SavedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::DeliveryMode;
 
     #[test]
     fn loads_current_format() {
@@ -95,5 +102,26 @@ mod tests {
         let state = SavedState::from_legacy_json(json, "some-model").unwrap();
         assert_eq!(state.model, "some-model");
         assert_eq!(state.conversation_history.len(), 1);
+    }
+
+    #[test]
+    fn queued_prompts_round_trip_and_old_saves_default_empty() {
+        let mut state = SavedState::new("openai".into(), "model".into());
+        state.queued_prompts.push(QueuedPrompt {
+            id: 7,
+            text: "do this next".into(),
+            delivery: DeliveryMode::FollowUp,
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        let loaded = SavedState::from_legacy_json(&json, "fallback").unwrap();
+        assert_eq!(loaded.queued_prompts, state.queued_prompts);
+
+        let old = r#"{
+            "provider": "openai",
+            "model": "model",
+            "conversation_history": []
+        }"#;
+        let loaded = SavedState::from_legacy_json(old, "fallback").unwrap();
+        assert!(loaded.queued_prompts.is_empty());
     }
 }

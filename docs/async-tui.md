@@ -1,0 +1,317 @@
+# Asynchronous TUI architecture
+
+This note defines the interaction model for Generalist's Ratatui frontend. It
+exists because a spinner drawn from another thread is not an asynchronous UI:
+the composer, transcript, queue, permissions, and cancellation must all remain
+responsive while a provider request or tool is running.
+
+The design was checked against the current implementations of:
+
+- OpenAI Codex (`openai/codex` at
+  `61a44880a85d2fd0d8770908dea5733495e571c8`), especially its TUI input queues,
+  `turn/steer` protocol, and turn-local pending-input queue.
+- pi (`badlogic/pi-mono` at
+  `5bc1c2c0a6f07e00e8c240304182f213ab8d311f`), especially its separate steering
+  and follow-up queues and the safe-point checks in `agent-loop.ts`.
+- Claude Code's public changelog and documentation. Claude Code has accepted
+  input while busy since 0.2.75, but its public material does not expose an
+  implementation boundary comparable to the two open-source agents.
+
+Primary references:
+
+- <https://github.com/openai/codex/blob/main/docs/tui-chat-composer.md>
+- <https://github.com/openai/codex/blob/main/codex-rs/tui/src/chatwidget/input_queue.rs>
+- <https://github.com/openai/codex/blob/main/codex-rs/tui/src/chatwidget/input_flow.rs>
+- <https://github.com/openai/codex/blob/main/codex-rs/core/src/session/turn.rs>
+- <https://github.com/badlogic/pi-mono/blob/main/packages/agent/src/agent-loop.ts>
+- <https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md#message-queue>
+- <https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md>
+
+## User-visible semantics
+
+There are two intentionally different ways to submit while the agent is busy:
+
+| Action | Idle | Busy |
+| --- | --- | --- |
+| `Enter` | Start a turn | Steer the active turn at its next safe boundary |
+| `Tab` or `Alt+Enter` | Start a turn | Queue a follow-up after the active turn settles |
+| `Shift+Enter` or `Ctrl+J` | Insert a newline | Insert a newline |
+| `Alt+Up` | Restore the latest queued item into an empty composer | Restore the latest queued item into an empty composer |
+| `F2` | Open queue manager | Open queue manager |
+| `Esc` | Clear/close the current UI layer | Interrupt the active turn when no modal owns the key |
+
+Modal input takes priority. In particular, Esc on a permission modal means
+deny-once; that denial settles the turn unless queued steering redirects it.
+
+A steering message is not an immediate interruption. It is inserted after the
+current assistant response and its complete tool-call batch, before another
+model request. A follow-up is a separate user turn and runs only once the
+current turn has completed, failed, been denied, or been interrupted.
+
+The queue manager shows every unclaimed item and supports edit, delete,
+reorder, and changing an item between steer and follow-up. Follow-ups are
+started one at a time. Multiple steering messages present at one safe boundary
+are delivered together, in FIFO order, to avoid unnecessary model round trips.
+Its viewport follows the stable-ID selection even when the queue is longer than
+the modal. Restore is refused while the composer contains a draft, so moving
+text out of the queue cannot silently destroy unsent input.
+
+Local commands are parsed as commands before dispatch; queueing `/clear` must
+never accidentally turn it into model-visible text. Help may open immediately.
+Commands that require mutable agent state wait in the same visible queue until
+the active turn releases that state.
+
+## Ownership model
+
+The program has one UI reactor and one active agent future. It does not have a
+render thread and does not put the entire `Agent` or terminal behind a mutex.
+
+```text
+terminal input ─┐
+frame tick ─────┤
+agent events ───┼──> UI reactor ───> Ratatui draw
+permission req ─┤        │
+turn completion ┘        ├──> authoritative prompt queue
+                         └──> permission replies
+
+                              safe-point claim
+authoritative prompt queue ─────────────────────> active Agent future
+```
+
+The UI reactor is the only owner allowed to read terminal events or draw.
+Provider and tool work remains a future polled by the same Tokio runtime task;
+this preserves the existing `Provider` trait's `?Send` contract. `tokio::select!`
+keeps terminal events, frame ticks, permission requests, and the active turn
+progressing together.
+
+The active future emits events into a same-task channel. Assistant deltas are
+appended to one live chat entry, and drawing happens on the 50 ms frame tick
+rather than once per token or terminal event. Rapid key-repeat and mouse-wheel
+bursts therefore update in-memory display state immediately but produce at most
+one frame per tick. Dirty tracking avoids rebuilding an idle transcript, and
+spinner-only frames run at 10 FPS. Permission, frame, and terminal branches are
+polled ahead of ordinary display events, so a streaming-event backlog cannot
+starve input or a permission answer. The channel is intentionally not a second
+state store: committed history remains inside `Agent`.
+
+Conversation scrolling stores an absolute top line while follow-latest is
+paused. New streamed lines therefore do not move the user's viewport.
+PageDown/mouse-down clamps at the real bottom and resumes follow-latest; PageUp
+cannot accumulate an invisible overscroll debt. Mouse input belongs to the
+active modal: it scrolls permission details or a long queue selection instead
+of changing the obscured conversation.
+
+## Prompt queue
+
+The prompt queue is a single shared state store. Each entry has:
+
+- a monotonically increasing `PromptId`;
+- the original text;
+- a delivery class (`Steer` or `FollowUp`).
+
+The TUI renders snapshots of this store; it does not maintain a second queue.
+The agent atomically claims steering entries at a safe boundary. The controller
+atomically claims one follow-up when no turn is active. Editing, deleting, or
+reordering loses a race cleanly if the item was already claimed.
+
+Stable IDs matter. Matching queue updates by message text is ambiguous when a
+user submits the same prompt twice, and maintaining separate display and
+execution queues invites drift on error paths.
+
+Queue lifecycle:
+
+```text
+draft -> queued -> claimed -> committed
+                   │
+                   └── failed before commit -> queued again
+```
+
+An item is removed from the visible queue only when it is atomically claimed.
+If submission fails before the agent records it, it is returned to the front
+of the queue. Undelivered steering entries become follow-ups when their target
+turn ends.
+
+## Safe steering boundary
+
+The agent checks for steering only at a history-valid boundary:
+
+1. A provider response has completed and its assistant message is recorded.
+2. Every tool use in that response has a corresponding tool result, including
+   synthetic error results for truncation, denial, or cancellation.
+3. Pending steering entries are claimed and recorded as user messages.
+4. If either tools or steering require continuation, the next provider request
+   begins.
+
+Steering is also checked after a response with no tool calls. A message typed
+while a final answer is streaming therefore causes another model request
+instead of being stranded for a later turn.
+
+Steering is never inserted:
+
+- into an in-flight provider request;
+- between one assistant message's tool uses and their tool results;
+- into manual compaction or another operation whose transcript protocol does
+  not support it.
+
+## Code-mode boundary
+
+When built-in code mode is active, every provider request advertises exactly one
+native tool, `python`. Bridge names such as `tools.firecrawl_search` occur only
+inside that tool's `code` string. OpenAI-compatible servers are not trusted to
+honor the advertised set: if a model emits another native name, the agent pairs
+the anomalous use with a synthetic error, reports a provider-protocol violation,
+and asks the model to retry through `python`. It emits no tool-start event,
+requests no permission, and executes no registry tool for that response.
+
+Keeping the anomalous use and its synthetic result in history is intentional.
+Silently dropping either side would produce a transcript that does not match the
+provider's preceding response; translating the call into executable Python
+would bypass the code-mode boundary.
+
+## Permissions
+
+Permission prompting becomes asynchronous. `MemoryPermissionHandler` awaits a
+broker response instead of synchronously reading terminal input. The broker
+sends a request carrying a stable request ID and a one-shot reply channel to
+the UI reactor.
+
+The UI owns the modal. A stale response whose turn or request ID no longer
+matches is ignored. Interrupting a turn resolves or drops its pending request
+before closing the modal. Remembered allow/deny decisions emit lightweight
+status events without opening a modal.
+
+This avoids two terminal readers and avoids deadlocking an agent future behind
+a terminal mutex held by a blocking input loop.
+
+## Cancellation and history validity
+
+Cancellation is cooperative and turn-scoped. Merely dropping `run_turn` is not
+safe: the history may already contain an assistant tool-use message without its
+required tool-result message.
+
+The controlled agent loop observes cancellation around provider calls, retry
+delays, permission waits, and tool execution:
+
+- Before an assistant response is committed, cancellation drops the provider
+  future and leaves no partial assistant message in model history.
+- During a tool batch, the running tool future is dropped, remaining calls are
+  not started, and every unfinished tool use receives a synthetic cancelled
+  result before the turn returns `Interrupted`.
+- Completed tool results remain in history.
+- Streaming text already shown in the TUI is marked interrupted; it is display
+  state, not silently treated as a committed assistant response. The marker
+  says the partial stream is uncommitted, and the text is absent from durable
+  model history.
+
+The long-running Bash and code-mode Python subprocesses use
+`kill_on_drop(true)`. Protocol repair does not claim to roll back external side
+effects: the synthetic result says completion is unknown. Nested activity
+entries whose futures disappear with a code-mode cancellation are retired by
+the controller when the turn returns.
+
+## Persistence
+
+Autosave happens after every committed boundary and every visible queue edit,
+not only after a whole multi-turn queue drains. The controller retains a clone
+of the latest history-valid boundary while the agent future owns the live
+history. It writes that boundary and the current queue together to one file
+using flush, atomic rename, and parent-directory flush. A restart recovers
+queued work only with the conversation history from the same atomic snapshot;
+residual steers become follow-ups because their target turn no longer exists.
+
+Terminal actions explicitly report whether they changed the queue. Submission,
+edit, delete, reclassification, reorder, and restore trigger the atomic write;
+composer editing, scrolling, resize, help navigation, and other display-only
+input do not. In particular, a mouse-wheel burst performs neither file nor
+parent-directory `fsync`.
+
+The transcript remains the source of truth for committed model context. Queue
+previews are not rendered as user chat messages until claimed; otherwise a
+deleted queued item would appear to have been sent.
+
+## Terminal hygiene
+
+The alternate screen, mouse capture, bracketed paste, cursor, and raw mode have
+one cleanup path. Startup failures after any partial terminal initialization use
+that path too, rather than returning with the terminal stranded in raw mode.
+Ratatui display strings are sanitized at their entry boundary: ESC and other
+control bytes become visible control pictures, while newlines remain newlines.
+This applies to provider/model labels, assistant and tool output, queue text,
+permission details, MCP descriptions, and editor previews. Conversation and
+tool data are not rewritten.
+
+## State invariants
+
+1. At most one mutation-capable agent turn is active for a conversation.
+2. Only the UI reactor reads terminal events or draws.
+3. Only the agent mutates committed conversation history.
+4. A prompt ID is in exactly one lifecycle state.
+5. Follow-ups start FIFO, one turn at a time.
+6. Tool-use and tool-result blocks are never left unpaired by a controlled
+   interruption.
+7. A permission response is applied only to its live request.
+8. Queue, turn, token, and terminal-display changes are rendered on the bounded
+   frame tick; no individual delta or scroll event forces an immediate frame.
+
+## Alternatives rejected
+
+### Background render thread plus `Arc<Mutex<Terminal>>`
+
+This can animate a spinner, but a blocking input loop can hold the same mutex,
+preventing agent events and permission prompts from progressing. Even with
+shorter lock scopes, multiple terminal readers are fragile.
+
+### `Arc<Mutex<Agent>>` with a spawned turn
+
+The turn holds the mutex for its full duration, so save/load/model operations
+still block. It also fights the provider abstraction's deliberately non-`Send`
+futures and makes permission re-entry prone to deadlock.
+
+### Dedicated OS thread and second Tokio runtime
+
+This can work, but it adds cross-runtime shutdown, terminal-broker, and state
+snapshot complexity without providing concurrency we need. The model and tools
+remain sequential; the UI only needs concurrent polling.
+
+### One undifferentiated FIFO
+
+It cannot express “correct the work before the next model call” separately from
+“do this after the current task is complete.” pi and Codex both demonstrate
+that users need the distinction.
+
+### Injecting text as soon as a key is pressed
+
+Provider requests are immutable once sent, and inserting between a tool use and
+its result corrupts the protocol history. The next valid model boundary is the
+earliest safe delivery point.
+
+## Formal model and review
+
+`spec/AsyncRuntime.tla` models the controller protocol and
+`spec/AsyncRuntime.cfg` supplies the finite CI bounds. TLC checks queue
+identity, single-turn ownership, delivery modes, safe steering, terminal
+reasons, tool-result pairing, permission correlation, committed settlement,
+stable ID ordering, and weakly fair release of busy ownership.
+
+The model is not accepted as a proxy for inspecting Rust. The maintained
+state/action/invariant refinement is in
+[`docs/runtime-traceability.md`](runtime-traceability.md), and
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) requires contributors to repeat the
+trace for runtime changes. `make traceability` ensures every checked action and
+invariant remains represented; `make tla` runs TLC; `make check` runs both plus
+the Rust and shell validation.
+
+## Self-critique and remaining limits
+
+- The model phase is the Rust program counter, not a mirrored runtime enum.
+  This avoids a second authority but makes the source trace a necessary human
+  review step.
+- The same-task event channel is unbounded. Frame-rate batching avoids terminal
+  churn, but a pathological provider can still create a display backlog.
+- A permission modal temporarily owns keyboard input. The agent future and
+  animation continue, but ordinary composition resumes after the decision.
+- Startup MCP discovery is asynchronous I/O but is not yet multiplexed with
+  ordinary composer input. Active model turns and manual compaction are.
+- Cooperative cancellation repairs history and kills subprocesses on drop
+  where supported; it cannot establish whether an arbitrary external action
+  completed before its future was dropped.

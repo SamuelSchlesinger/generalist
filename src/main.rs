@@ -1,48 +1,104 @@
 use colored::*;
-use dialoguer::{theme::ColorfulTheme, Input, Select};
-use generalist::chat_ui::ChatUI;
 use generalist::provider::{anthropic, AnthropicProvider, OpenAiProvider, Provider};
 use generalist::tools::*;
+use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
-    Agent, AgentEvent, Error, MemoryPermissionHandler, Result, SavedState, ToolRegistry,
-    TurnOutcome,
+    history_tool_protocol_is_valid, Agent, AgentEvent, DeliveryMode, Error,
+    MemoryPermissionHandler, PermissionBrokerPrompt, PermissionChoice, PermissionRequest,
+    PermissionUiEvent, PromptQueue, Result, SavedState, ToolRegistry, TurnControl, TurnOutcome,
 };
-use indicatif::ProgressBar;
-use std::cell::RefCell;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 
 const AUTOSAVE_NAME: &str = "autosave";
+const PENDING_QUEUE_NAME: &str = "pending-queue";
+const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
 
 fn home_dir() -> PathBuf {
     #[allow(deprecated)]
     env::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn history_dir() -> PathBuf {
-    let dir = home_dir().join(".generalist_history");
-    fs::create_dir_all(&dir).ok();
-    dir
+fn history_dir_for(home: &Path) -> Result<PathBuf> {
+    let dir = home.join(".generalist").join("history");
+    fs::create_dir_all(&dir).map_err(|error| {
+        Error::Other(format!(
+            "Failed to create state directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
 }
 
-/// Legacy history location from earlier versions.
-fn legacy_history_dir() -> PathBuf {
-    home_dir().join(".chatbot_history")
+fn history_dir() -> Result<PathBuf> {
+    history_dir_for(&home_dir())
+}
+
+fn state_search_dirs() -> Vec<PathBuf> {
+    let home = home_dir();
+    let mut dirs = Vec::new();
+    if let Ok(current) = history_dir_for(&home) {
+        dirs.push(current);
+    }
+    // Older releases used both paths. `.generalist_history` may also be a
+    // regular readline-history file, so only read_dir/read_to_string callers
+    // decide whether a particular candidate has the shape they need.
+    dirs.push(home.join(".generalist_history"));
+    dirs.push(home.join(".chatbot_history"));
+    dirs
 }
 
 fn save_state(state: &SavedState, filename: &str) -> Result<PathBuf> {
-    let filepath = history_dir().join(format!("{}.json", filename));
-    let json_data = serde_json::to_string_pretty(state)
-        .map_err(|e| Error::Other(format!("Failed to serialize state: {}", e)))?;
-    fs::write(&filepath, json_data)
-        .map_err(|e| Error::Other(format!("Failed to write state file: {}", e)))?;
+    let filepath = history_dir()?.join(format!("{}.json", filename));
+    let json_data = serialize_state(state)?;
+    write_atomically(&filepath, &json_data)?;
     Ok(filepath)
 }
 
+fn serialize_state(state: &SavedState) -> Result<Vec<u8>> {
+    if !history_tool_protocol_is_valid(&state.conversation_history) {
+        return Err(Error::Other(
+            "Refusing to persist history with an unpaired tool use/result".to_string(),
+        ));
+    }
+    serde_json::to_vec_pretty(state)
+        .map_err(|error| Error::Other(format!("Failed to serialize state: {error}")))
+}
+
+fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Other(format!("{} has no parent directory", path.display())))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".generalist-state-")
+        .tempfile_in(parent)
+        .map_err(|error| Error::Other(format!("Failed to create state file: {error}")))?;
+    temporary
+        .write_all(contents)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| Error::Other(format!("Failed to flush state file: {error}")))?;
+    temporary.persist(path).map_err(|error| {
+        Error::Other(format!(
+            "Failed to replace {}: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| Error::Other(format!("Failed to flush {}: {error}", parent.display())))
+}
+
 fn load_state(filename: &str) -> Result<SavedState> {
-    for dir in [history_dir(), legacy_history_dir()] {
+    for dir in state_search_dirs() {
         let filepath = dir.join(format!("{}.json", filename));
         if let Ok(json_data) = fs::read_to_string(&filepath) {
             return SavedState::from_legacy_json(&json_data, anthropic::SUGGESTED_MODELS[0])
@@ -57,11 +113,14 @@ fn load_state(filename: &str) -> Result<SavedState> {
 
 fn list_saved_conversations() -> Vec<String> {
     let mut conversations = Vec::new();
-    for dir in [history_dir(), legacy_history_dir()] {
+    for dir in state_search_dirs() {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     if let Some(stem) = name.strip_suffix(".json") {
+                        if stem == PENDING_QUEUE_NAME {
+                            continue;
+                        }
                         if !conversations.contains(&stem.to_string()) {
                             conversations.push(stem.to_string());
                         }
@@ -84,12 +143,11 @@ impl ApiKeys {
     fn from_env() -> Self {
         let openai_base_url = env::var("OPENAI_BASE_URL").ok();
         Self {
-            // CLAUDE_API_KEY is the name earlier versions used.
             anthropic: env::var("ANTHROPIC_API_KEY")
                 .or_else(|_| env::var("CLAUDE_API_KEY"))
                 .ok(),
-            // Local servers (Ollama, LM Studio, vLLM) don't check the key, so
-            // a configured base URL is enough to enable the provider.
+            // Local OpenAI-compatible servers generally do not inspect the
+            // key, so a configured base URL is sufficient to enable them.
             openai: env::var("OPENAI_API_KEY")
                 .ok()
                 .or_else(|| openai_base_url.as_ref().map(|_| "unused".to_string())),
@@ -108,26 +166,15 @@ impl ApiKeys {
         }
         providers
     }
-}
 
-fn choose_model(provider: &str) -> String {
-    match provider {
-        "anthropic" => {
-            let selection = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select model")
-                .items(anthropic::SUGGESTED_MODELS)
-                .default(0)
-                .interact()
-                .unwrap_or(0);
-            anthropic::SUGGESTED_MODELS[selection].to_string()
-        }
-        _ => {
-            let default = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-            Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Model name (e.g. gpt-4o, or an Ollama model like qwen3:30b)")
-                .default(default)
-                .interact_text()
-                .unwrap_or_else(|_| "gpt-4o".to_string())
+    fn provider_label(&self, provider: &str) -> String {
+        match provider {
+            "anthropic" => "Anthropic".to_string(),
+            "openai" if self.openai_base_url == generalist::provider::openai::DEFAULT_BASE_URL => {
+                "OpenAI".to_string()
+            }
+            "openai" => "OpenAI-compatible".to_string(),
+            other => other.to_string(),
         }
     }
 }
@@ -152,16 +199,12 @@ fn build_provider(keys: &ApiKeys, provider: &str, model: String) -> Result<Box<d
                 model,
             )?))
         }
-        other => Err(Error::Other(format!("Unknown provider '{}'", other))),
+        other => Err(Error::Other(format!("Unknown provider '{other}'"))),
     }
 }
 
 fn build_registry(permission_handler: &MemoryPermissionHandler) -> Result<ToolRegistry> {
-    let shared = MemoryPermissionHandler::with_shared_state(
-        permission_handler.always_allow(),
-        permission_handler.always_deny(),
-    );
-    let mut registry = ToolRegistry::with_permission_handler(Box::new(shared));
+    let mut registry = ToolRegistry::with_permission_handler(Box::new(permission_handler.clone()));
     registry.register(Arc::new(ReadFileTool))?;
     registry.register(Arc::new(PatchFileTool))?;
     registry.register(Arc::new(ListDirectoryTool))?;
@@ -179,22 +222,83 @@ fn build_registry(permission_handler: &MemoryPermissionHandler) -> Result<ToolRe
     Ok(registry)
 }
 
-fn make_saved_state(agent: &Agent, handler: &MemoryPermissionHandler) -> SavedState {
+fn make_saved_state(
+    agent: &Agent,
+    handler: &MemoryPermissionHandler,
+    queue: &PromptQueue,
+) -> SavedState {
     SavedState {
         provider: agent.provider().id().to_string(),
         model: agent.provider().model().to_string(),
         conversation_history: agent.history.clone(),
         always_allow_tools: handler.always_allow().lock().unwrap().clone(),
         always_deny_tools: handler.always_deny().lock().unwrap().clone(),
+        queued_prompts: queue.snapshot(),
     }
 }
 
-const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
-const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
+struct DurableBoundary {
+    provider: String,
+    model: String,
+    history: Vec<generalist::Message>,
+}
+
+impl DurableBoundary {
+    fn from_agent(agent: &Agent) -> Self {
+        Self {
+            provider: agent.provider().id().to_string(),
+            model: agent.provider().model().to_string(),
+            history: agent.history.clone(),
+        }
+    }
+
+    fn save(
+        &self,
+        permission_handler: &MemoryPermissionHandler,
+        queue: &PromptQueue,
+    ) -> Result<()> {
+        save_state(
+            &SavedState {
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                conversation_history: self.history.clone(),
+                always_allow_tools: permission_handler.always_allow().lock().unwrap().clone(),
+                always_deny_tools: permission_handler.always_deny().lock().unwrap().clone(),
+                queued_prompts: queue.snapshot(),
+            },
+            AUTOSAVE_NAME,
+        )?;
+        Ok(())
+    }
+}
+
+fn apply_runtime_event(
+    ui: &mut TerminalUi,
+    queue: &PromptQueue,
+    permission_handler: &MemoryPermissionHandler,
+    durable: &mut DurableBoundary,
+    event: AgentEvent,
+) {
+    let steering = matches!(&event, AgentEvent::SteeringCommitted { .. });
+    match event {
+        AgentEvent::HistoryCheckpoint {
+            history,
+            context_tokens,
+        } => {
+            ui.set_context_tokens(context_tokens);
+            durable.history = history;
+            if let Err(error) = durable.save(permission_handler, queue) {
+                ui.error(&format!("Failed to persist runtime checkpoint: {error}"));
+            }
+        }
+        event => ui.handle_agent_event(event),
+    }
+    if steering {
+        ui.sync_queue(queue);
+    }
+}
 
 struct CliArgs {
-    /// `--local [model]`: skip provider selection, run against a local
-    /// OpenAI-compatible server (Ollama by default).
     local_model: Option<String>,
 }
 
@@ -219,16 +323,14 @@ fn parse_args() -> CliArgs {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--local" => {
-                // Model name is optional: `--local` alone uses the default,
-                // and a following flag is not a model name.
                 let model = match args.peek() {
                     Some(next) if !next.starts_with('-') => args.next().unwrap(),
                     _ => DEFAULT_LOCAL_MODEL.to_string(),
                 };
                 local_model = Some(model);
             }
-            a if a.starts_with("--local=") => {
-                local_model = Some(a["--local=".len()..].to_string());
+            value if value.starts_with("--local=") => {
+                local_model = Some(value["--local=".len()..].to_string());
             }
             "-h" | "--help" => {
                 print_usage();
@@ -244,11 +346,483 @@ fn parse_args() -> CliArgs {
     CliArgs { local_model }
 }
 
-#[tokio::main]
+fn terminal<T>(result: io::Result<T>) -> Result<T> {
+    result.map_err(|error| Error::Other(format!("Terminal error: {error}")))
+}
+
+async fn choose_provider(
+    ui: &mut TerminalUi,
+    keys: &ApiKeys,
+    available: &[&'static str],
+) -> Result<Option<String>> {
+    if available.len() == 1 {
+        return Ok(Some(available[0].to_string()));
+    }
+    let labels = available
+        .iter()
+        .map(|provider| keys.provider_label(provider))
+        .collect::<Vec<_>>();
+    Ok(terminal(ui.select("Select API", &labels).await)?.map(|index| available[index].to_string()))
+}
+
+async fn choose_model(ui: &mut TerminalUi, provider: &str) -> Result<Option<String>> {
+    if provider == "anthropic" {
+        let models = anthropic::SUGGESTED_MODELS
+            .iter()
+            .map(|model| model.to_string())
+            .collect::<Vec<_>>();
+        Ok(terminal(ui.select("Select model", &models).await)?.map(|index| models[index].clone()))
+    } else {
+        let default = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
+        terminal(ui.prompt("Model name", &default).await)
+    }
+}
+
+async fn choose_provider_and_model(
+    ui: &mut TerminalUi,
+    keys: &ApiKeys,
+    available: &[&'static str],
+) -> Result<Option<(String, String)>> {
+    let Some(provider) = choose_provider(ui, keys, available).await? else {
+        return Ok(None);
+    };
+    let Some(model) = choose_model(ui, &provider).await? else {
+        return Ok(None);
+    };
+    Ok(Some((provider, model)))
+}
+
+fn is_local_command(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('/')
+        || trimmed.eq_ignore_ascii_case("exit")
+        || trimmed.eq_ignore_ascii_case("quit")
+}
+
+fn enqueue_submission(
+    ui: &mut TerminalUi,
+    queue: &PromptQueue,
+    text: String,
+    requested: DeliveryMode,
+    turn_active: bool,
+) {
+    if text.trim().eq_ignore_ascii_case("/help") {
+        ui.open_help();
+        return;
+    }
+    let delivery = if !turn_active || is_local_command(&text) {
+        DeliveryMode::FollowUp
+    } else {
+        requested
+    };
+    queue.enqueue(text, delivery);
+    ui.sync_queue(queue);
+    ui.status(&format!(
+        "Queued {} message · {} waiting",
+        delivery.label(),
+        queue.len()
+    ));
+}
+
+async fn drive_started_turn(
+    agent: &mut Agent,
+    ui: &mut TerminalUi,
+    queue: &PromptQueue,
+    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
+    permission_handler: &MemoryPermissionHandler,
+) -> Result<bool> {
+    let mut durable = DurableBoundary::from_agent(agent);
+    let (cancel_handle, mut control) = TurnControl::for_turn(queue.clone());
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::unbounded_channel();
+    let mut exit_requested = false;
+
+    ui.set_busy(true, "Thinking");
+    ui.draw().map_err(|error| Error::Other(error.to_string()))?;
+
+    let outcome = {
+        let mut on_event = move |event: AgentEvent| {
+            if matches!(&event, AgentEvent::HistoryCheckpoint { .. }) {
+                let _ = checkpoint_tx.send(event);
+            } else {
+                let _ = event_tx.send(event);
+            }
+        };
+        let turn = agent.run_started_turn(&mut on_event, &mut control);
+        tokio::pin!(turn);
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut pending_permission: Option<PermissionRequest> = None;
+
+        loop {
+            tokio::select! {
+                biased;
+                Some(event) = checkpoint_rx.recv() => {
+                    apply_runtime_event(
+                        ui,
+                        queue,
+                        permission_handler,
+                        &mut durable,
+                        event,
+                    );
+                }
+                result = &mut turn => {
+                    if let Some(pending) = pending_permission.take() {
+                        ui.close_permission(pending.id);
+                    }
+                    break result;
+                }
+                Some(permission_event) = permission_rx.recv() => {
+                    match permission_event {
+                        PermissionUiEvent::Request(request) => {
+                            if let Some(stale) = pending_permission.replace(request) {
+                                ui.close_permission(stale.id);
+                                let _ = stale.reply.send(PermissionChoice::DenyOnce);
+                            }
+                            let pending = pending_permission.as_ref().expect("permission stored");
+                            ui.open_permission(pending.id, pending.request.clone());
+                            ui.draw().map_err(|error| Error::Other(error.to_string()))?;
+                        }
+                        PermissionUiEvent::Automatic { request, allowed } => {
+                            ui.status(&format!(
+                                "{} was {} by remembered policy",
+                                request.tool_name,
+                                if allowed { "auto-allowed" } else { "auto-denied" }
+                            ));
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    ui.tick();
+                    ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
+                }
+                terminal_event = ui.next_event() => {
+                    let action = ui
+                        .handle_event(terminal(terminal_event)?, queue);
+                    let persist_queue = action.requires_queue_persist();
+                    match action {
+                        UiAction::None | UiAction::QueueChanged => {}
+                        UiAction::Submit { text, delivery } => {
+                            enqueue_submission(ui, queue, text, delivery, true);
+                        }
+                        UiAction::Interrupt => {
+                            if let Some(pending) = pending_permission.take() {
+                                ui.close_permission(pending.id);
+                                let _ = pending.reply.send(PermissionChoice::DenyOnce);
+                            }
+                            cancel_handle.cancel();
+                            ui.status("Interrupting safely…");
+                        }
+                        UiAction::Exit => {
+                            exit_requested = true;
+                            if let Some(pending) = pending_permission.take() {
+                                ui.close_permission(pending.id);
+                                let _ = pending.reply.send(PermissionChoice::DenyOnce);
+                            }
+                            cancel_handle.cancel();
+                            ui.status("Interrupting before exit…");
+                        }
+                        UiAction::Permission { id, choice } => {
+                            if pending_permission.as_ref().is_some_and(|pending| pending.id == id) {
+                                let pending = pending_permission.take().expect("matched permission");
+                                let _ = pending.reply.send(choice);
+                            }
+                        }
+                    }
+                    if persist_queue {
+                        if let Err(error) = durable.save(permission_handler, queue) {
+                            ui.error(&format!("Failed to persist runtime state: {error}"));
+                        }
+                    }
+                }
+                // Keep ordinary display events last in this biased reactor:
+                // an unbounded stream of deltas must not starve frame ticks,
+                // terminal input, or a live permission decision.
+                Some(event) = event_rx.recv() => {
+                    apply_runtime_event(
+                        ui,
+                        queue,
+                        permission_handler,
+                        &mut durable,
+                        event,
+                    );
+                }
+            }
+        }
+    };
+
+    while let Ok(event) = checkpoint_rx.try_recv() {
+        apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
+    }
+    while let Ok(event) = event_rx.try_recv() {
+        apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
+    }
+    queue.normalize_steers();
+    ui.sync_queue(queue);
+    if let Err(error) = save_state(
+        &make_saved_state(agent, permission_handler, queue),
+        AUTOSAVE_NAME,
+    ) {
+        ui.error(&format!("Failed to persist settled runtime state: {error}"));
+    }
+
+    match outcome {
+        Ok(TurnOutcome::Completed | TurnOutcome::Refused) => ui.set_busy(false, "Ready"),
+        Ok(TurnOutcome::PausedOnDenial) => {
+            ui.set_busy(false, "Paused after denial");
+            ui.info("Tool denied. Queued work will continue as a new turn.");
+        }
+        Ok(TurnOutcome::MaxIterationsReached) => {
+            ui.set_busy(false, "Iteration limit reached");
+            ui.info("Iteration limit reached; queued work will continue separately.");
+        }
+        Ok(TurnOutcome::Interrupted) => {
+            ui.cancel_running_activity();
+            ui.set_busy(false, "Interrupted");
+            ui.info("Turn interrupted cleanly; unfinished tools were paired with error results.");
+        }
+        Err(error) => {
+            ui.set_busy(false, "Error");
+            ui.error(&error.to_string());
+            ui.info("Conversation state is preserved; queued work can continue.");
+        }
+    }
+    ui.set_context_tokens(agent.context_tokens());
+    ui.draw().map_err(|error| Error::Other(error.to_string()))?;
+    Ok(exit_requested)
+}
+
+async fn drive_compaction(
+    agent: &mut Agent,
+    ui: &mut TerminalUi,
+    queue: &PromptQueue,
+    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
+    permission_handler: &MemoryPermissionHandler,
+) -> Result<bool> {
+    let mut durable = DurableBoundary::from_agent(agent);
+    let before = agent.context_tokens();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::unbounded_channel();
+    let mut exit_requested = false;
+    ui.set_busy(true, "Compacting context");
+
+    let compacted = {
+        let mut on_event = move |event: AgentEvent| {
+            if matches!(&event, AgentEvent::HistoryCheckpoint { .. }) {
+                let _ = checkpoint_tx.send(event);
+            } else {
+                let _ = event_tx.send(event);
+            }
+        };
+        let operation = agent.compact(&mut on_event);
+        tokio::pin!(operation);
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+                Some(event) = checkpoint_rx.recv() => apply_runtime_event(
+                    ui,
+                    queue,
+                    permission_handler,
+                    &mut durable,
+                    event,
+                ),
+                result = &mut operation => break Some(result),
+                Some(permission_event) = permission_rx.recv() => {
+                    match permission_event {
+                        PermissionUiEvent::Request(request) => {
+                            let _ = request.reply.send(PermissionChoice::DenyOnce);
+                        }
+                        PermissionUiEvent::Automatic { request, allowed } => {
+                            ui.status(&format!(
+                                "{} was {} by remembered policy",
+                                request.tool_name,
+                                if allowed { "auto-allowed" } else { "auto-denied" }
+                            ));
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    ui.tick();
+                    ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
+                }
+                terminal_event = ui.next_event() => {
+                    let action = ui.handle_event(terminal(terminal_event)?, queue);
+                    let persist_queue = action.requires_queue_persist();
+                    match action {
+                        UiAction::Submit { text, .. } => {
+                            enqueue_submission(
+                                ui,
+                                queue,
+                                text,
+                                DeliveryMode::FollowUp,
+                                true,
+                            );
+                        }
+                        UiAction::Interrupt => break None,
+                        UiAction::Exit => {
+                            exit_requested = true;
+                            break None;
+                        }
+                        UiAction::None | UiAction::QueueChanged | UiAction::Permission { .. } => {}
+                    }
+                    if persist_queue {
+                        if let Err(error) = durable.save(permission_handler, queue) {
+                            ui.error(&format!("Failed to persist runtime state: {error}"));
+                        }
+                    }
+                }
+                // See the active-turn reactor above: display backlog is lower
+                // priority than interaction and bounded frame progress.
+                Some(event) = event_rx.recv() => apply_runtime_event(
+                    ui,
+                    queue,
+                    permission_handler,
+                    &mut durable,
+                    event,
+                ),
+            }
+        }
+    };
+
+    while let Ok(event) = checkpoint_rx.try_recv() {
+        apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
+    }
+    while let Ok(event) = event_rx.try_recv() {
+        apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
+    }
+    if let Err(error) = save_state(
+        &make_saved_state(agent, permission_handler, queue),
+        AUTOSAVE_NAME,
+    ) {
+        ui.error(&format!("Failed to persist compaction state: {error}"));
+    }
+    match compacted {
+        Some(Ok(true)) => ui.info(&format!(
+            "Context compacted: ~{}k → ~{}k tokens",
+            before / 1_000,
+            agent.context_tokens() / 1_000
+        )),
+        Some(Ok(false)) => ui.info("Nothing to compact yet."),
+        Some(Err(error)) => ui.error(&format!("Compaction failed: {error}")),
+        None => ui.info("Compaction interrupted before changing history."),
+    }
+    ui.set_busy(false, "Ready");
+    ui.set_context_tokens(agent.context_tokens());
+    Ok(exit_requested)
+}
+
+enum CommandFlow {
+    Continue,
+    Exit,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_command(
+    text: &str,
+    agent: &mut Agent,
+    ui: &mut TerminalUi,
+    queue: &PromptQueue,
+    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
+    permission_handler: &MemoryPermissionHandler,
+    keys: &ApiKeys,
+    available: &[&'static str],
+) -> Result<CommandFlow> {
+    let command = text.trim();
+    if command.eq_ignore_ascii_case("exit") || command.eq_ignore_ascii_case("quit") {
+        return Ok(CommandFlow::Exit);
+    }
+    if command.eq_ignore_ascii_case("/help") {
+        terminal(ui.show_help().await)?;
+    } else if command.eq_ignore_ascii_case("/compact") {
+        if drive_compaction(agent, ui, queue, permission_rx, permission_handler).await? {
+            return Ok(CommandFlow::Exit);
+        }
+    } else if command.eq_ignore_ascii_case("/clear") {
+        agent.clear_history();
+        ui.clear_conversation();
+        ui.set_context_tokens(0);
+        ui.info("Conversation cleared.");
+    } else if command.eq_ignore_ascii_case("/save") {
+        let default = format!("chat_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+        if let Some(name) = terminal(ui.prompt("Save conversation as", &default).await)? {
+            match save_state(&make_saved_state(agent, permission_handler, queue), &name) {
+                Ok(path) => ui.info(&format!("Saved to {}", path.display())),
+                Err(error) => ui.error(&format!("Failed to save: {error}")),
+            }
+        }
+    } else if command.eq_ignore_ascii_case("/load") {
+        let saved = list_saved_conversations();
+        if saved.is_empty() {
+            ui.info("No saved conversations found.");
+        } else if let Some(index) = terminal(ui.select("Load conversation", &saved).await)? {
+            match load_state(&saved[index]) {
+                Ok(state) => {
+                    let SavedState {
+                        provider,
+                        model,
+                        conversation_history,
+                        always_allow_tools,
+                        always_deny_tools,
+                        queued_prompts,
+                    } = state;
+                    if !history_tool_protocol_is_valid(&conversation_history) {
+                        ui.error(
+                            "Saved conversation has an unpaired tool use/result; refusing to load it.",
+                        );
+                        return Ok(CommandFlow::Continue);
+                    }
+                    match build_provider(keys, &provider, model) {
+                        Ok(provider) => agent.set_provider(provider),
+                        Err(error) => ui.error(&format!(
+                            "Saved API '{provider}' is unavailable ({error}); keeping the current API."
+                        )),
+                    }
+                    permission_handler.set_always_allow(always_allow_tools);
+                    permission_handler.set_always_deny(always_deny_tools);
+                    agent.replace_history(conversation_history);
+                    queue.replace(queued_prompts);
+                    ui.load_history(&agent.history);
+                    ui.sync_queue(queue);
+                    ui.set_session(
+                        agent.provider().display_name(),
+                        agent.provider().model(),
+                        agent.registry.tool_names().len(),
+                    );
+                    ui.set_context_tokens(agent.context_tokens());
+                    ui.info(&format!("Loaded {} messages", agent.history.len()));
+                }
+                Err(error) => ui.error(&format!("Failed to load: {error}")),
+            }
+        }
+    } else if command.eq_ignore_ascii_case("/model") {
+        if let Some((provider_name, model)) = choose_provider_and_model(ui, keys, available).await?
+        {
+            match build_provider(keys, &provider_name, model) {
+                Ok(provider) => {
+                    agent.set_provider(provider);
+                    ui.set_session(
+                        agent.provider().display_name(),
+                        agent.provider().model(),
+                        agent.registry.tool_names().len(),
+                    );
+                    ui.info("Model switched.");
+                }
+                Err(error) => ui.error(&format!("Failed to switch model: {error}")),
+            }
+        }
+    } else {
+        ui.info(&format!("Unknown local command: {command}"));
+    }
+    Ok(CommandFlow::Continue)
+}
+
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = parse_args();
 
-    // ~/.generalist.env is optional; plain environment variables work too.
     let env_path = home_dir().join(".generalist.env");
     if env_path.exists() {
         dotenv::from_path(&env_path).ok();
@@ -256,8 +830,6 @@ async fn main() -> Result<()> {
 
     let mut keys = ApiKeys::from_env();
     if cli.local_model.is_some() {
-        // --local needs no API key; point at Ollama unless a base URL was
-        // configured explicitly.
         if env::var("OPENAI_BASE_URL").is_err() {
             keys.openai_base_url = OLLAMA_BASE_URL.to_string();
         }
@@ -266,262 +838,228 @@ async fn main() -> Result<()> {
     let available = keys.available_providers();
     if available.is_empty() {
         eprintln!("{}", "No API key found.".red());
-        eprintln!("Set at least one of these (in the environment or in ~/.generalist.env):");
+        eprintln!("Set at least one of these (in the environment or ~/.generalist.env):");
         eprintln!("  ANTHROPIC_API_KEY=...   for Anthropic models");
-        eprintln!("  OPENAI_API_KEY=...      for OpenAI or any OpenAI-compatible server");
-        eprintln!(
-            "  OPENAI_BASE_URL=...     optional, e.g. {} for Ollama",
-            OLLAMA_BASE_URL
-        );
-        eprintln!("Or run against a local model directly:  generalist --local <model>");
+        eprintln!("  OPENAI_API_KEY=...      for OpenAI or a compatible server");
+        eprintln!("  OPENAI_BASE_URL=...     optional, e.g. {OLLAMA_BASE_URL} for Ollama");
+        eprintln!("Or run against a local model directly: generalist --local <model>");
         std::process::exit(1);
     }
 
-    let ui = ChatUI::new();
-
-    let (provider_name, model) = match &cli.local_model {
-        Some(model) => ("openai", model.clone()),
-        None => {
-            let provider_name = if available.len() == 1 {
-                available[0]
-            } else {
-                let selection = Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Select provider")
-                    .items(&available)
-                    .default(0)
-                    .interact()
-                    .unwrap_or(0);
-                available[selection]
-            };
-            (provider_name, choose_model(provider_name))
-        }
+    let mut ui = terminal(TerminalUi::start("Starting", "selecting model"))?;
+    let provider_and_model = match cli.local_model {
+        Some(model) => Some(("openai".to_string(), model)),
+        None => choose_provider_and_model(&mut ui, &keys, &available).await?,
     };
-    let provider = build_provider(&keys, provider_name, model)?;
+    let Some((provider_name, model)) = provider_and_model else {
+        return Ok(());
+    };
+    let provider = build_provider(&keys, &provider_name, model)?;
+    ui.set_session(provider.display_name(), provider.model(), 0);
 
-    let permission_handler = MemoryPermissionHandler::new();
+    let (permission_tx, mut permission_rx) = mpsc::unbounded_channel();
+    let permission_prompt = Arc::new(PermissionBrokerPrompt::new(permission_tx));
+    let permission_handler = MemoryPermissionHandler::with_prompt(permission_prompt);
     let mut registry = build_registry(&permission_handler)?;
 
-    // MCP servers from ~/.generalist/mcp.json; their schemas use progressive
-    // disclosure and are available from scripts via tools-module docstrings.
+    ui.set_busy(true, "Connecting tools");
+    terminal(ui.draw())?;
     if let Some(config) = generalist::mcp::McpConfig::load(&home_dir().join(".generalist/mcp.json"))
     {
         for line in generalist::mcp::register_servers(&mut registry, &config).await {
-            ui.print_info(&line);
+            ui.info(&line);
         }
     }
+    ui.set_busy(false, "Ready");
 
-    // System prompt = base + skills index + project notes, if present.
     let mut system_prompt = include_str!("../SYSTEM_PROMPT.md").to_string();
     if let Some(index) = generalist::skills::skills_index(&home_dir().join(".generalist/skills")) {
         system_prompt.push_str(&index);
     }
     for name in ["AGENTS.md", "CLAUDE.md"] {
         if let Ok(notes) = fs::read_to_string(name) {
-            system_prompt.push_str(&format!("\n\n## Project notes (./{})\n\n{}", name, notes));
+            system_prompt.push_str(&format!("\n\n## Project notes (./{name})\n\n{notes}"));
             break;
         }
     }
 
     let mut agent = Agent::new(provider, registry, system_prompt);
-
-    ui.print_welcome(
+    let queue = match load_state(AUTOSAVE_NAME) {
+        Ok(state) if !state.queued_prompts.is_empty() => {
+            if history_tool_protocol_is_valid(&state.conversation_history) {
+                let SavedState {
+                    conversation_history,
+                    always_allow_tools,
+                    always_deny_tools,
+                    queued_prompts,
+                    ..
+                } = state;
+                let count = queued_prompts.len();
+                permission_handler.set_always_allow(always_allow_tools);
+                permission_handler.set_always_deny(always_deny_tools);
+                agent.replace_history(conversation_history);
+                ui.load_history(&agent.history);
+                ui.info(&format!(
+                    "Recovered {count} queued message(s) with their conversation context."
+                ));
+                PromptQueue::from_saved(queued_prompts)
+            } else {
+                ui.error(
+                    "Autosave has an unpaired tool use/result; queued work was not recovered.",
+                );
+                PromptQueue::default()
+            }
+        }
+        _ => PromptQueue::default(),
+    };
+    queue.normalize_steers();
+    ui.sync_queue(&queue);
+    ui.set_session(
         agent.provider().display_name(),
         agent.provider().model(),
-        &agent.registry.tool_names(),
+        agent.registry.tool_names().len(),
     );
+    ui.set_context_tokens(agent.context_tokens());
 
-    // Exits on Ctrl-C / closed stdin (Err) or the exit command.
-    while let Ok(input) = Input::<String>::with_theme(&ColorfulTheme::default())
-        .with_prompt("You")
-        .interact_text()
-    {
-        let trimmed = input.trim();
+    let mut ticker = tokio::time::interval(Duration::from_millis(50));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut exiting = false;
 
-        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-            println!("\n{}", "Goodbye!".yellow());
-            break;
-        } else if trimmed.eq_ignore_ascii_case("/help") {
-            ui.print_help();
-            continue;
-        } else if trimmed.eq_ignore_ascii_case("/compact") {
-            let before = agent.context_tokens();
-            let mut on_note = |event: AgentEvent| {
-                if let AgentEvent::Notice(message) = event {
-                    ui.print_info(&message);
-                }
-            };
-            match agent.compact(&mut on_note).await {
-                Ok(true) => {}
-                Ok(false) => ui.print_info("Nothing to compact yet."),
-                Err(e) => ui.print_error(&format!("Compaction failed: {}", e)),
-            }
-            ui.print_info(&format!(
-                "Context: ~{}k -> ~{}k tokens",
-                before / 1000,
-                agent.context_tokens() / 1000
-            ));
-            continue;
-        } else if trimmed.eq_ignore_ascii_case("/clear") {
-            agent.history.clear();
-            ui.print_info("Conversation cleared.");
-            continue;
-        } else if trimmed.eq_ignore_ascii_case("/save") {
-            let name: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Save conversation as")
-                .default(format!(
-                    "chat_{}",
-                    chrono::Local::now().format("%Y%m%d_%H%M%S")
-                ))
-                .interact_text()
-                .unwrap_or_else(|_| "unnamed".to_string());
-            match save_state(&make_saved_state(&agent, &permission_handler), &name) {
-                Ok(path) => ui.print_info(&format!("Saved to {}", path.display())),
-                Err(e) => ui.print_error(&format!("Failed to save: {}", e)),
-            }
-            continue;
-        } else if trimmed.eq_ignore_ascii_case("/load") {
-            let saved = list_saved_conversations();
-            if saved.is_empty() {
-                ui.print_info("No saved conversations found.");
-                continue;
-            }
-            let Some(idx) = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select conversation to load")
-                .items(&saved)
-                .interact_opt()
-                .ok()
-                .flatten()
-            else {
-                continue;
-            };
-            match load_state(&saved[idx]) {
-                Ok(state) => {
-                    match build_provider(&keys, &state.provider, state.model.clone()) {
-                        Ok(provider) => agent.set_provider(provider),
-                        Err(e) => {
-                            ui.print_error(&format!(
-                                "Conversation used provider '{}' which is unavailable ({}); keeping current provider.",
-                                state.provider, e
-                            ));
-                        }
-                    }
-                    permission_handler.set_always_allow(state.always_allow_tools.clone());
-                    permission_handler.set_always_deny(state.always_deny_tools.clone());
-                    agent.history = state.conversation_history;
-                    ui.print_info(&format!(
-                        "Loaded {} messages on {} / {}",
-                        agent.history.len(),
-                        agent.provider().display_name(),
-                        agent.provider().model()
-                    ));
-                    for msg in &agent.history {
-                        let text = msg.text();
-                        if !text.is_empty() {
-                            ui.print_message(&msg.role, &text);
-                        }
-                    }
-                    println!();
-                }
-                Err(e) => ui.print_error(&format!("Failed to load: {}", e)),
-            }
-            continue;
-        } else if trimmed.eq_ignore_ascii_case("/model") {
-            let provider_name = if available.len() == 1 {
-                available[0]
+    while !exiting {
+        queue.normalize_steers();
+        ui.sync_queue(&queue);
+
+        if let Some(claim) = queue.claim_follow_up() {
+            let prompt = claim.prompts()[0].clone();
+            if is_local_command(&prompt.text) {
+                claim.commit();
+                exiting = matches!(
+                    execute_command(
+                        &prompt.text,
+                        &mut agent,
+                        &mut ui,
+                        &queue,
+                        &mut permission_rx,
+                        &permission_handler,
+                        &keys,
+                        &available,
+                    )
+                    .await?,
+                    CommandFlow::Exit
+                );
             } else {
-                let selection = Select::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Select provider")
-                    .items(&available)
-                    .default(0)
-                    .interact()
-                    .unwrap_or(0);
-                available[selection]
-            };
-            let model = choose_model(provider_name);
-            match build_provider(&keys, provider_name, model) {
-                Ok(provider) => {
-                    agent.set_provider(provider);
-                    ui.print_info(&format!(
-                        "Switched to {} / {}",
-                        agent.provider().display_name(),
-                        agent.provider().model()
-                    ));
+                agent.begin_turn(&prompt.text);
+                claim.commit();
+                ui.push_user(prompt.text.trim());
+                if let Err(error) = save_state(
+                    &make_saved_state(&agent, &permission_handler, &queue),
+                    AUTOSAVE_NAME,
+                ) {
+                    ui.error(&format!("Failed to persist the started turn: {error}"));
                 }
-                Err(e) => ui.print_error(&format!("Failed to switch: {}", e)),
+                exiting = drive_started_turn(
+                    &mut agent,
+                    &mut ui,
+                    &queue,
+                    &mut permission_rx,
+                    &permission_handler,
+                )
+                .await?;
             }
-            continue;
-        } else if trimmed.is_empty() {
+            if let Err(error) = save_state(
+                &make_saved_state(&agent, &permission_handler, &queue),
+                AUTOSAVE_NAME,
+            ) {
+                ui.error(&format!("Failed to persist settled runtime state: {error}"));
+            }
             continue;
         }
 
-        // Run the turn, rendering events as they arrive. The spinner lives in
-        // a RefCell so the event closure can start/stop it; ApiCallFinished is
-        // guaranteed to fire even on errors, keeping the state balanced.
-        let spinner: RefCell<Option<ProgressBar>> = RefCell::new(None);
-        let streaming = RefCell::new(false);
-        let clear_spinner = || {
-            if let Some(pb) = spinner.borrow_mut().take() {
-                pb.finish_and_clear();
-            }
-        };
-        let mut on_event = |event: AgentEvent| match event {
-            AgentEvent::ApiCallStarted => {
-                *spinner.borrow_mut() = Some(ui.spinner("Thinking..."));
-            }
-            AgentEvent::ApiCallFinished { .. } => {
-                clear_spinner();
-                if *streaming.borrow() {
-                    ui.stream_end();
-                    *streaming.borrow_mut() = false;
+        ui.set_busy(false, "Ready");
+        tokio::select! {
+            biased;
+            Some(permission_event) = permission_rx.recv() => {
+                match permission_event {
+                    PermissionUiEvent::Request(request) => {
+                        let _ = request.reply.send(PermissionChoice::DenyOnce);
+                        ui.error("Ignored a stale permission request with no active turn.");
+                    }
+                    PermissionUiEvent::Automatic { request, allowed } => {
+                        ui.status(&format!(
+                            "{} was {} by remembered policy",
+                            request.tool_name,
+                            if allowed { "auto-allowed" } else { "auto-denied" }
+                        ));
+                    }
                 }
             }
-            AgentEvent::AssistantTextDelta(text) => {
-                clear_spinner();
-                let first = !*streaming.borrow();
-                ui.stream_delta(first, &text);
-                *streaming.borrow_mut() = true;
+            _ = ticker.tick() => {
+                ui.tick();
+                ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
             }
-            AgentEvent::AssistantText(text) => ui.print_message("assistant", &text),
-            AgentEvent::ToolCallStarted { name, input } => ui.print_tool_call(&name, &input),
-            AgentEvent::ToolCallFinished {
-                name,
-                outcome,
-                content,
-            } => ui.print_tool_result(&name, outcome, &content),
-            AgentEvent::Retrying {
-                attempt,
-                max_retries,
-                delay_secs,
-                error,
-            } => {
-                ui.print_info(&format!(
-                    "Transient API error ({}); retry {}/{} in {}s",
-                    error, attempt, max_retries, delay_secs
-                ));
-            }
-            AgentEvent::Notice(message) => ui.print_info(&message),
-        };
-
-        match agent.run_turn(trimmed, &mut on_event).await {
-            Ok(TurnOutcome::Completed) | Ok(TurnOutcome::Refused) => {}
-            Ok(TurnOutcome::PausedOnDenial) => {
-                ui.print_info("You can now give new instructions.");
-            }
-            Ok(TurnOutcome::MaxIterationsReached) => {
-                ui.print_info("Ask to continue if you want the agent to keep going.");
-            }
-            Err(e) => {
-                ui.print_error(&e.to_string());
-                ui.print_info("The conversation so far is preserved; you can continue or /save.");
+            terminal_event = ui.next_event() => {
+                let action = ui.handle_event(terminal(terminal_event)?, &queue);
+                let persist_queue = action.requires_queue_persist();
+                match action {
+                    UiAction::Submit { text, delivery } => {
+                        enqueue_submission(&mut ui, &queue, text, delivery, false);
+                    }
+                    UiAction::Exit => exiting = true,
+                    UiAction::None
+                    | UiAction::QueueChanged
+                    | UiAction::Interrupt
+                    | UiAction::Permission { .. } => {}
+                }
+                if persist_queue {
+                    if let Err(error) = save_state(
+                        &make_saved_state(&agent, &permission_handler, &queue),
+                        AUTOSAVE_NAME,
+                    ) {
+                        ui.error(&format!("Failed to persist runtime state: {error}"));
+                    }
+                }
             }
         }
-
-        // Best-effort autosave so a crash never loses a session.
-        let _ = save_state(
-            &make_saved_state(&agent, &permission_handler),
-            AUTOSAVE_NAME,
-        );
-        println!();
     }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use generalist::{ContentBlock, Message};
+    use serde_json::json;
+
+    #[test]
+    fn structured_state_does_not_collide_with_legacy_input_history_file() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".generalist_history");
+        fs::write(&legacy, "old input history\n").unwrap();
+
+        let directory = history_dir_for(home.path()).unwrap();
+        assert_eq!(directory, home.path().join(".generalist/history"));
+        assert!(directory.is_dir());
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), "old input history\n");
+
+        let autosave = directory.join("autosave.json");
+        write_atomically(&autosave, br#"{"version":1}"#).unwrap();
+        write_atomically(&autosave, br#"{"version":2}"#).unwrap();
+        assert_eq!(fs::read_to_string(autosave).unwrap(), r#"{"version":2}"#);
+    }
+
+    #[test]
+    fn persistence_rejects_an_invalid_tool_protocol_boundary() {
+        let mut state = SavedState::new("openai".into(), "model".into());
+        state
+            .conversation_history
+            .push(Message::assistant(vec![ContentBlock::ToolUse {
+                name: "python".into(),
+                input: json!({}),
+                id: "dangling".into(),
+            }]));
+
+        let error = serialize_state(&state).unwrap_err().to_string();
+        assert!(error.contains("unpaired tool use/result"));
+    }
 }

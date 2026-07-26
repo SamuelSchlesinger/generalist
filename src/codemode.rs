@@ -76,15 +76,16 @@ pub(crate) fn python_tool_def(available_tools: &[ToolDef], code_only_tools: &[To
         description: format!(
             "Execute a Python 3 script and return its stdout/stderr. This is the only \
              model-facing tool while code mode is enabled: perform all tool work inside the \
-             script via the pre-generated `tools` module. Start with `import tools`, then call \
-             bridge functions with keyword arguments; they return str and raise RuntimeError \
-             on failure. Complete the largest coherent work phase in one script instead of \
-             returning after one bridged call: loop, branch, retry, validate, and combine \
-             results in code. Tool results stay inside the script unless printed. Print only \
-             conclusions, compact evidence, and paths; write large intermediate results to \
-             files. Output is truncated to the last 50,000 characters (full output is saved \
-             to a temp file whose path is included). Default timeout 120s (override with \
-             timeout_seconds, max 600).\n\nAvailable bridge tools:\n{}{}",
+             script via the pre-generated `tools` module. A `tools.<name>` expression belongs \
+             inside the `code` string; never emit `<name>` or `tools.<name>` as a native tool \
+             call. Start with `import tools`, then call bridge functions with keyword arguments; \
+             they return str and raise RuntimeError on failure. Complete the largest coherent \
+             work phase in one script instead of returning after one bridged call: loop, branch, \
+             retry, validate, and combine results in code. Tool results stay inside the script \
+             unless printed. Print only conclusions, compact evidence, and paths; write large \
+             intermediate results to files. Output is truncated to the last 50,000 characters \
+             (full output is saved to a temp file whose path is included). Default timeout 120s \
+             (override with timeout_seconds, max 600).\n\nAvailable bridge tools:\n{}{}",
             tool_docs, code_only_note
         ),
         input_schema: json!({
@@ -157,6 +158,11 @@ def _call(_tool, **kwargs):
 pub(crate) struct ScriptResult {
     pub content: String,
     pub failed: bool,
+    /// At least one bridged tool call was denied by the permission policy.
+    ///
+    /// A script may catch the generated Python exception and still exit zero,
+    /// so this signal must travel separately from process success.
+    pub denied: bool,
 }
 
 /// Remove a file when dropped (used for the bridge socket).
@@ -187,6 +193,7 @@ pub(crate) async fn run_script(
         Err(message) => ScriptResult {
             content: message,
             failed: true,
+            denied: false,
         },
     }
 }
@@ -254,13 +261,14 @@ async fn run_script_inner(
         buf
     });
 
+    let mut denied = false;
     let serve_and_wait = async {
         loop {
             tokio::select! {
                 status = child.wait() => break status,
                 accepted = listener.accept() => {
                     if let Ok((stream, _)) = accepted {
-                        serve_connection(stream, registry, on_event).await;
+                        serve_connection(stream, registry, on_event, &mut denied).await;
                     }
                 }
             }
@@ -278,6 +286,7 @@ async fn run_script_inner(
                     timeout_secs
                 ),
                 failed: true,
+                denied,
             });
         }
     };
@@ -302,6 +311,7 @@ async fn run_script_inner(
     Ok(ScriptResult {
         content: crate::tools::bash::tail_truncate_with_spill(&content),
         failed,
+        denied,
     })
 }
 
@@ -310,11 +320,12 @@ async fn serve_connection(
     stream: UnixStream,
     registry: &mut ToolRegistry,
     on_event: &mut dyn FnMut(AgentEvent),
+    denied: &mut bool,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let response = handle_request(&line, registry, on_event).await;
+        let response = handle_request(&line, registry, on_event, denied).await;
         let mut payload = serde_json::to_string(&response).unwrap_or_else(|_| {
             "{\"is_error\": true, \"content\": \"serialization failed\"}".to_string()
         });
@@ -329,6 +340,7 @@ async fn handle_request(
     line: &str,
     registry: &mut ToolRegistry,
     on_event: &mut dyn FnMut(AgentEvent),
+    denied: &mut bool,
 ) -> Value {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -360,7 +372,7 @@ async fn handle_request(
         outcome: result.outcome,
         content: crate::types::truncate_middle(&content, 2_000),
     });
-    let _ = result.outcome == ToolCallOutcome::Denied; // denial surfaces to the script as an error
+    *denied |= result.outcome == ToolCallOutcome::Denied;
     json!({"is_error": is_error, "content": content})
 }
 
