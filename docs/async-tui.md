@@ -38,6 +38,8 @@ There are two intentionally different ways to submit while the agent is busy:
 | `Shift+Enter` or `Ctrl+J` | Insert a newline | Insert a newline |
 | `Alt+Up` | Restore the latest queued item into an empty composer | Restore the latest queued item into an empty composer |
 | `F2` | Open queue manager | Open queue manager |
+| `F3` | Toggle native terminal copy mode | Toggle native terminal copy mode without stopping provider/tool progress |
+| `F4` | Inspect provider-supplied reasoning | Inspect live provider-supplied reasoning |
 | `Esc` | Clear/close the current UI layer | Interrupt the active turn when no modal owns the key |
 
 Modal input takes priority. In particular, Esc on a permission modal means
@@ -102,15 +104,17 @@ this preserves the existing `Provider` trait's `?Send` contract. `tokio::select!
 keeps terminal events, frame ticks, permission requests, and the active turn
 progressing together.
 
-The active future emits events into a same-task channel. Assistant deltas are
-appended to one live chat entry, and drawing happens on the 50 ms frame tick
-rather than once per token or terminal event. Rapid key-repeat and mouse-wheel
-bursts therefore update in-memory display state immediately but produce at most
-one frame per tick. Dirty tracking avoids rebuilding an idle transcript, and
-spinner-only frames run at 10 FPS. Permission, frame, and terminal branches are
-polled ahead of ordinary display events, so a streaming-event backlog cannot
-starve input or a permission answer. The channel is intentionally not a second
-state store: committed history remains inside `Agent`.
+The active future emits events into a same-task channel. Answer deltas are
+appended to one live chat entry; provider-supplied reasoning deltas are appended
+to a separate inspector entry for the same API attempt. Drawing happens on the
+50 ms frame tick rather than once per token or terminal event. Rapid key-repeat
+and mouse-wheel bursts therefore update in-memory display state immediately but
+produce at most one frame per tick. Dirty tracking avoids rebuilding an idle
+transcript, and spinner-only frames run at 10 FPS. Permission, frame, and
+terminal branches are polled ahead of ordinary display events, so a
+streaming-event backlog cannot starve input or a permission answer. The channel
+is intentionally not a second committed-history authority: committed history
+remains inside `Agent`.
 
 Conversation scrolling stores an absolute top line while follow-latest is
 paused. New streamed lines therefore do not move the user's viewport.
@@ -118,9 +122,39 @@ PageDown/mouse-down clamps at the real bottom and resumes follow-latest; PageUp
 cannot accumulate an invisible overscroll debt. Scroll bounds come from
 Ratatui's own word-wrapping layout rather than a character-width estimate, so
 moving a whole word onto the next row cannot make the rendered bottom
-unreachable. Mouse input belongs to the active modal: it scrolls permission
-details or a long queue selection instead of changing the obscured
-conversation.
+unreachable. The scrollbar is given the count of valid top-row positions
+(`max_scroll + 1`) plus the visible-row count, rather than the total wrapped
+rows. Its thumb therefore reaches the end of the track exactly when
+follow-latest reaches the real bottom. Mouse input belongs to the active modal:
+it scrolls permission details or a long queue selection instead of changing
+the obscured conversation.
+
+### Copy mode and reasoning inspection
+
+`F3` is a terminal-ownership mode, not a runtime pause. On entry the UI releases
+mouse capture, draws a visible `display paused` banner, hides the composer
+cursor, and then freezes Ratatui redraws. The terminal can therefore perform
+native selection and its usual copy shortcut without a frame erasing the
+selection. All application input except `F3` is suspended while this mode owns
+the screen. The same reactor continues polling the provider/tool future,
+permission channel, and frame clock; events update in-memory state and mark the
+frame dirty. On the second `F3`, mouse capture is restored and one frame redraws
+the accumulated state. Bracketed paste remains enabled and is accepted by the
+composer after copy mode closes.
+
+`F4` opens a scrollable, follow-latest view of model reasoning. Its data boundary
+is deliberately narrower than “the agent's thoughts”: it contains only fields
+the configured provider sent as inspectable output. Anthropic `thinking_delta`
+text and common OpenAI-compatible string extensions are normalized into
+`CompletionDelta::Reasoning`; answer text uses
+`CompletionDelta::Text`. A provider attempt always gets an inspector entry, so
+an endpoint that exposes no reasoning produces an explicit “no inspectable
+reasoning” message rather than fabricated content. Answer text alone enters the
+conversation rendering. Anthropic signatures are retained only for required
+provider replay, and redacted-thinking data is represented by a placeholder;
+neither is emitted to the inspector. Unsigned reasoning from an
+OpenAI-compatible endpoint is retained for inspection/history loading but is
+not sent as an Anthropic thinking block after a provider switch.
 
 ## Prompt queue
 
@@ -220,9 +254,9 @@ delays, permission waits, and tool execution:
   result before the turn returns `Interrupted`.
 - Completed tool results remain in history.
 - Streaming text already shown in the TUI is marked interrupted; it is display
-  state, not silently treated as a committed assistant response. The marker
-  says the partial stream is uncommitted, and the text is absent from durable
-  model history.
+  state, not silently treated as a committed assistant response. Streamed
+  reasoning receives its own aborted-attempt label. Both remain inspection
+  evidence, while neither partial stream enters durable model history.
 
 The long-running Bash and code-mode Python subprocesses use
 `kill_on_drop(true)`. Protocol repair does not claim to roll back external side
@@ -257,6 +291,8 @@ deleted queued item would appear to have been sent.
 The alternate screen, mouse capture, bracketed paste, cursor, and raw mode have
 one cleanup path. Startup failures after any partial terminal initialization use
 that path too, rather than returning with the terminal stranded in raw mode.
+Copy mode temporarily disables only mouse capture; terminal cleanup disables it
+again unconditionally, so exiting from either copy state is safe.
 Ratatui display strings are sanitized at their entry boundary: ESC and other
 control bytes become visible control pictures, while newlines remain newlines.
 This applies to provider/model labels, assistant and tool output, queue text,
@@ -273,8 +309,10 @@ tool data are not rewritten.
 6. Tool-use and tool-result blocks are never left unpaired by a controlled
    interruption.
 7. A permission response is applied only to its live request.
-8. Queue, turn, token, and terminal-display changes are rendered on the bounded
-   frame tick; no individual delta or scroll event forces an immediate frame.
+8. Outside explicit copy mode, queue, turn, token, and terminal-display changes
+   are rendered on the bounded frame tick; no individual delta or scroll event
+   forces an immediate frame. Copy mode accumulates those changes until its
+   single exit redraw.
 
 ## Alternatives rejected
 
@@ -310,11 +348,18 @@ earliest safe delivery point.
 
 ## Formal model and review
 
-`spec/AsyncRuntime.tla` models the controller protocol and
+`spec/AsyncRuntime.tla` models the controller protocol and copy-mode terminal
+ownership, while reasoning text and Ratatui layout remain hidden payload/display
+state. The
 `spec/AsyncRuntime.cfg` supplies the finite CI bounds. TLC checks queue
 identity, single-turn ownership, delivery modes, safe steering, terminal
 reasons, tool-result pairing, permission correlation, committed settlement,
-stable ID ordering, and weakly fair release of busy ownership.
+stable ID ordering, weakly fair release of busy ownership, and eventual copy
+mode exit under an explicit user-resumption fairness assumption. Because copy
+mode makes permission keys intermittently unavailable, permission resolution
+has its own strong-fairness assumption when the permission UI is available
+infinitely often; the first version without that assumption produced a TLC
+liveness counterexample.
 
 The model is not accepted as a proxy for inspecting Rust. The maintained
 state/action/invariant refinement is in
@@ -333,6 +378,14 @@ the Rust and shell validation.
   churn, but a pathological provider can still create a display backlog.
 - A permission modal temporarily owns keyboard input. The agent future and
   animation continue, but ordinary composition resumes after the decision.
+- Copy mode intentionally suspends application input and visual updates so the
+  host terminal can own selection. Runtime work continues, but a permission
+  request that arrives in copy mode cannot be answered until `F3` resumes the
+  display. TLA+ liveness assumes the user eventually resumes; the implementation
+  cannot force that environmental action.
+- Reasoning inspection is provider-dependent and is not a faithful transcript
+  of hidden model computation. Providers may omit, summarize, redact, or
+  transform reasoning before exposing it.
 - Startup MCP discovery is asynchronous I/O but is not yet multiplexed with
   ordinary composer input. Active model turns and manual compaction are.
 - Cooperative cancellation repairs history and kills subprocesses on drop

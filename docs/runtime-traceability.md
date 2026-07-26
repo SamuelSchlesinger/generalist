@@ -22,11 +22,16 @@ editing, manual save/load/compaction, startup tool discovery, and provider
 selection execute only outside a mutation-capable turn and are reviewed
 separately for that ownership guard. Goal text and other provider payloads are
 hidden data in this model: an idle goal mutation refines a TLA+ stutter step.
+Reasoning-inspector contents and scroll are also hidden display data. Copy-mode
+ownership itself is modeled because it gates all concrete terminal actions:
+while `copyMode` is true, provider/tool progress remains enabled but queue,
+cancel, and permission-choice input is disabled.
 
 ## State mapping
 
 | TLA+ state | Authoritative Rust representation | Review note |
 | --- | --- | --- |
+| `copyMode` | `tui::AppState::copy_mode`, changed only by `TerminalUi::toggle_copy_mode` | It controls terminal ownership/redraw only; no queue, history, permission ID, or turn state moves with the toggle. |
 | `phase` | Control location in `main::drive_started_turn`, `Agent::run_started_turn`, and the permission broker | It is a model program counter, not a second mutable Rust enum that could drift. |
 | `activeTurn` | The one prompt synchronously recorded by `Agent::begin_turn` before the controller pins the sole `&mut Agent` future | The current-thread reactor cannot start another turn until that future returns. |
 | `queue`, `delivery` | `runtime::PromptQueue` containing `QueuedPrompt { id, text, delivery }` | `Rc<RefCell<_>>` is the sole store; `tui::AppState::queue` is a render snapshot only. |
@@ -46,16 +51,19 @@ hidden data in this model: an idle goal mutation refines a TLA+ stutter step.
 | `DeleteQueued` | Queue modal deletion routes the selected stable ID to `PromptQueue::delete`. Restore is the same modeled removal plus a display-only move into an empty composer; it is refused over an existing draft. | `queue_manager_mutations_address_stable_ids`, `restoring_queue_text_never_overwrites_a_draft` |
 | `ReclassifyQueued` | Queue modal `s` calls `PromptQueue::toggle_delivery`; idle cannot create a steer. | `queue_manager_mutations_address_stable_ids`, `ending_turn_normalizes_undelivered_steers` |
 | `MoveQueuedEarlier` | Queue modal Ctrl+Up/Down calls `PromptQueue::move_by` by ID. | `queue_manager_mutations_address_stable_ids` |
+| `EnterCopyMode` | F3 is intercepted before modal/composer dispatch, disables mouse capture, sets `copy_mode`, draws the paused banner once, and then suppresses application input/redraws. | `copy_mode_banner_explains_that_rendering_is_paused`; exact-binary PTY copy test |
+| `ExitCopyMode` | The next F3 reenables mouse capture, clears `copy_mode`, and performs one immediate redraw of state accumulated by the still-polled runtime. | `copy_mode_banner_explains_that_rendering_is_paused`; exact-binary PTY progress test |
 | `DispatchFollowUp` | The idle outer loop calls `claim_follow_up` once; it never scans past a non-follow-up head. | `followups_dispatch_one_at_a_time_in_fifo_order` |
 | `CommitStart` | Without an await, the controller calls `Agent::begin_turn`, commits the `PromptClaim`, and atomically writes the started history plus remaining queue. | `dropped_claim_rolls_back_and_commit_removes`; source-order review in `main` |
 | `RequeueStart` | Dropping an uncommitted `PromptClaim` restores the same ID at the front. Production start is currently infallible between claim and commit; the action over-approximates unwinding and future fallible setup. | `dropped_claim_rolls_back_and_commit_removes` |
-| `ProviderAnswer` | `complete_with_retry` commits a complete assistant response, emits no partial response into history, then reaches the no-tools boundary. Aborted visible deltas receive a display-only uncommitted marker. | `steering_queued_during_final_response_gets_another_model_call`, `provider_cancellation_commits_no_partial_assistant_message`, `cancelling_a_partial_stream_marks_the_visible_text_uncommitted` |
+| `ProviderAnswer` | `complete_with_retry` commits a complete assistant response, emits no partial response into history, then reaches the no-tools boundary. Text and provider-supplied reasoning are separate display deltas; aborted streams receive separate display-only uncommitted markers. | `steering_queued_during_final_response_gets_another_model_call`, `provider_cancellation_commits_no_partial_assistant_message`, `cancelling_a_partial_stream_marks_the_visible_text_uncommitted`, `streamed_text_is_not_double_emitted`, `provider_reasoning_stays_out_of_chat_and_has_a_live_inspector` |
 | `ProviderRefusal` | Refusal pairs any anomalous tool uses with synthetic errors, checkpoints, and returns without accepting steering. | `refusal_with_tool_uses_is_repaired_before_checkpointing` |
 | `ProviderToolBatch` | A committed assistant response is scanned into a finite `tool_uses` vector; one loop iteration is consumed. | `tool_results_are_truncated_in_history`, `iteration_limit_leaves_late_steering_for_controller_normalization` |
 | `CompleteTool` | Tools run sequentially; each outcome becomes one `ToolResult`. Truncation and unknown tools also return structured results. In code mode, an undeclared native call is never started or permission-checked and receives a synthetic error result. | `tool_results_are_truncated_in_history`, `history_survives_api_errors_after_tool_execution`, `code_mode_rejects_unadvertised_direct_tool_calls` |
 | `AskPermission` | `PermissionBrokerPrompt::choose` allocates a monotonic request ID, sends one `PermissionRequest`, and awaits its one-shot. | `broker_correlates_the_ui_reply_with_its_request` |
 | `AllowPermission` | The reactor sends the choice only when the modal ID equals the live request ID; the handler records `AllowAlways` before execution. | `broker_request_ids_keep_out_of_order_replies_correlated`, `memory_handler_remembers_decisions_without_prompting` |
 | `DenyPermission` | A denial becomes a structured denied result. Denials inside code-mode bridge calls propagate through `ScriptResult::denied` even if Python exits successfully. | `dropped_broker_reply_denies_instead_of_hanging`, `denial_inside_code_mode_pauses_the_outer_turn` |
+| `PermissionResolution` (fairness action) | This is the union of allow/deny, not another Rust transition. Both choices are unavailable while F3 owns input and become available again on resume. | broker correlation tests; exact-binary permission-during-copy PTY trace |
 | `ClaimSteering` | At a history-valid boundary, `PromptQueue::claim_steering` removes all visible steers, preserves their relative order, and leaves follow-ups. | `steering_claim_preserves_relative_order_and_followups` |
 | `CommitSteering` | `Agent::commit_steering` appends claimed text to the valid user boundary, commits IDs, emits `SteeringCommitted`, and checkpoints with no await between those operations. | `steering_queued_during_final_response_gets_another_model_call` |
 | `RequeueSteering` | Dropping an uncommitted steering claim restores the same IDs at the front. Normal commit contains no fallible/await boundary. | `dropped_steering_claim_restores_the_same_ids_at_the_front` |
@@ -80,7 +88,8 @@ hidden data in this model: an idle goal mutation refines a TLA+ stutter step.
 | `PermissionIsCorrelated` | IDs are monotonic, choices travel over the request's own one-shot, mismatched modal IDs are ignored, and dropping a reply denies once. |
 | `SettledPromptsAreCommitted` | The controller records the initial user message before `PromptClaim::commit`; interrupted and ordinary outcomes therefore refer to a committed follow-up. |
 | `HistoryOrderHasStableIds` | Queue claims and `SteeringCommitted` preserve stable-ID order. `committedOrder` is a model ghost variable, verified through claim/event tests rather than stored in model-visible text. |
-| `EveryBusyPeriodSettles` | TLC checks weakly fair settlement for the finite bounds. Rust bounds provider rounds/retries and every permission/cancellation wait has a controller resolution path; external tools and providers can still hang until their configured timeout or user cancellation. |
+| `EveryBusyPeriodSettles` | TLC checks settlement for the finite bounds under weakly fair agent progress, weakly fair copy exit, and strongly fair permission resolution when its UI is available infinitely often. Rust bounds provider rounds/retries and keeps polling them during copy mode; permission input waits for resume. External tools/providers, a user who never resumes, or a user who never answers remain environmental blockers. |
+| `CopyModeEventuallyResumes` | `WF_vars(ExitCopyMode)` makes the environmental assumption explicit rather than silently proving liveness through a permanently disabled terminal. The PTY test verifies the concrete exit path; it cannot force a real user to press F3. |
 
 ## Durable-boundary refinement
 
@@ -106,11 +115,15 @@ after execution. Display-only actions are covered by
 - `phase`, lifecycle sets, and committed order are model ghost state. Adding a
   mirrored mutable Rust state machine would create a second authority; review
   instead traces control locations and RAII ownership.
-- Streaming deltas and Ratatui frames are display state. Only a complete
-  provider response enters model history. The event channel is unbounded, but
+- Streaming text/reasoning deltas, reasoning-modal scroll, and Ratatui frames
+  are hidden display state. Copy-mode ownership is modeled separately because
+  it disables user transitions; rendering beneath that ownership remains
+  hidden. Only a complete provider response enters model history. The event
+  channel is unbounded, but
   permission, frame, and terminal branches precede display-event draining and
   frames are batched by the 50 ms tick; a pathological provider can consume
-  memory but cannot indefinitely starve terminal input.
+  memory but cannot indefinitely starve terminal input outside the user's
+  explicit copy-mode pause.
 - Provider tool-name validation is an implementation strengthening outside the
   model's payload abstraction. Code mode advertises only `python`; an undeclared
   response is paired with an error for `ToolHistoryIsValid` but is never exposed
@@ -129,6 +142,11 @@ after execution. Display-only actions are covered by
   that guard. The active goal is host instruction state, not conversation
   history; `active_goal_is_injected_without_entering_conversation_history`
   checks that boundary.
+- Provider reasoning is payload, not control state. The OpenAI-compatible and
+  Anthropic adapters normalize only inspectable text, the TUI keeps it out of
+  conversation rendering, and redacted/signature material is never rendered.
+  `redacted_reasoning_payload_never_reaches_the_inspector` and provider parser
+  tests cover that boundary. This adds no TLA+ action or invariant.
 - TLC's state space is finite and its fingerprint collision probability is
   nonzero. A green run is model evidence, not a proof of Rust refinement or
   external tool termination.
@@ -168,7 +186,11 @@ transition. The review found and corrected:
   rows by total character width, while Ratatui wraps at word boundaries. Both
   conversation and permission-detail bounds now use Ratatui's exact
   `WordWrapper` line count, with a regression that scrolls away from and back to
-  a final marker;
+  a final marker. Screenshot review then exposed a separate presentation bug:
+  the scrollbar received total wrapped rows even though its position was a
+  bounded top-row offset. This left visible track below the thumb at the true
+  bottom. It now receives the number of legal offsets and the viewport length;
+  the regression checks both the final marker and the bottom thumb cell;
 - long queue selections disappearing below a non-stateful list viewport,
   queued-text restore overwriting a composer draft, queue-editor control keys
   inserting literal letters, and same-named saved tool calls displaying swapped
@@ -177,6 +199,14 @@ transition. The review found and corrected:
 - cancelled provider deltas remaining on screen as an apparently committed
   assistant response. `AssistantStreamAborted` now labels them uncommitted while
   durable history remains unchanged;
+- terminal mouse capture preventing native selection/copy, and no inspection
+  path for reasoning fields already exposed by providers. F3 now releases mouse
+  capture and freezes redraws while the same reactor continues progressing;
+  F4 renders provider-supplied reasoning separately, explicitly represents its
+  absence, and never renders signatures or redacted payload data. Reasoning is
+  a hidden payload refinement. Copy ownership is now explicit in TLA+ because
+  the review found that it gates cancellation and permission input and therefore
+  changes the liveness assumptions;
 - idle and spinner-only ticks rebuilding the complete transcript unnecessarily,
   and ordinary agent-event backlog taking priority over terminal input. Dirty
   frames, a 10 FPS spinner, and reactor branch ordering bound the display work;
@@ -185,9 +215,16 @@ transition. The review found and corrected:
   and a shared cleanup path now cover every rendered source and initialization
   error boundary.
 
-After those corrections, TLC explored 256,987 states (56,595 distinct, depth
-26) with no error under `spec/AsyncRuntime.cfg`. This is the baseline to repeat,
-not a permanent certification.
+After copy-mode ownership was added, the first TLC run found a liveness
+counterexample: repeatedly entering and exiting copy mode could keep a
+permission unresolved because permission input was not continuously enabled,
+so weak fairness of combined agent progress did not apply. The model now makes
+both environmental assumptions explicit: weak fairness for exiting copy mode,
+and strong fairness for resolving a permission when its UI is available
+infinitely often. TLC then explored 442,870 states (113,190 distinct, depth 27)
+with no error under `spec/AsyncRuntime.cfg`. This is the current baseline to
+repeat, not a permanent certification or a claim that the program can force a
+human response.
 
 The final PTY review rebuilt the binary and ran it against a deliberately
 stalled local OpenAI-compatible SSE server. While the first response was
@@ -222,3 +259,25 @@ the edited value; a fresh process with no queued work rendered the recovered
 goal, and `/goal clear` persisted `null`. Preparing this run found that generic
 prompt modals treated Ctrl+U as a literal `u`; prompt editing now shares the
 composer's shell-style replacement controls and has deterministic coverage.
+
+The observability review rebuilt the exact binary again and drove it in an
+isolated 100×30 tmux PTY against a two-stage loopback SSE response. F4 displayed
+the first `reasoning_content` fragment as live. Entering F3 emitted terminal
+mouse-capture disable sequences and drew the paused banner once; while that
+frame remained byte-for-byte unchanged, the provider emitted more reasoning
+plus the final answer and the controller committed it to the atomic autosave.
+Keystrokes sent during copy mode did not enter the composer. Exiting F3 emitted
+mouse-capture enable sequences and immediately revealed the accumulated,
+completed reasoning, while the answer remained hidden behind the reasoning
+modal and appeared only after it closed. A subsequent bracketed Unicode
+multiline paste reached the next intercepted user message exactly, and every
+intercepted request still advertised only `python`. The no-reasoning response
+produced the explicit inspector placeholder. Normal exit disabled mouse capture
+and bracketed paste. A final staged response delivered a `python` tool call
+while F3 owned the terminal: the frame stayed frozen and no continuation
+request occurred until F3 resumed, exposed the permission modal, and allow-once
+was answered; only then did the tool result and next provider request appear.
+This concretely exercises the permission/copy-mode fairness boundary identified
+by TLC. A separate 80×24 PTY regression reconfirmed that the final wrapped
+marker and scrollbar thumb reach the real bottom, PageUp pauses, and PageDown
+restores follow-latest.

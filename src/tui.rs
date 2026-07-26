@@ -65,6 +65,14 @@ struct ChatEntry {
     body: String,
 }
 
+#[derive(Debug, Clone)]
+struct ReasoningEntry {
+    timestamp: String,
+    body: String,
+    finished: bool,
+    abort_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivityStatus {
     Running,
@@ -108,6 +116,11 @@ enum Modal {
         selected: usize,
         editing: Option<QueueEditor>,
     },
+    Reasoning {
+        scroll: usize,
+        max_scroll: usize,
+        follow_latest: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +144,10 @@ struct AppState {
     bridge_count: usize,
     context_tokens: u64,
     goal: Option<String>,
+    copy_mode: bool,
     chat: Vec<ChatEntry>,
+    reasoning: Vec<ReasoningEntry>,
+    active_reasoning: Option<usize>,
     activity: Vec<ActivityEntry>,
     active_tools: Vec<(String, usize)>,
     streaming_chat: Option<usize>,
@@ -161,7 +177,10 @@ impl AppState {
             bridge_count: 0,
             context_tokens: 0,
             goal: None,
+            copy_mode: false,
             chat: Vec::new(),
+            reasoning: Vec::new(),
+            active_reasoning: None,
             activity: Vec::new(),
             active_tools: Vec::new(),
             streaming_chat: None,
@@ -208,6 +227,8 @@ impl AppState {
 
     fn clear_conversation(&mut self) {
         self.chat.clear();
+        self.reasoning.clear();
+        self.active_reasoning = None;
         self.activity.clear();
         self.active_tools.clear();
         self.streaming_chat = None;
@@ -228,6 +249,30 @@ impl AppState {
                     ChatKind::Assistant
                 };
                 self.push_chat(kind, text);
+            }
+            if message.role == "assistant" {
+                let reasoning = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                            Some(thinking.as_str())
+                        }
+                        ContentBlock::RedactedThinking { .. } => {
+                            Some("[Provider redacted this reasoning block.]")
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !reasoning.is_empty() {
+                    self.reasoning.push(ReasoningEntry {
+                        timestamp: "saved".to_string(),
+                        body: sanitize_terminal_text(&reasoning),
+                        finished: true,
+                        abort_reason: None,
+                    });
+                }
             }
             for block in &message.content {
                 match block {
@@ -317,6 +362,28 @@ impl AppState {
                 *scroll = scroll.saturating_add(3)
             }
             (
+                Some(Modal::Reasoning {
+                    scroll,
+                    follow_latest,
+                    ..
+                }),
+                MouseEventKind::ScrollUp,
+            ) => {
+                *scroll = scroll.saturating_sub(3);
+                *follow_latest = false;
+            }
+            (
+                Some(Modal::Reasoning {
+                    scroll,
+                    max_scroll,
+                    follow_latest,
+                }),
+                MouseEventKind::ScrollDown,
+            ) => {
+                *scroll = scroll.saturating_add(3).min(*max_scroll);
+                *follow_latest = *scroll == *max_scroll;
+            }
+            (
                 Some(Modal::Queue {
                     selected,
                     editing: None,
@@ -363,15 +430,65 @@ impl AppState {
         }
     }
 
+    fn start_reasoning_attempt(&mut self) {
+        self.reasoning.push(ReasoningEntry {
+            timestamp: Self::timestamp(),
+            body: String::new(),
+            finished: false,
+            abort_reason: None,
+        });
+        self.active_reasoning = self.reasoning.len().checked_sub(1);
+    }
+
+    fn finish_reasoning_attempt(&mut self) {
+        if let Some(index) = self.active_reasoning.take() {
+            if let Some(entry) = self.reasoning.get_mut(index) {
+                entry.finished = true;
+            }
+        }
+    }
+
+    fn push_reasoning_delta(&mut self, reasoning: String) {
+        let reasoning = sanitize_terminal_text(&reasoning);
+        if reasoning.is_empty() {
+            return;
+        }
+        let index = self
+            .active_reasoning
+            .or_else(|| self.reasoning.len().checked_sub(1));
+        let Some(index) = index else {
+            self.start_reasoning_attempt();
+            return self.push_reasoning_delta(reasoning);
+        };
+        if let Some(entry) = self.reasoning.get_mut(index) {
+            entry.body.push_str(&reasoning);
+        }
+    }
+
+    fn abort_reasoning_attempt(&mut self, reason: String) {
+        let reason = sanitize_terminal_text(&reason);
+        let index = self
+            .active_reasoning
+            .take()
+            .or_else(|| self.reasoning.len().checked_sub(1));
+        if let Some(entry) = index.and_then(|index| self.reasoning.get_mut(index)) {
+            entry.finished = true;
+            entry.abort_reason = Some(reason);
+        }
+    }
+
     fn apply_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::ApiCallStarted => {
                 self.busy = true;
                 self.streaming_chat = None;
+                self.finish_reasoning_attempt();
+                self.start_reasoning_attempt();
                 self.status = "Thinking".to_string();
             }
             AgentEvent::ApiCallFinished { usage } => {
                 self.streaming_chat = None;
+                self.finish_reasoning_attempt();
                 self.status = usage
                     .map(|usage| {
                         format!(
@@ -397,6 +514,7 @@ impl AppState {
                     self.streaming_chat = self.chat.len().checked_sub(1);
                 }
             }
+            AgentEvent::ReasoningDelta(reasoning) => self.push_reasoning_delta(reasoning),
             AgentEvent::AssistantStreamAborted { reason } => {
                 let reason = sanitize_terminal_text(&reason);
                 if let Some(index) = self.streaming_chat.take() {
@@ -409,6 +527,7 @@ impl AppState {
                     self.push_info(format!("Uncommitted assistant stream: {reason}"));
                 }
             }
+            AgentEvent::ReasoningStreamAborted { reason } => self.abort_reasoning_attempt(reason),
             AgentEvent::ToolCallStarted { name, input } => {
                 let via_code_mode = name != "python"
                     && self
@@ -641,6 +760,13 @@ impl TerminalUi {
     }
 
     pub fn draw(&mut self) -> io::Result<()> {
+        if self.app.copy_mode {
+            return Ok(());
+        }
+        self.draw_now()
+    }
+
+    fn draw_now(&mut self) -> io::Result<()> {
         let app = &mut self.app;
         self.terminal.draw(|frame| render(frame, app))?;
         self.dirty = false;
@@ -648,7 +774,7 @@ impl TerminalUi {
     }
 
     pub fn draw_if_dirty(&mut self) -> io::Result<()> {
-        if self.dirty {
+        if self.dirty && !self.app.copy_mode {
             self.draw()?;
         }
         Ok(())
@@ -673,6 +799,39 @@ impl TerminalUi {
             // when the only visual change is the spinner.
             self.dirty |= self.app.spinner_tick.is_multiple_of(2);
         }
+    }
+
+    fn toggle_copy_mode(&mut self) -> io::Result<()> {
+        if self.app.copy_mode {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)?;
+            self.app.copy_mode = false;
+            self.dirty = true;
+            self.draw_now()
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)?;
+            self.app.copy_mode = true;
+            self.dirty = true;
+            if let Err(error) = self.draw_now() {
+                self.app.copy_mode = false;
+                let _ = execute!(self.terminal.backend_mut(), EnableMouseCapture);
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+
+    /// Toggle copy mode on F3 and suppress application input while it is
+    /// active. The terminal keeps its native copy shortcuts; only the TUI's
+    /// mouse capture and redraws are suspended.
+    fn copy_mode_owns_event(&mut self, event: &Event) -> io::Result<bool> {
+        if matches!(
+            event,
+            Event::Key(key) if is_key_press(*key) && key.code == KeyCode::F(3)
+        ) {
+            self.toggle_copy_mode()?;
+            return Ok(true);
+        }
+        Ok(self.app.copy_mode)
     }
 
     pub fn set_session(&mut self, api: &str, model: &str, bridge_count: usize) {
@@ -817,6 +976,9 @@ impl TerminalUi {
                 _ = ticker.tick() => self.tick(),
                 event = self.next_event() => {
                     let event = event?;
+                    if self.copy_mode_owns_event(&event)? {
+                        continue;
+                    }
                     self.dirty = true;
                     if let Event::Key(key) = event {
                         if is_key_press(key)
@@ -852,6 +1014,9 @@ impl TerminalUi {
                 _ = ticker.tick() => self.tick(),
                 event = self.next_event() => {
                     let event = event?;
+                    if self.copy_mode_owns_event(&event)? {
+                        continue;
+                    }
                     self.dirty = true;
                     let Event::Key(key) = event else {
                         self.draw_if_dirty()?;
@@ -910,8 +1075,12 @@ impl TerminalUi {
             tokio::select! {
                 _ = ticker.tick() => self.tick(),
                 event = self.next_event() => {
+                    let event = event?;
+                    if self.copy_mode_owns_event(&event)? {
+                        continue;
+                    }
                     self.dirty = true;
-                    match event? {
+                    match event {
                         Event::Paste(text) => {
                             let Modal::Prompt { value, cursor, .. } =
                                 self.app.modal.as_mut().expect("prompt modal")
@@ -948,9 +1117,12 @@ impl TerminalUi {
         }
     }
 
-    pub fn handle_event(&mut self, event: Event, queue: &PromptQueue) -> UiAction {
+    pub fn handle_event(&mut self, event: Event, queue: &PromptQueue) -> io::Result<UiAction> {
+        if self.copy_mode_owns_event(&event)? {
+            return Ok(UiAction::None);
+        }
         self.dirty = true;
-        match event {
+        Ok(match event {
             Event::Key(key) if is_key_press(key) => self.handle_key(key, queue),
             Event::Paste(text) => {
                 if let Some(Modal::Queue {
@@ -970,7 +1142,7 @@ impl TerminalUi {
             }
             Event::Resize(_, _) => UiAction::None,
             _ => UiAction::None,
-        }
+        })
     }
 
     fn handle_key(&mut self, key: KeyEvent, queue: &PromptQueue) -> UiAction {
@@ -986,6 +1158,7 @@ impl TerminalUi {
             }
             Some(Modal::Permission { .. }) => return self.handle_permission_key(key),
             Some(Modal::Queue { .. }) => return self.handle_queue_key(key, queue),
+            Some(Modal::Reasoning { .. }) => return self.handle_reasoning_key(key),
             Some(Modal::Select { .. } | Modal::Prompt { .. }) => return UiAction::None,
             None => {}
         }
@@ -1104,6 +1277,14 @@ impl TerminalUi {
                 });
                 UiAction::None
             }
+            KeyCode::F(4) => {
+                self.app.modal = Some(Modal::Reasoning {
+                    scroll: 0,
+                    max_scroll: 0,
+                    follow_latest: true,
+                });
+                UiAction::None
+            }
             _ => UiAction::None,
         }
     }
@@ -1114,6 +1295,53 @@ impl TerminalUi {
             return UiAction::None;
         }
         UiAction::Submit { text, delivery }
+    }
+
+    fn handle_reasoning_key(&mut self, key: KeyEvent) -> UiAction {
+        let Some(Modal::Reasoning {
+            mut scroll,
+            max_scroll,
+            mut follow_latest,
+        }) = self.app.modal.take()
+        else {
+            return UiAction::None;
+        };
+
+        match key.code {
+            KeyCode::F(4) | KeyCode::Esc | KeyCode::Enter => return UiAction::None,
+            KeyCode::PageUp => {
+                scroll = scroll.saturating_sub(10);
+                follow_latest = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                scroll = scroll.saturating_sub(1);
+                follow_latest = false;
+            }
+            KeyCode::PageDown => {
+                scroll = scroll.saturating_add(10).min(max_scroll);
+                follow_latest = scroll == max_scroll;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                scroll = scroll.saturating_add(1).min(max_scroll);
+                follow_latest = scroll == max_scroll;
+            }
+            KeyCode::Home => {
+                scroll = 0;
+                follow_latest = false;
+            }
+            KeyCode::End => {
+                scroll = max_scroll;
+                follow_latest = true;
+            }
+            _ => {}
+        }
+
+        self.app.modal = Some(Modal::Reasoning {
+            scroll,
+            max_scroll,
+            follow_latest,
+        });
+        UiAction::None
     }
 
     fn handle_permission_key(&mut self, key: KeyEvent) -> UiAction {
@@ -1393,7 +1621,7 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     render_input(frame, app, input_area);
     render_footer(frame, app, footer_area);
     if let Some(modal) = &mut app.modal {
-        render_modal(frame, modal, &app.queue);
+        render_modal(frame, modal, &app.queue, &app.reasoning);
     }
 }
 
@@ -1495,7 +1723,14 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut AppState, area: Rect) {
     );
 
     if max_scroll > 0 && inner.width > 2 {
-        let mut scrollbar_state = ScrollbarState::new(total_lines).position(scroll);
+        // ScrollbarState treats `content_length - 1` as the greatest legal
+        // position. Our position is a bounded top-row offset whose greatest
+        // value is `max_scroll`, not `total_lines - 1`. Passing total_lines
+        // leaves track below the thumb at the true bottom and falsely suggests
+        // that more conversation is hidden.
+        let mut scrollbar_state = ScrollbarState::new(max_scroll.saturating_add(1))
+            .position(scroll)
+            .viewport_content_length(visible);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
@@ -1625,7 +1860,7 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         Paragraph::new(input).style(Style::default().bg(PANEL_ALT)),
         inner,
     );
-    if app.modal.is_none() {
+    if app.modal.is_none() && !app.copy_mode {
         frame.set_cursor_position(Position::new(
             inner.x + cursor_x.min(inner.width.saturating_sub(1)),
             inner.y,
@@ -1635,7 +1870,9 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 
 fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let command_hint;
-    let left = if app.input.trim_start().starts_with('/') {
+    let left = if app.copy_mode {
+        " F3 resume · select text · use your terminal's copy shortcut"
+    } else if app.input.trim_start().starts_with('/') {
         command_hint = format!(
             " {}",
             COMMAND_SPECS
@@ -1646,11 +1883,13 @@ fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         );
         command_hint.as_str()
     } else if app.busy {
-        " F1 help  F2 queue  Alt+↑ restore  Esc/Ctrl+C interrupt"
+        " F1 help  F2 queue  F3 copy  F4 reasoning  Esc/Ctrl+C interrupt"
     } else {
-        " F1 help  F2 queue  Alt+↑ restore  Ctrl+C quit"
+        " F1 help  F2 queue  F3 copy  F4 reasoning  Ctrl+C quit"
     };
-    let right = if app.follow_latest {
+    let right = if app.copy_mode {
+        "display paused "
+    } else if app.follow_latest {
         "following latest "
     } else {
         "scroll paused "
@@ -1669,7 +1908,12 @@ fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     );
 }
 
-fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal, queue: &[QueuedPrompt]) {
+fn render_modal(
+    frame: &mut Frame<'_>,
+    modal: &mut Modal,
+    queue: &[QueuedPrompt],
+    reasoning: &[ReasoningEntry],
+) {
     match modal {
         Modal::Help => render_help(frame),
         Modal::Select {
@@ -1691,6 +1935,11 @@ fn render_modal(frame: &mut Frame<'_>, modal: &mut Modal, queue: &[QueuedPrompt]
         Modal::Queue { selected, editing } => {
             render_queue(frame, queue, *selected, editing.as_ref())
         }
+        Modal::Reasoning {
+            scroll,
+            max_scroll,
+            follow_latest,
+        } => render_reasoning(frame, reasoning, scroll, max_scroll, follow_latest),
     }
 }
 
@@ -1747,6 +1996,7 @@ fn render_help(frame: &mut Frame<'_>) {
         Line::from(Span::styled("Editor", Style::default().fg(CYAN).bold())),
         Line::from("  Ctrl+A/E home/end · Ctrl+U clear · Ctrl+W delete word"),
         Line::from("  PgUp/PgDn scroll conversation · mouse wheel also works"),
+        Line::from("  F3 native terminal copy mode · F4 provider reasoning"),
     ];
     frame.render_widget(
         Paragraph::new(shortcut_lines)
@@ -1758,6 +2008,71 @@ fn render_help(frame: &mut Frame<'_>) {
         Paragraph::new("Esc, Enter, or F1 closes this window")
             .alignment(Alignment::Center)
             .style(Style::default().fg(MUTED).bg(PANEL_ALT)),
+        hint_area,
+    );
+}
+
+fn render_reasoning(
+    frame: &mut Frame<'_>,
+    entries: &[ReasoningEntry],
+    scroll: &mut usize,
+    max_scroll: &mut usize,
+    follow_latest: &mut bool,
+) {
+    let area = centered(frame.area(), 92, 88, 70, 20);
+    frame.render_widget(Clear, area);
+    let block = modal_block(" Model reasoning · provider supplied ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [content_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let paragraph = Paragraph::new(reasoning_text(entries))
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(TEXT).bg(PANEL_ALT));
+    let width = content_area.width.max(1);
+    let visible = content_area.height as usize;
+    let total_lines = paragraph.line_count(width);
+    *max_scroll = total_lines.saturating_sub(visible);
+    if *follow_latest {
+        *scroll = *max_scroll;
+    } else {
+        *scroll = (*scroll).min(*max_scroll);
+        if *scroll == *max_scroll {
+            *follow_latest = true;
+        }
+    }
+    frame.render_widget(
+        paragraph.scroll(((*scroll).min(u16::MAX as usize) as u16, 0)),
+        content_area,
+    );
+
+    if *max_scroll > 0 && content_area.width > 2 {
+        let mut scrollbar_state = ScrollbarState::new(max_scroll.saturating_add(1))
+            .position(*scroll)
+            .viewport_content_length(visible);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_symbol("▐")
+                .track_symbol(Some("│")),
+            content_area,
+            &mut scrollbar_state,
+        );
+    }
+
+    let status = if *follow_latest {
+        "following latest"
+    } else {
+        "scroll paused"
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "F4/Esc close · ↑/↓/PgUp/PgDn scroll · F3 copy · {status}"
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(MUTED).bg(PANEL_ALT)),
         hint_area,
     );
 }
@@ -2055,6 +2370,64 @@ fn chat_text(entries: &[ChatEntry]) -> Text<'static> {
             "Start a conversation below. Tool calls will appear in the activity panel.",
             Style::default().fg(MUTED),
         )));
+    }
+    Text::from(lines)
+}
+
+fn reasoning_text(entries: &[ReasoningEntry]) -> Text<'static> {
+    if entries.is_empty() {
+        return Text::from(vec![
+            Line::from(Span::styled(
+                "No model requests have exposed inspectable reasoning in this session.",
+                Style::default().fg(MUTED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "This view shows only reasoning fields supplied by the configured provider.",
+                Style::default().fg(MUTED),
+            )),
+        ]);
+    }
+
+    let mut lines = Vec::<Line<'static>>::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let (status, color) = if entry.finished {
+            ("complete", GREEN)
+        } else {
+            ("live", YELLOW)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("REQUEST {}  ", index + 1),
+                Style::default().fg(PURPLE).bold(),
+            ),
+            Span::styled(entry.timestamp.clone(), Style::default().fg(MUTED)),
+            Span::styled(format!("  {status}"), Style::default().fg(color).bold()),
+        ]));
+
+        if entry.body.is_empty() {
+            let message = if entry.finished {
+                "  Provider supplied no inspectable reasoning for this request."
+            } else {
+                "  Waiting for provider-supplied reasoning…"
+            };
+            lines.push(Line::from(Span::styled(
+                message,
+                Style::default().fg(MUTED),
+            )));
+        } else {
+            lines.extend(entry.body.lines().map(|line| {
+                Line::from(Span::styled(format!("  {line}"), Style::default().fg(TEXT)))
+            }));
+        }
+
+        if let Some(reason) = &entry.abort_reason {
+            lines.push(Line::from(Span::styled(
+                format!("  Stream ended before commit: {reason}"),
+                Style::default().fg(RED),
+            )));
+        }
+        lines.push(Line::from(""));
     }
     Text::from(lines)
 }
@@ -2627,6 +3000,97 @@ mod tests {
     }
 
     #[test]
+    fn provider_reasoning_stays_out_of_chat_and_has_a_live_inspector() {
+        let mut app = AppState::new("OpenAI-compatible", "qwen");
+        app.apply_agent_event(AgentEvent::ApiCallStarted);
+        app.apply_agent_event(AgentEvent::ReasoningDelta("inspect the evidence".into()));
+        app.apply_agent_event(AgentEvent::AssistantTextDelta("final answer".into()));
+        app.apply_agent_event(AgentEvent::ApiCallFinished { usage: None });
+
+        assert_eq!(app.chat.len(), 1);
+        assert_eq!(app.chat[0].body, "final answer");
+        assert_eq!(app.reasoning.len(), 1);
+        assert_eq!(app.reasoning[0].body, "inspect the evidence");
+        assert!(app.reasoning[0].finished);
+
+        app.modal = Some(Modal::Reasoning {
+            scroll: 0,
+            max_scroll: 0,
+            follow_latest: true,
+        });
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Model reasoning"));
+        assert!(rendered.contains("inspect the evidence"));
+        assert!(rendered.contains("complete"));
+        assert!(!chat_text(&app.chat)
+            .to_string()
+            .contains("inspect the evidence"));
+    }
+
+    #[test]
+    fn reasoning_inspector_is_explicit_when_provider_supplies_nothing() {
+        let mut app = AppState::new("api", "model");
+        app.apply_agent_event(AgentEvent::ApiCallStarted);
+        app.apply_agent_event(AgentEvent::ApiCallFinished { usage: None });
+        app.modal = Some(Modal::Reasoning {
+            scroll: 0,
+            max_scroll: 0,
+            follow_latest: true,
+        });
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(terminal
+            .backend()
+            .to_string()
+            .contains("Provider supplied no inspectable reasoning"));
+    }
+
+    #[test]
+    fn redacted_reasoning_payload_never_reaches_the_inspector() {
+        let secret = "provider-private-redacted-payload";
+        let history = vec![Message::assistant(vec![
+            ContentBlock::RedactedThinking {
+                data: secret.to_string(),
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ])];
+        let mut app = AppState::new("api", "model");
+        app.load_history(&history);
+        app.modal = Some(Modal::Reasoning {
+            scroll: 0,
+            max_scroll: 0,
+            follow_latest: true,
+        });
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Provider redacted this reasoning block"));
+        assert!(!rendered.contains(secret));
+    }
+
+    #[test]
+    fn copy_mode_banner_explains_that_rendering_is_paused() {
+        let mut app = AppState::new("api", "model");
+        app.copy_mode = true;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("F3 resume"));
+        assert!(rendered.contains("select text"));
+        assert!(rendered.contains("display paused"));
+    }
+
+    #[test]
     fn streaming_and_nested_tools_update_existing_entries() {
         let mut app = AppState::new("OpenAI-compatible", "qwen");
         app.apply_agent_event(AgentEvent::ApiCallStarted);
@@ -2730,6 +3194,16 @@ mod tests {
             terminal.backend().to_string().contains("BOTTOM-MARKER"),
             "follow-latest stopped above Ratatui's word-wrapped bottom"
         );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((30, 8))
+                .expect("bottom scrollbar cell")
+                .symbol(),
+            "▐",
+            "the scrollbar must visually reach the bottom with follow-latest active"
+        );
 
         app.scroll_chat_up(usize::MAX);
         terminal
@@ -2746,6 +3220,16 @@ mod tests {
         assert!(
             terminal.backend().to_string().contains("BOTTOM-MARKER"),
             "scroll-down stopped above Ratatui's word-wrapped bottom"
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((30, 8))
+                .expect("bottom scrollbar cell")
+                .symbol(),
+            "▐",
+            "the scrollbar must return to the bottom after scrolling down"
         );
     }
 
@@ -2798,6 +3282,11 @@ mod tests {
             Some(Modal::Queue {
                 selected: 0,
                 editing: None,
+            }),
+            Some(Modal::Reasoning {
+                scroll: 0,
+                max_scroll: usize::MAX,
+                follow_latest: true,
             }),
         ];
         for (width, height) in [(1, 1), (8, 3), (24, 8), (60, 16)] {

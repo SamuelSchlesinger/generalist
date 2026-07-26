@@ -71,7 +71,8 @@ impl Message {
 /// snake_case variants); the OpenAI provider translates as needed. The
 /// `Thinking`/`RedactedThinking` variants exist so reasoning blocks returned
 /// by a model can be replayed unchanged on subsequent requests, which some
-/// providers require.
+/// providers require. A `Thinking` block with an empty signature is inspectable
+/// reasoning from a compatible provider, not a replayable Anthropic block.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -164,6 +165,17 @@ pub struct CompletionResponse {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
     pub usage: Option<Usage>,
+}
+
+/// One inspectable fragment emitted while a provider response streams.
+///
+/// Reasoning is provider-supplied model output, not host inference. Providers
+/// that do not expose reasoning simply emit no [`CompletionDelta::Reasoning`]
+/// values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionDelta {
+    Text(String),
+    Reasoning(String),
 }
 
 /// Rough token estimate for messages: serialized length / 4.

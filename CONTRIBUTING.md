@@ -23,7 +23,8 @@ architecture prose that can be updated from memory.
 
 For every change touching `src/main.rs`, `src/command.rs`, `src/tui.rs`,
 `src/runtime.rs`, `src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`,
-`src/tool.rs`, or queue/goal-bearing persistence in `src/state.rs`:
+`src/tool.rs`, `src/provider/`, `src/types.rs`, or queue/goal-bearing
+persistence in `src/state.rs`:
 
 1. Read the changed Rust paths and the entire TLA+ action they refine. Do not
    infer equivalence from names.
@@ -48,13 +49,20 @@ For every change touching `src/main.rs`, `src/command.rs`, `src/tui.rs`,
    the composer, enqueue both delivery modes, edit/reorder/delete the queue,
    rapidly scroll a long transcript, answer or cancel a permission request, and
    interrupt the turn. Confirm that display-only scrolling does not change the
-   autosave, then confirm the subsequent provider request and queue-changing
-   autosave, not only the rendered frame. Never infer PTY coverage from a
-   pre-existing `target/` binary.
+   autosave, that the scrollbar thumb reaches the end precisely when the final
+   content row is visible, then confirm the subsequent provider request and
+   queue-changing autosave, not only the rendered frame. Never infer PTY
+   coverage from a pre-existing `target/` binary.
    Include a bursty streaming response, a queue longer than the modal, a draft
    beneath restore, and a resize below the normal layout. On exit, verify raw
    mode, echo/canonical input, bracketed paste, and the alternate screen were
-   restored.
+   restored. Exercise `F3` while the fake provider advances: mouse selection
+   must work, the captured frame must stay frozen, and the accumulated state
+   must appear after `F3` resumes. Inject a bracketed Unicode paste after
+   resuming and inspect the intercepted request. Exercise `F4` both with live
+   provider reasoning and with no reasoning field; answer text must stay out of
+   the inspector, reasoning must stay out of conversation text, and provider
+   signatures/redacted payloads must never render.
 8. Run `make check`, inspect the complete diff, and repeat the trace for any
    fix made during validation.
 
@@ -74,7 +82,11 @@ Pay particular attention to the races that have found real defects before:
   into the obscured conversation;
 - partial streamed text appearing committed after cancellation, untrusted
   control bytes reaching the terminal, and startup-error paths skipping terminal
-  cleanup.
+  cleanup;
+- copy mode accidentally pausing the runtime, redrawing over native selection,
+  or consuming pasted text; reasoning fields leaking into answer text, replaying
+  unsigned reasoning to a different provider, or exposing signature/redaction
+  payloads.
 
 The checked-in pre-commit hook always presents this exact acknowledgement:
 

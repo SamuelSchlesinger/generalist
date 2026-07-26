@@ -81,6 +81,6 @@ pub use runtime::{
 pub use state::SavedState;
 pub use tool::{Tool, ToolCallOutcome, ToolCallResult, ToolRegistry};
 pub use types::{
-    estimate_tokens, truncate_middle, CompletionRequest, CompletionResponse, ContentBlock, Message,
-    StopReason, ToolDef, ToolUse, Usage,
+    estimate_tokens, truncate_middle, CompletionDelta, CompletionRequest, CompletionResponse,
+    ContentBlock, Message, StopReason, ToolDef, ToolUse, Usage,
 };

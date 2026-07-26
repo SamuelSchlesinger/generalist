@@ -21,7 +21,8 @@ use crate::provider::Provider;
 use crate::runtime::{QueuedPrompt, TurnControl};
 use crate::tool::{ToolCallOutcome, ToolCallResult, ToolRegistry};
 use crate::types::{
-    estimate_tokens, truncate_middle, CompletionRequest, ContentBlock, Message, StopReason, Usage,
+    estimate_tokens, truncate_middle, CompletionDelta, CompletionRequest, ContentBlock, Message,
+    StopReason, Usage,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -35,6 +36,27 @@ fn cancelled_tool_result(tool_use_id: String) -> ContentBlock {
             .to_string(),
         tool_use_id,
         is_error: Some(true),
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct StreamedKinds {
+    text: bool,
+    reasoning: bool,
+}
+
+fn emit_stream_aborted(
+    on_event: &mut dyn FnMut(AgentEvent),
+    streamed: StreamedKinds,
+    reason: String,
+) {
+    if streamed.text {
+        on_event(AgentEvent::AssistantStreamAborted {
+            reason: reason.clone(),
+        });
+    }
+    if streamed.reasoning {
+        on_event(AgentEvent::ReasoningStreamAborted { reason });
     }
 }
 
@@ -53,9 +75,15 @@ pub enum AgentEvent {
     /// A streamed fragment of assistant text. Render incrementally; a final
     /// `ApiCallFinished` closes the message.
     AssistantTextDelta(String),
+    /// A provider-supplied reasoning fragment. This is inspectable UI data,
+    /// not assistant-visible conversation text.
+    ReasoningDelta(String),
     /// A provider attempt emitted visible deltas but failed or was cancelled
     /// before a complete response could enter conversation history.
     AssistantStreamAborted { reason: String },
+    /// A provider attempt emitted reasoning but failed or was cancelled before
+    /// that reasoning could enter committed history.
+    ReasoningStreamAborted { reason: String },
     /// A tool call is about to be checked for permission and executed.
     /// Emitted *before* execution so the user always sees the input first.
     ToolCallStarted { name: String, input: Value },
@@ -312,7 +340,17 @@ impl Agent {
             self.history
                 .push(Message::assistant(response.content.clone()));
 
-            if !streamed {
+            if !streamed.reasoning {
+                for block in &response.content {
+                    if let ContentBlock::Thinking { thinking, .. } = block {
+                        if !thinking.is_empty() {
+                            on_event(AgentEvent::ReasoningDelta(thinking.clone()));
+                        }
+                    }
+                }
+            }
+
+            if !streamed.text {
                 for block in &response.content {
                     if let ContentBlock::Text { text } = block {
                         if !text.is_empty() {
@@ -736,7 +774,7 @@ impl Agent {
         &self,
         on_event: &mut dyn FnMut(AgentEvent),
         control: &mut TurnControl,
-    ) -> Result<Option<(crate::types::CompletionResponse, bool)>> {
+    ) -> Result<Option<(crate::types::CompletionResponse, StreamedKinds)>> {
         let tools = self.model_tool_defs();
         let system_prompt = self.effective_system_prompt();
         let mut attempt: u32 = 0;
@@ -748,11 +786,17 @@ impl Agent {
                 tools: &tools,
                 max_tokens: self.max_tokens,
             };
-            let mut streamed = false;
+            let mut streamed = StreamedKinds::default();
             let maybe_result = {
-                let mut forward = |text: String| {
-                    streamed = true;
-                    on_event(AgentEvent::AssistantTextDelta(text));
+                let mut forward = |delta: CompletionDelta| match delta {
+                    CompletionDelta::Text(text) => {
+                        streamed.text = true;
+                        on_event(AgentEvent::AssistantTextDelta(text));
+                    }
+                    CompletionDelta::Reasoning(reasoning) => {
+                        streamed.reasoning = true;
+                        on_event(AgentEvent::ReasoningDelta(reasoning));
+                    }
                 };
                 let completion = self.provider.complete_streaming(request, &mut forward);
                 tokio::pin!(completion);
@@ -762,11 +806,11 @@ impl Agent {
                 }
             };
             let Some(result) = maybe_result else {
-                if streamed {
-                    on_event(AgentEvent::AssistantStreamAborted {
-                        reason: "interrupted before the response was committed".to_string(),
-                    });
-                }
+                emit_stream_aborted(
+                    on_event,
+                    streamed,
+                    "interrupted before the response was committed".to_string(),
+                );
                 on_event(AgentEvent::ApiCallFinished { usage: None });
                 return Ok(None);
             };
@@ -778,11 +822,11 @@ impl Agent {
                     return Ok(Some((response, streamed)));
                 }
                 Err(e) if e.is_retryable() && attempt < self.max_retries => {
-                    if streamed {
-                        on_event(AgentEvent::AssistantStreamAborted {
-                            reason: format!("stream failed before it was committed: {e}"),
-                        });
-                    }
+                    emit_stream_aborted(
+                        on_event,
+                        streamed,
+                        format!("stream failed before it was committed: {e}"),
+                    );
                     on_event(AgentEvent::ApiCallFinished { usage: None });
                     let delay_secs = 1u64 << attempt; // 1, 2, 4 ...
                     on_event(AgentEvent::Retrying {
@@ -798,11 +842,11 @@ impl Agent {
                     attempt += 1;
                 }
                 Err(e) => {
-                    if streamed {
-                        on_event(AgentEvent::AssistantStreamAborted {
-                            reason: format!("stream failed before it was committed: {e}"),
-                        });
-                    }
+                    emit_stream_aborted(
+                        on_event,
+                        streamed,
+                        format!("stream failed before it was committed: {e}"),
+                    );
                     on_event(AgentEvent::ApiCallFinished { usage: None });
                     return Err(e);
                 }
@@ -1293,9 +1337,9 @@ mod tests {
         async fn complete_streaming(
             &self,
             _request: CompletionRequest<'_>,
-            on_delta: &mut dyn FnMut(String),
+            on_delta: &mut dyn FnMut(CompletionDelta),
         ) -> Result<CompletionResponse> {
-            on_delta("visible but uncommitted".to_string());
+            on_delta(CompletionDelta::Text("visible but uncommitted".to_string()));
             self.started.notify_one();
             std::future::pending::<Result<CompletionResponse>>().await
         }
@@ -1815,27 +1859,48 @@ except Exception as e:
             async fn complete_streaming(
                 &self,
                 _r: CompletionRequest<'_>,
-                on_delta: &mut dyn FnMut(String),
+                on_delta: &mut dyn FnMut(CompletionDelta),
             ) -> Result<CompletionResponse> {
-                on_delta("hel".to_string());
-                on_delta("lo".to_string());
-                Ok(text_response("hello"))
+                on_delta(CompletionDelta::Reasoning("because ".to_string()));
+                on_delta(CompletionDelta::Reasoning("evidence".to_string()));
+                on_delta(CompletionDelta::Text("hel".to_string()));
+                on_delta(CompletionDelta::Text("lo".to_string()));
+                Ok(CompletionResponse {
+                    content: vec![
+                        ContentBlock::Thinking {
+                            thinking: "because evidence".to_string(),
+                            signature: String::new(),
+                        },
+                        ContentBlock::Text {
+                            text: "hello".to_string(),
+                        },
+                    ],
+                    stop_reason: StopReason::EndTurn,
+                    usage: None,
+                })
             }
         }
 
         let mut agent = Agent::new(Box::new(Streamy), ToolRegistry::new(), "test");
         let mut deltas = String::new();
+        let mut reasoning = String::new();
         let mut full_blocks = 0;
         agent
             .run_turn("hi", &mut |event| match event {
                 AgentEvent::AssistantTextDelta(t) => deltas.push_str(&t),
+                AgentEvent::ReasoningDelta(t) => reasoning.push_str(&t),
                 AgentEvent::AssistantText(_) => full_blocks += 1,
                 _ => {}
             })
             .await
             .unwrap();
         assert_eq!(deltas, "hello");
+        assert_eq!(reasoning, "because evidence");
         assert_eq!(full_blocks, 0, "streamed text must not be re-emitted whole");
+        assert!(matches!(
+            agent.history[1].content[0],
+            ContentBlock::Thinking { .. }
+        ));
     }
 
     #[tokio::test]

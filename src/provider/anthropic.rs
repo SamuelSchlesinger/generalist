@@ -2,7 +2,9 @@
 
 use crate::error::{Error, Result};
 use crate::provider::Provider;
-use crate::types::{CompletionRequest, CompletionResponse, ContentBlock, StopReason, Usage};
+use crate::types::{
+    CompletionDelta, CompletionRequest, CompletionResponse, ContentBlock, StopReason, Usage,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -51,26 +53,40 @@ impl AnthropicProvider {
     /// the last block of the last message, so each turn extends the cached
     /// prefix instead of re-reading the whole conversation at full price.
     fn build_body(&self, req: &CompletionRequest<'_>) -> Result<Value> {
-        let last_msg = req.messages.len().saturating_sub(1);
         let mut messages = Vec::with_capacity(req.messages.len());
-        for (i, message) in req.messages.iter().enumerate() {
-            let mut content: Vec<Value> = message
+        for message in req.messages {
+            let content: Vec<Value> = message
                 .content
                 .iter()
+                // Signed Anthropic thinking blocks must be replayed unchanged.
+                // OpenAI-compatible reasoning extensions are stored in the
+                // same neutral variant with an empty signature so the TUI can
+                // inspect and persist them, but they are not valid Anthropic
+                // input after a provider switch.
+                .filter(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Thinking { signature, .. } if signature.is_empty()
+                    )
+                })
                 .map(serde_json::to_value)
                 .collect::<std::result::Result<_, _>>()?;
-            if i == last_msg {
-                if let Some(block) = content.last_mut() {
-                    let cacheable = matches!(
-                        block.get("type").and_then(|t| t.as_str()),
-                        Some("text") | Some("tool_use") | Some("tool_result")
-                    );
-                    if cacheable {
-                        block["cache_control"] = json!({"type": "ephemeral"});
-                    }
-                }
+            if !content.is_empty() {
+                messages.push(json!({"role": message.role, "content": content}));
             }
-            messages.push(json!({"role": message.role, "content": content}));
+        }
+        if let Some(block) = messages
+            .last_mut()
+            .and_then(|message| message["content"].as_array_mut())
+            .and_then(|content| content.last_mut())
+        {
+            let cacheable = matches!(
+                block.get("type").and_then(|t| t.as_str()),
+                Some("text") | Some("tool_use") | Some("tool_result")
+            );
+            if cacheable {
+                block["cache_control"] = json!({"type": "ephemeral"});
+            }
         }
 
         let mut body = json!({
@@ -146,8 +162,9 @@ struct StreamState {
 }
 
 impl StreamState {
-    /// Apply one SSE event; returns any user-visible text delta.
-    fn apply(&mut self, event: &Value) -> Result<Option<String>> {
+    /// Apply one SSE event; returns every inspectable delta it contains.
+    fn apply(&mut self, event: &Value) -> Result<Vec<CompletionDelta>> {
+        let mut emitted = Vec::new();
         match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "message_start" => {
                 if let Some(usage) = event.pointer("/message/usage") {
@@ -171,10 +188,10 @@ impl StreamState {
             "content_block_delta" => {
                 let index = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 let Some(delta) = event.get("delta") else {
-                    return Ok(None);
+                    return Ok(emitted);
                 };
                 if index >= self.blocks.len() {
-                    return Ok(None);
+                    return Ok(emitted);
                 }
                 match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                     "text_delta" => {
@@ -185,7 +202,9 @@ impl StreamState {
                         {
                             self.blocks[index]["text"] = json!(existing + text);
                         }
-                        return Ok(Some(text.to_string()));
+                        if !text.is_empty() {
+                            emitted.push(CompletionDelta::Text(text.to_string()));
+                        }
                     }
                     "input_json_delta" => {
                         let fragment = delta
@@ -201,6 +220,9 @@ impl StreamState {
                             .and_then(|t| t.as_str().map(String::from))
                         {
                             self.blocks[index]["thinking"] = json!(existing + fragment);
+                        }
+                        if !fragment.is_empty() {
+                            emitted.push(CompletionDelta::Reasoning(fragment.to_string()));
                         }
                     }
                     "signature_delta" => {
@@ -242,7 +264,7 @@ impl StreamState {
             // ping / content_block_stop / message_stop carry no state we need.
             _ => {}
         }
-        Ok(None)
+        Ok(emitted)
     }
 
     fn into_response(mut self) -> CompletionResponse {
@@ -322,7 +344,7 @@ impl Provider for AnthropicProvider {
     async fn complete_streaming(
         &self,
         request: CompletionRequest<'_>,
-        on_delta: &mut dyn FnMut(String),
+        on_delta: &mut dyn FnMut(CompletionDelta),
     ) -> Result<CompletionResponse> {
         let mut body = self.build_body(&request)?;
         body["stream"] = json!(true);
@@ -365,8 +387,8 @@ impl Provider for AnthropicProvider {
                     if event.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
                         saw_message_stop = true;
                     }
-                    if let Some(text) = state.apply(&event)? {
-                        on_delta(text);
+                    for delta in state.apply(&event)? {
+                        on_delta(delta);
                     }
                 }
             }
@@ -376,8 +398,8 @@ impl Provider for AnthropicProvider {
                 if event.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
                     saw_message_stop = true;
                 }
-                if let Some(text) = state.apply(&event)? {
-                    on_delta(text);
+                for delta in state.apply(&event)? {
+                    on_delta(delta);
                 }
             }
         }
@@ -419,7 +441,24 @@ mod tests {
 
     #[test]
     fn body_adds_cache_breakpoints_and_thinking() {
-        let messages = vec![Message::user_text("hi")];
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::Thinking {
+                thinking: "unsigned-only compatible reasoning".into(),
+                signature: String::new(),
+            }]),
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "unsigned compatible reasoning".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Thinking {
+                    thinking: "signed Anthropic reasoning".into(),
+                    signature: "signature".into(),
+                },
+                ContentBlock::Text { text: "hi".into() },
+            ]),
+            Message::user_text("continue"),
+        ];
         let tools = vec![ToolDef {
             name: "t".into(),
             description: "d".into(),
@@ -433,8 +472,14 @@ mod tests {
         };
         let body = provider().build_body(&req).unwrap();
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 2);
         assert_eq!(
-            body["messages"][0]["content"][0]["cache_control"]["type"],
+            body["messages"][0]["content"][0]["thinking"],
+            "signed Anthropic reasoning"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
         assert_eq!(body["thinking"]["type"], "adaptive");
@@ -472,13 +517,20 @@ mod tests {
             json!({"type": "message_stop"}),
         ];
         let mut state = StreamState::default();
-        let mut streamed = String::new();
+        let mut streamed_text = String::new();
+        let mut streamed_reasoning = String::new();
         for event in &events {
-            if let Some(text) = state.apply(event).unwrap() {
-                streamed.push_str(&text);
+            for delta in state.apply(event).unwrap() {
+                match delta {
+                    CompletionDelta::Text(text) => streamed_text.push_str(&text),
+                    CompletionDelta::Reasoning(reasoning) => {
+                        streamed_reasoning.push_str(&reasoning)
+                    }
+                }
             }
         }
-        assert_eq!(streamed, "Hello");
+        assert_eq!(streamed_text, "Hello");
+        assert_eq!(streamed_reasoning, "hmm");
         let response = state.into_response();
         assert_eq!(response.stop_reason, StopReason::ToolUse);
         assert_eq!(response.content.len(), 3);

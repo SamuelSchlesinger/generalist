@@ -495,8 +495,9 @@ async fn drive_started_turn(
                     ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
                 }
                 terminal_event = ui.next_event() => {
-                    let action = ui
-                        .handle_event(terminal(terminal_event)?, queue);
+                    let action = terminal(
+                        ui.handle_event(terminal(terminal_event)?, queue)
+                    )?;
                     let persist_queue = action.requires_queue_persist();
                     match action {
                         UiAction::None | UiAction::QueueChanged => {}
@@ -647,7 +648,8 @@ async fn drive_compaction(
                     ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
                 }
                 terminal_event = ui.next_event() => {
-                    let action = ui.handle_event(terminal(terminal_event)?, queue);
+                    let action =
+                        terminal(ui.handle_event(terminal(terminal_event)?, queue))?;
                     let persist_queue = action.requires_queue_persist();
                     match action {
                         UiAction::Submit { text, .. } => {
@@ -1038,7 +1040,8 @@ async fn main() -> Result<()> {
                 ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
             }
             terminal_event = ui.next_event() => {
-                let action = ui.handle_event(terminal(terminal_event)?, &queue);
+                let action =
+                    terminal(ui.handle_event(terminal(terminal_event)?, &queue))?;
                 let persist_queue = action.requires_queue_persist();
                 match action {
                     UiAction::Submit { text, delivery } => {

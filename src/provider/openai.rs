@@ -7,7 +7,8 @@
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::types::{
-    CompletionRequest, CompletionResponse, ContentBlock, Message, StopReason, ToolDef, Usage,
+    CompletionDelta, CompletionRequest, CompletionResponse, ContentBlock, Message, StopReason,
+    ToolDef, Usage,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -115,6 +116,18 @@ impl OpenAiProvider {
             .collect()
     }
 
+    /// Reasoning extensions used by common OpenAI-compatible servers.
+    ///
+    /// Qwen/vLLM/SGLang commonly use `reasoning_content`; Ollama's model
+    /// message format uses `thinking`, and some compatible gateways use
+    /// `reasoning`. Official OpenAI responses need not expose any of them.
+    fn reasoning_text(value: &Value) -> Option<&str> {
+        ["reasoning_content", "reasoning", "thinking"]
+            .into_iter()
+            .find_map(|field| value.get(field).and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+    }
+
     fn from_wire_response(value: &Value) -> Result<CompletionResponse> {
         let choice = value
             .get("choices")
@@ -126,6 +139,12 @@ impl OpenAiProvider {
             .ok_or_else(|| Error::Other("choice missing message".to_string()))?;
 
         let mut content = Vec::new();
+        if let Some(reasoning) = Self::reasoning_text(message) {
+            content.push(ContentBlock::Thinking {
+                thinking: reasoning.to_string(),
+                signature: String::new(),
+            });
+        }
         if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
                 content.push(ContentBlock::Text {
@@ -184,6 +203,7 @@ impl OpenAiProvider {
 #[derive(Default)]
 struct ChunkState {
     text: String,
+    reasoning: String,
     /// (id, name, arguments-fragments) per tool_call index.
     tool_calls: Vec<(String, String, String)>,
     finish_reason: Option<StopReason>,
@@ -191,8 +211,9 @@ struct ChunkState {
 }
 
 impl ChunkState {
-    /// Apply one stream chunk; returns any user-visible text delta.
-    fn apply(&mut self, chunk: &Value) -> Option<String> {
+    /// Apply one stream chunk; returns every inspectable delta it contains.
+    fn apply(&mut self, chunk: &Value) -> Vec<CompletionDelta> {
+        let mut emitted = Vec::new();
         // The final usage chunk has an empty `choices` array.
         if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(Usage {
@@ -211,11 +232,16 @@ impl ChunkState {
         let choice = chunk
             .get("choices")
             .and_then(|c| c.as_array())
-            .and_then(|c| c.first())?;
+            .and_then(|c| c.first());
+        let Some(choice) = choice else {
+            return emitted;
+        };
         if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
             self.finish_reason = Some(StopReason::parse(finish));
         }
-        let delta = choice.get("delta")?;
+        let Some(delta) = choice.get("delta") else {
+            return emitted;
+        };
         if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for call in calls {
                 let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
@@ -235,16 +261,29 @@ impl ChunkState {
                 }
             }
         }
-        let text = delta
+        if let Some(reasoning) = OpenAiProvider::reasoning_text(delta) {
+            self.reasoning.push_str(reasoning);
+            emitted.push(CompletionDelta::Reasoning(reasoning.to_string()));
+        }
+        if let Some(text) = delta
             .get("content")
             .and_then(|c| c.as_str())
-            .filter(|t| !t.is_empty())?;
-        self.text.push_str(text);
-        Some(text.to_string())
+            .filter(|text| !text.is_empty())
+        {
+            self.text.push_str(text);
+            emitted.push(CompletionDelta::Text(text.to_string()));
+        }
+        emitted
     }
 
     fn into_response(self) -> CompletionResponse {
         let mut content = Vec::new();
+        if !self.reasoning.is_empty() {
+            content.push(ContentBlock::Thinking {
+                thinking: self.reasoning,
+                signature: String::new(),
+            });
+        }
         if !self.text.is_empty() {
             content.push(ContentBlock::Text { text: self.text });
         }
@@ -329,7 +368,7 @@ impl Provider for OpenAiProvider {
     async fn complete_streaming(
         &self,
         request: CompletionRequest<'_>,
-        on_delta: &mut dyn FnMut(String),
+        on_delta: &mut dyn FnMut(CompletionDelta),
     ) -> Result<CompletionResponse> {
         let mut body = json!({
             "model": self.model,
@@ -378,8 +417,8 @@ impl Provider for OpenAiProvider {
                     continue;
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-                    if let Some(text) = state.apply(&value) {
-                        on_delta(text);
+                    for delta in state.apply(&value) {
+                        on_delta(delta);
                     }
                 }
             }
@@ -388,8 +427,8 @@ impl Provider for OpenAiProvider {
             if payload.trim() == "[DONE]" {
                 done = true;
             } else if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-                if let Some(text) = state.apply(&value) {
-                    on_delta(text);
+                for delta in state.apply(&value) {
+                    on_delta(delta);
                 }
             }
         }
@@ -502,8 +541,38 @@ mod tests {
     }
 
     #[test]
-    fn chunk_state_accumulates_streamed_text_and_tool_calls() {
+    fn parses_openai_compatible_reasoning_without_mixing_it_into_text() {
+        let value = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "reasoning_content": "inspect evidence",
+                    "content": "final answer"
+                }
+            }]
+        });
+        let response = OpenAiProvider::from_wire_response(&value).unwrap();
+        assert_eq!(
+            response.content[0],
+            ContentBlock::Thinking {
+                thinking: "inspect evidence".to_string(),
+                signature: String::new(),
+            }
+        );
+        assert_eq!(
+            response.content[1],
+            ContentBlock::Text {
+                text: "final answer".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn chunk_state_accumulates_reasoning_text_and_tool_calls() {
         let chunks = [
+            json!({"choices": [{"delta": {"reasoning_content": "inspect "}, "finish_reason": null}]}),
+            json!({"choices": [{"delta": {"reasoning": "the "}, "finish_reason": null}]}),
+            json!({"choices": [{"delta": {"thinking": "evidence"}, "finish_reason": null}]}),
             json!({"choices": [{"delta": {"content": "Hel"}, "finish_reason": null}]}),
             json!({"choices": [{"delta": {"content": "lo"}, "finish_reason": null}]}),
             json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "weather", "arguments": "{\"ci"}}]}, "finish_reason": null}]}),
@@ -512,17 +581,31 @@ mod tests {
             json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 8}}),
         ];
         let mut state = ChunkState::default();
-        let mut streamed = String::new();
+        let mut streamed_text = String::new();
+        let mut streamed_reasoning = String::new();
         for chunk in &chunks {
-            if let Some(text) = state.apply(chunk) {
-                streamed.push_str(&text);
+            for delta in state.apply(chunk) {
+                match delta {
+                    CompletionDelta::Text(text) => streamed_text.push_str(&text),
+                    CompletionDelta::Reasoning(reasoning) => {
+                        streamed_reasoning.push_str(&reasoning)
+                    }
+                }
             }
         }
-        assert_eq!(streamed, "Hello");
+        assert_eq!(streamed_text, "Hello");
+        assert_eq!(streamed_reasoning, "inspect the evidence");
         let response = state.into_response();
         assert_eq!(response.stop_reason, StopReason::ToolUse);
-        assert_eq!(response.content.len(), 2);
-        match &response.content[1] {
+        assert_eq!(response.content.len(), 3);
+        assert_eq!(
+            response.content[0],
+            ContentBlock::Thinking {
+                thinking: "inspect the evidence".to_string(),
+                signature: String::new(),
+            }
+        );
+        match &response.content[2] {
             ContentBlock::ToolUse { name, input, id } => {
                 assert_eq!(name, "weather");
                 assert_eq!(id, "call_1");

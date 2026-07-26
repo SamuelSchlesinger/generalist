@@ -15,7 +15,7 @@ pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
 
 use crate::error::Result;
-use crate::types::{CompletionRequest, CompletionResponse};
+use crate::types::{CompletionDelta, CompletionRequest, CompletionResponse};
 use async_trait::async_trait;
 
 /// A backend capable of producing one model completion per call.
@@ -46,16 +46,16 @@ pub trait Provider: Send + Sync {
     /// Request a single completion.
     async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse>;
 
-    /// Request a completion, streaming assistant text fragments through
-    /// `on_delta` as they arrive. Returns the complete response as if
-    /// [`Provider::complete`] had been called.
+    /// Request a completion, streaming assistant text and any provider-supplied
+    /// reasoning through `on_delta` as they arrive. Returns the complete
+    /// response as if [`Provider::complete`] had been called.
     ///
     /// The default implementation falls back to non-streaming, so custom
     /// providers work without implementing it.
     async fn complete_streaming(
         &self,
         request: CompletionRequest<'_>,
-        on_delta: &mut dyn FnMut(String),
+        on_delta: &mut dyn FnMut(CompletionDelta),
     ) -> Result<CompletionResponse> {
         let _ = on_delta;
         self.complete(request).await

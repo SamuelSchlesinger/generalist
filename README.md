@@ -83,6 +83,14 @@ Keyboard and mouse controls:
   reorder, or restore a queued message. The mouse wheel moves long queue
   selections. `Alt+Up` restores the latest queued message directly to an empty
   composer; restore never overwrites an unsent draft.
+- `F3` enters native terminal copy mode. Mouse capture and redraws pause so you
+  can select text and use the terminal's normal copy shortcut. Provider/tool
+  work continues in memory; press `F3` again to resume and redraw the latest
+  state. Normal terminal paste works in the composer after copy mode is closed.
+- `F4` opens the live model-reasoning inspector. It shows only inspectable
+  reasoning fields actually supplied by the provider, separately from answer
+  text, and says so explicitly when a request supplies none. Provider
+  signatures and redacted payloads are never displayed.
 - `F1` opens help. With no modal, `Esc`/`Ctrl+C` interrupts a busy turn safely;
   while idle, `Esc` clears the editor and `Ctrl+C` exits. A permission modal
   consumes its own keys first.
@@ -130,6 +138,10 @@ Follows what pi, opencode, and Claude Code converged on:
 - Responses stream (SSE) on both providers; a stream that dies mid-message is
   visibly marked uncommitted and retried rather than treated as a complete
   answer or persisted as assistant history.
+- Provider-supplied reasoning streams independently from answer text into the
+  `F4` inspector. Anthropic thinking deltas and common OpenAI-compatible string
+  extensions (`reasoning_content`, `reasoning`, or `thinking`) are supported.
+  Endpoints that expose no such field produce no invented reasoning.
 - When context passes a threshold (default 150k tokens, configurable), older
   history is summarized in place and recent turns stay verbatim. `/compact`
   triggers it manually. Local models with small context windows may want a much
