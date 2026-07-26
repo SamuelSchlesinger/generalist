@@ -1,10 +1,10 @@
 # generalist
 
 A provider-agnostic terminal agent in Rust with a full-screen Ratatui interface. Works
-with the Anthropic Messages API or any
-OpenAI-compatible endpoint (OpenAI, Ollama, Groq, Mistral, vLLM, LM Studio). The
-library is small: neutral conversation types, a `Provider` trait, a tool registry with
-permission gating, and an agent loop that reports progress through event callbacks.
+with the Anthropic Messages API, OpenRouter, or any OpenAI-compatible endpoint
+(OpenAI, Ollama, Groq, Mistral, vLLM, LM Studio). The library is small: neutral
+conversation types, a `Provider` trait, a tool registry with permission gating, and
+an agent loop that reports progress through event callbacks.
 
 ## Install and run
 
@@ -14,6 +14,7 @@ cargo build --release
 # Keys go in the environment or ~/.generalist.env:
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.generalist.env
 echo 'OPENAI_API_KEY=sk-...'        >> ~/.generalist.env   # and/or
+echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.generalist.env   # and/or
 echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 
 ./target/release/generalist
@@ -23,6 +24,10 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 ./target/release/generalist --local qwen2.5-coder:32b  # or name one
 ```
 
+When `OPENROUTER_API_KEY` is configured, normal remote startup defaults to
+OpenRouter's `moonshotai/kimi-k3`. Use `/model` to switch to another configured
+API. `--local` always takes precedence and keeps the local-model behavior.
+
 `--local [model]` skips provider selection and uses `http://localhost:11434/v1`; set
 `OPENAI_BASE_URL` for other local servers. Tool calling requires a tool-capable model
 (`qwen3.6`, `qwen3`, `qwen2.5-coder`, `devstral`).
@@ -30,7 +35,8 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 Optional binaries: `z3` (constraint solver), `patch` (file editing; present on any Unix).
 
 Smoke tests, all live end-to-end: `cargo run --example smoke` (Anthropic),
-`smoke_ollama` (local tool loop), `smoke_codemode` (local code-mode bridge).
+`smoke_openrouter` (Kimi K3), `smoke_ollama` (local tool loop), and
+`smoke_codemode` (local code-mode bridge).
 
 ## Usage
 

@@ -1,5 +1,7 @@
 use colored::*;
-use generalist::provider::{anthropic, AnthropicProvider, OpenAiProvider, Provider};
+use generalist::provider::{
+    anthropic, openrouter, AnthropicProvider, OpenAiProvider, OpenRouterProvider, Provider,
+};
 use generalist::tools::*;
 use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
@@ -137,6 +139,7 @@ fn list_saved_conversations() -> Vec<String> {
 struct ApiKeys {
     anthropic: Option<String>,
     openai: Option<String>,
+    openrouter: Option<String>,
     openai_base_url: String,
 }
 
@@ -152,6 +155,7 @@ impl ApiKeys {
             openai: env::var("OPENAI_API_KEY")
                 .ok()
                 .or_else(|| openai_base_url.as_ref().map(|_| "unused".to_string())),
+            openrouter: env::var("OPENROUTER_API_KEY").ok(),
             openai_base_url: openai_base_url
                 .unwrap_or_else(|| generalist::provider::openai::DEFAULT_BASE_URL.to_string()),
         }
@@ -165,12 +169,16 @@ impl ApiKeys {
         if self.openai.is_some() {
             providers.push("openai");
         }
+        if self.openrouter.is_some() {
+            providers.insert(0, "openrouter");
+        }
         providers
     }
 
     fn provider_label(&self, provider: &str) -> String {
         match provider {
             "anthropic" => "Anthropic".to_string(),
+            "openrouter" => "OpenRouter".to_string(),
             "openai" if self.openai_base_url == generalist::provider::openai::DEFAULT_BASE_URL => {
                 "OpenAI".to_string()
             }
@@ -200,8 +208,24 @@ fn build_provider(keys: &ApiKeys, provider: &str, model: String) -> Result<Box<d
                 model,
             )?))
         }
+        "openrouter" => {
+            let key = keys
+                .openrouter
+                .clone()
+                .ok_or_else(|| Error::Other("OPENROUTER_API_KEY is not set".to_string()))?;
+            Ok(Box::new(OpenRouterProvider::new(key, model)?))
+        }
         other => Err(Error::Other(format!("Unknown provider '{other}'"))),
     }
+}
+
+fn default_remote_provider_and_model(keys: &ApiKeys) -> Option<(String, String)> {
+    keys.openrouter.as_ref().map(|_| {
+        (
+            "openrouter".to_string(),
+            openrouter::DEFAULT_MODEL.to_string(),
+        )
+    })
 }
 
 fn build_registry(permission_handler: &MemoryPermissionHandler) -> Result<ToolRegistry> {
@@ -373,6 +397,12 @@ async fn choose_provider(
 async fn choose_model(ui: &mut TerminalUi, provider: &str) -> Result<Option<String>> {
     if provider == "anthropic" {
         let models = anthropic::SUGGESTED_MODELS
+            .iter()
+            .map(|model| model.to_string())
+            .collect::<Vec<_>>();
+        Ok(terminal(ui.select("Select model", &models).await)?.map(|index| models[index].clone()))
+    } else if provider == "openrouter" {
+        let models = openrouter::SUGGESTED_MODELS
             .iter()
             .map(|model| model.to_string())
             .collect::<Vec<_>>();
@@ -877,6 +907,7 @@ async fn main() -> Result<()> {
         eprintln!("Set at least one of these (in the environment or ~/.generalist.env):");
         eprintln!("  ANTHROPIC_API_KEY=...   for Anthropic models");
         eprintln!("  OPENAI_API_KEY=...      for OpenAI or a compatible server");
+        eprintln!("  OPENROUTER_API_KEY=...  for OpenRouter (defaults to Kimi K3)");
         eprintln!("  OPENAI_BASE_URL=...     optional, e.g. {OLLAMA_BASE_URL} for Ollama");
         eprintln!("Or run against a local model directly: generalist --local <model>");
         std::process::exit(1);
@@ -885,7 +916,10 @@ async fn main() -> Result<()> {
     let mut ui = terminal(TerminalUi::start("Starting", "selecting model"))?;
     let provider_and_model = match cli.local_model {
         Some(model) => Some(("openai".to_string(), model)),
-        None => choose_provider_and_model(&mut ui, &keys, &available).await?,
+        None => match default_remote_provider_and_model(&keys) {
+            Some(default) => Some(default),
+            None => choose_provider_and_model(&mut ui, &keys, &available).await?,
+        },
     };
     let Some((provider_name, model)) = provider_and_model else {
         return Ok(());
@@ -1130,5 +1164,24 @@ mod tests {
         );
         assert_eq!(parse_local_command("/exit"), Some(LocalCommand::Exit));
         assert_eq!(parse_local_command("ordinary prompt"), None);
+    }
+
+    #[test]
+    fn openrouter_kimi_is_the_default_remote_when_configured() {
+        let keys = ApiKeys {
+            anthropic: Some("anthropic-key".into()),
+            openai: Some("openai-key".into()),
+            openrouter: Some("openrouter-key".into()),
+            openai_base_url: generalist::provider::openai::DEFAULT_BASE_URL.into(),
+        };
+
+        assert_eq!(
+            keys.available_providers(),
+            vec!["openrouter", "anthropic", "openai"]
+        );
+        assert_eq!(
+            default_remote_provider_and_model(&keys),
+            Some(("openrouter".to_string(), "moonshotai/kimi-k3".to_string()))
+        );
     }
 }

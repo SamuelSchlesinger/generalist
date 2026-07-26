@@ -7,12 +7,16 @@
 //! - [`AnthropicProvider`] — the Anthropic Messages API
 //! - [`OpenAiProvider`] — any OpenAI-compatible chat-completions API
 //!   (OpenAI itself, Ollama, Groq, Mistral, vLLM, ...)
+//! - [`OpenRouterProvider`] — OpenRouter's OpenAI-compatible endpoint, with a
+//!   distinct persistence identity
 
 pub mod anthropic;
 pub mod openai;
+pub mod openrouter;
 
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
+pub use openrouter::OpenRouterProvider;
 
 use crate::error::Result;
 use crate::types::{CompletionDelta, CompletionRequest, CompletionResponse};
