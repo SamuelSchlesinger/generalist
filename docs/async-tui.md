@@ -97,9 +97,12 @@ state store: committed history remains inside `Agent`.
 Conversation scrolling stores an absolute top line while follow-latest is
 paused. New streamed lines therefore do not move the user's viewport.
 PageDown/mouse-down clamps at the real bottom and resumes follow-latest; PageUp
-cannot accumulate an invisible overscroll debt. Mouse input belongs to the
-active modal: it scrolls permission details or a long queue selection instead
-of changing the obscured conversation.
+cannot accumulate an invisible overscroll debt. Scroll bounds come from
+Ratatui's own word-wrapping layout rather than a character-width estimate, so
+moving a whole word onto the next row cannot make the rendered bottom
+unreachable. Mouse input belongs to the active modal: it scrolls permission
+details or a long queue selection instead of changing the obscured
+conversation.
 
 ## Prompt queue
 

@@ -1446,7 +1446,13 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut AppState, area: Rect) {
     let inner = block.inner(area);
     let text = chat_text(&app.chat);
     let width = inner.width.max(1);
-    let total_lines = wrapped_line_count(&text, width);
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(TEXT).bg(PANEL));
+    // Use the same WordWrapper implementation for scroll bounds and drawing.
+    // A width-based estimate undercounts rows whenever wrapping moves a whole
+    // word to the next line, which makes the real bottom unreachable.
+    let total_lines = paragraph.line_count(width);
     let visible = inner.height as usize;
     let max_scroll = total_lines.saturating_sub(visible);
     app.update_chat_metrics(max_scroll);
@@ -1457,9 +1463,6 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut AppState, area: Rect) {
         format!(" Conversation · {lines_from_latest} lines from latest ")
     };
     frame.render_widget(panel_block(title), area);
-    let paragraph = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(TEXT).bg(PANEL));
     let scroll = app.chat_scroll;
     frame.render_widget(
         paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
@@ -1878,13 +1881,13 @@ fn render_permission(
     );
     let detail = permission_detail(request);
     let detail_inner = Block::new().borders(Borders::ALL).inner(detail_area);
-    let detail_lines = wrapped_line_count(&detail, detail_inner.width.max(1));
+    let detail = Paragraph::new(detail).wrap(Wrap { trim: false });
+    let detail_lines = detail.line_count(detail_inner.width.max(1));
     let max_scroll = detail_lines.saturating_sub(detail_inner.height as usize);
     *scroll = (*scroll as usize).min(max_scroll).min(u16::MAX as usize) as u16;
     frame.render_widget(
-        Paragraph::new(detail)
+        detail
             .scroll((*scroll, 0))
-            .wrap(Wrap { trim: false })
             .block(
                 Block::new()
                     .borders(Borders::ALL)
@@ -2114,14 +2117,6 @@ fn terminal_display_char(ch: char) -> char {
         ch if ch.is_control() => '�',
         ch => ch,
     }
-}
-
-fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
-    let width = width.max(1) as usize;
-    text.lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum()
 }
 
 fn insert_text(value: &mut String, cursor: &mut usize, text: &str) {
@@ -2524,6 +2519,46 @@ mod tests {
         assert!(rendered.contains("Conversation"));
         assert!(rendered.contains("Tool activity"));
         assert!(rendered.contains("Build a better interface"));
+    }
+
+    #[test]
+    fn word_wrapped_chat_reaches_the_real_bottom() {
+        let mut app = AppState::new("api", "model");
+        let long_words = (0..80)
+            .map(|_| "abcdefghijklmnop")
+            .collect::<Vec<_>>()
+            .join(" ");
+        app.push_user(long_words);
+        app.push_chat(ChatKind::Assistant, "BOTTOM-MARKER");
+
+        let backend = TestBackend::new(32, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_chat(frame, &mut app, frame.area()))
+            .unwrap();
+
+        assert!(app.follow_latest);
+        assert!(
+            terminal.backend().to_string().contains("BOTTOM-MARKER"),
+            "follow-latest stopped above Ratatui's word-wrapped bottom"
+        );
+
+        app.scroll_chat_up(usize::MAX);
+        terminal
+            .draw(|frame| render_chat(frame, &mut app, frame.area()))
+            .unwrap();
+        assert!(!app.follow_latest);
+        assert!(!terminal.backend().to_string().contains("BOTTOM-MARKER"));
+
+        app.scroll_chat_down(usize::MAX);
+        terminal
+            .draw(|frame| render_chat(frame, &mut app, frame.area()))
+            .unwrap();
+        assert!(app.follow_latest);
+        assert!(
+            terminal.backend().to_string().contains("BOTTOM-MARKER"),
+            "scroll-down stopped above Ratatui's word-wrapped bottom"
+        );
     }
 
     #[test]

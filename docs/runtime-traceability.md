@@ -156,7 +156,12 @@ transition. The review found and corrected:
 - scroll state measured only as a distance from the newest line, so a supposedly
   paused viewport drifted during streaming and could accumulate overscroll far
   beyond the oldest line. It now uses a clamped absolute viewport with explicit
-  follow-latest state, and modal mouse events no longer leak into the transcript;
+  follow-latest state, and modal mouse events no longer leak into the transcript.
+  A later manual review found that the scroll bound still estimated wrapped
+  rows by total character width, while Ratatui wraps at word boundaries. Both
+  conversation and permission-detail bounds now use Ratatui's exact
+  `WordWrapper` line count, with a regression that scrolls away from and back to
+  a final marker;
 - long queue selections disappearing below a non-stateful list viewport,
   queued-text restore overwriting a composer draft, queue-editor control keys
   inserting literal letters, and same-named saved tool calls displaying swapped
