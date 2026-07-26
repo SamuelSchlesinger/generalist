@@ -105,6 +105,22 @@ The exact async semantics, TLA+ model, and maintained model-to-Rust review are
 documented in [the architecture note](docs/async-tui.md) and
 [runtime traceability matrix](docs/runtime-traceability.md).
 
+## Memory architecture status
+
+The registered `enhanced_memory` bridge is still the legacy flat JSON CRUD
+implementation. It is not the proposed episodic/consolidation architecture and
+should not be expanded into one by adding more model-authored fields.
+
+The source-grounded design, adversarial safety review, multi-agent analysis,
+and exact next implementation slice are checked in under
+[the agent-memory research corpus](docs/research/agent-memory/index.md). Start
+with the
+[implementation handoff](docs/research/agent-memory/architecture/implementation-handoff.md).
+No SQLite supervisor, episodic capture, automatic retrieval, consolidation,
+simulation, or collaboration runtime described there has been implemented yet.
+The handoff deliberately starts with disabled-by-default M0 contracts and TLA+
+models before immutable episodic M1.
+
 ## Permissions
 
 New tool calls open a permission modal showing the full input (patches are rendered as

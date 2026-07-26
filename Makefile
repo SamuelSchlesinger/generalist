@@ -1,10 +1,10 @@
 SHELL := /bin/sh
 
-.PHONY: check lint test fmt clippy shellcheck traceability hooks-check tla setup hooks tla-tools doctor
+.PHONY: check lint test fmt clippy shellcheck traceability memory-research hooks-check tla setup hooks tla-tools doctor
 
 check: lint test
 
-lint: fmt clippy shellcheck traceability hooks-check tla
+lint: fmt clippy shellcheck traceability memory-research hooks-check tla
 
 test:
 	cargo test --all-targets --all-features --locked
@@ -20,6 +20,11 @@ shellcheck:
 
 traceability:
 	./scripts/check-runtime-traceability.sh
+
+memory-research:
+	PYTHONDONTWRITEBYTECODE=1 python3 docs/research/agent-memory/systems/data/check_corpus.py
+	PYTHONDONTWRITEBYTECODE=1 python3 docs/research/agent-memory/safety-evaluation/data/validate-branch.py
+	PYTHONDONTWRITEBYTECODE=1 python3 docs/research/agent-memory/data/validate_corpus.py
 
 hooks-check:
 	test -x .githooks/pre-commit

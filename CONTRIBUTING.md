@@ -98,6 +98,43 @@ prompt is an acknowledgement, not a substitute for the review. Deliberate
 non-interactive automation may set `GENERALIST_TLA_ACK=1`; ordinary local
 commits must answer in a terminal.
 
+## Memory and collaboration handoff
+
+The current `EnhancedMemoryTool` is legacy code, not an architectural
+foundation. Before changing memory, multi-agent coordination, project scope,
+or offline consolidation, read the reviewed
+[research index](docs/research/agent-memory/index.md) and
+[implementation handoff](docs/research/agent-memory/architecture/implementation-handoff.md).
+Run `make memory-research` after editing that corpus.
+
+The first authorized implementation milestone is M0: disabled-by-default
+supervisor/client contracts, schema and measurement scaffolding,
+`MemoryRuntime.tla` and `CollaborationRuntime.tla` skeletons/configurations,
+shared-interface traceability to `AsyncRuntime.tla`, and CI. Do not represent
+the research design as implemented, enable automatic retrieval, or add
+model-controlled promotion to make an early demo look complete.
+
+Review memory changes against these boundaries:
+
+- exactness applies only to the admitted canonical payload after trusted
+  redaction/omission;
+- provider reasoning and generated simulations are never evidence;
+- same-UID file modes are not worker isolation;
+- FTS/content authorization precedes ranking, while timing remains a measured
+  residual side channel;
+- prompt and effect epochs are rechecked at their dispatch linearization
+  points;
+- external effects without provider idempotency can be `sent_unknown`;
+- external tombstone-ledger and SQLite crash ordering must fail closed; and
+- raw M1 deletion does not claim the later descendant/promotion guarantees;
+  and
+- offline M3 consolidation depends on C2: only a task/attempt-bound fenced
+  worker session may publish proposals, never a controller session.
+
+Once M0 adds the two specifications, extend the Git-hook acknowledgement,
+traceability script, `make tla`, CI, and the painstaking model-to-Rust review to
+all three models in the same commit.
+
 ## Change hygiene
 
 - Keep one authoritative queue and one terminal reader.
