@@ -2,7 +2,7 @@
 
 use crate::command::COMMAND_SPECS;
 use crate::permissions::{PermissionChoice, ToolExecutionRequest};
-use crate::runtime::{DeliveryMode, PromptId, PromptQueue, QueuedPrompt};
+use crate::runtime::{DeliveryMode, PromptId, PromptQueue, PromptSource, QueuedPrompt};
 use crate::types::{truncate_middle, ContentBlock, Message};
 use crate::{AgentEvent, ToolCallOutcome};
 use chrono::Local;
@@ -243,12 +243,16 @@ impl AppState {
         for message in history {
             let text = message.text();
             if !text.is_empty() {
-                let kind = if message.role == "user" {
-                    ChatKind::User
+                if message.is_goal_continuation() {
+                    self.push_info("Automatic continuation of the active goal");
                 } else {
-                    ChatKind::Assistant
-                };
-                self.push_chat(kind, text);
+                    let kind = if message.role == "user" {
+                        ChatKind::User
+                    } else {
+                        ChatKind::Assistant
+                    };
+                    self.push_chat(kind, text);
+                }
             }
             if message.role == "assistant" {
                 let reasoning = message
@@ -593,9 +597,21 @@ impl AppState {
             AgentEvent::Notice(message) => self.push_info(message),
             AgentEvent::SteeringCommitted { prompts } => {
                 for prompt in prompts {
-                    self.push_user(prompt.text);
+                    if prompt.source == PromptSource::GoalContinuation {
+                        self.push_info("Automatic continuation of the active goal");
+                    } else {
+                        self.push_user(prompt.text);
+                    }
                 }
                 self.status = "Steering active turn".to_string();
+            }
+            AgentEvent::GoalCompleted { goal } => {
+                self.goal = None;
+                self.push_info(format!(
+                    "Goal completed: {}",
+                    truncate_middle(&sanitize_terminal_text(&goal), 400)
+                ));
+                self.status = "Goal completed".to_string();
             }
             AgentEvent::HistoryCheckpoint { context_tokens, .. } => {
                 self.context_tokens = context_tokens;
@@ -1761,9 +1777,10 @@ fn render_activity(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .iter()
         .take(6)
         .map(|prompt| {
-            let (label, color) = match prompt.delivery {
-                DeliveryMode::Steer => ("↪ steer", PURPLE),
-                DeliveryMode::FollowUp => ("＋ next", CYAN),
+            let (label, color) = match (prompt.source, prompt.delivery) {
+                (PromptSource::GoalContinuation, _) => ("◎ goal", GREEN),
+                (_, DeliveryMode::Steer) => ("↪ steer", PURPLE),
+                (_, DeliveryMode::FollowUp) => ("＋ next", CYAN),
             };
             ListItem::new(vec![
                 Line::from(Span::styled(label, Style::default().fg(color).bold())),
@@ -2115,9 +2132,10 @@ fn render_queue(
             .take(visible_items)
             .map(|(index, prompt)| {
                 let active = index == selected;
-                let (label, color) = match prompt.delivery {
-                    DeliveryMode::Steer => ("STEER", PURPLE),
-                    DeliveryMode::FollowUp => ("NEXT ", CYAN),
+                let (label, color) = match (prompt.source, prompt.delivery) {
+                    (PromptSource::GoalContinuation, _) => ("GOAL ", GREEN),
+                    (_, DeliveryMode::Steer) => ("STEER", PURPLE),
+                    (_, DeliveryMode::FollowUp) => ("NEXT ", CYAN),
                 };
                 ListItem::new(vec![
                     Line::from(vec![
@@ -2719,7 +2737,7 @@ fn permission_choice(index: usize) -> PermissionChoice {
 }
 
 fn is_code_mode_protocol_rejection(content: &str) -> bool {
-    content.contains("code mode permits only the model-facing `python` tool")
+    content.contains("code mode permits only the model-facing `python` capability tool")
         || content.contains("Direct tool calls are disabled in code mode")
 }
 
@@ -2894,6 +2912,7 @@ mod tests {
                 id,
                 text: id.to_string(),
                 delivery: DeliveryMode::FollowUp,
+                source: PromptSource::User,
             })
             .collect();
         app.modal = Some(Modal::Queue {
@@ -2911,6 +2930,7 @@ mod tests {
             id: 7,
             text: "queued".into(),
             delivery: DeliveryMode::FollowUp,
+            source: PromptSource::User,
         };
         let mut app = AppState::new("api", "model");
         app.input = "unsent draft".into();
@@ -2923,6 +2943,26 @@ mod tests {
         app.input_cursor = 0;
         assert!(app.restore_to_composer(&prompt));
         assert_eq!(app.input, "queued");
+    }
+
+    #[test]
+    fn automatic_goal_control_is_visible_as_info_and_completion_clears_header() {
+        let mut app = AppState::new("api", "model");
+        app.load_history(&[Message::user_text(crate::goal::GOAL_CONTINUATION_PROMPT)]);
+        assert_eq!(app.chat[0].kind, ChatKind::User);
+
+        app.load_history(&[Message::goal_continuation()]);
+        assert_eq!(app.chat.len(), 1);
+        assert_eq!(app.chat[0].kind, ChatKind::Info);
+        assert!(app.chat[0].body.contains("Automatic continuation"));
+
+        app.goal = Some("finish it".into());
+        app.apply_agent_event(AgentEvent::GoalCompleted {
+            goal: "finish it".into(),
+        });
+        assert!(app.goal.is_none());
+        assert_eq!(app.chat.last().unwrap().kind, ChatKind::Info);
+        assert!(app.chat.last().unwrap().body.contains("Goal completed"));
     }
 
     #[test]
@@ -2973,7 +3013,7 @@ mod tests {
             Message::user(vec![ContentBlock::ToolResult {
                 content: "The provider emitted undeclared native tool call \
                           `tools.firecrawl_search`. It was not executed: code mode permits only \
-                          the model-facing `python` tool."
+                          the model-facing `python` capability tool."
                     .into(),
                 tool_use_id: "bad-native".into(),
                 is_error: Some(true),
@@ -3169,7 +3209,7 @@ mod tests {
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Slash commands"));
         assert!(rendered.contains("/goal"));
-        assert!(rendered.contains("edit/show/clear/set objective"));
+        assert!(rendered.contains("run/edit/show/clear objective"));
         assert!(rendered.contains("/exit"));
     }
 
@@ -3240,6 +3280,7 @@ mod tests {
                 id,
                 text: format!("queue-item-{id}"),
                 delivery: DeliveryMode::FollowUp,
+                source: PromptSource::User,
             })
             .collect::<Vec<_>>();
         let backend = TestBackend::new(80, 24);

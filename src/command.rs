@@ -74,7 +74,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "/goal",
         usage: "/goal [edit|show|clear|<text>]",
-        description: "edit/show/clear/set objective",
+        description: "run/edit/show/clear objective",
         kind: CommandKind::Goal,
     },
     CommandSpec {

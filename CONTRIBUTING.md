@@ -25,7 +25,7 @@ state/action/invariant mappings are in
 `docs/runtime-traceability.md`. Treat that file as review evidence, not as
 architecture prose that can be updated from memory.
 
-For every change touching `src/main.rs`, `src/command.rs`, `src/tui.rs`,
+For every change touching `src/main.rs`, `src/command.rs`, `src/goal.rs`, `src/tui.rs`,
 `src/runtime.rs`, `src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`,
 `src/tool.rs`, `src/provider/`, `src/types.rs`, or queue/goal-bearing
 persistence in `src/state.rs`, plus every change to `src/memory.rs`:

@@ -109,8 +109,10 @@ unit coverage.
 2. The current-thread UI reactor must remain responsive. Retrieval,
    consolidation, indexing, and storage I/O need explicit async ownership and
    cancellation behavior; they cannot hide a blocking second runtime.
-3. Code mode advertises only `python`. A host-native memory lifecycle should not
-   require additional model-facing tool calls merely to remember or recall, but
+3. Code mode advertises only `python` as a capability tool. The separate
+   `update_goal` completion control is host-owned, reserved, and
+   permission-free. A host-native memory lifecycle should not require
+   additional model-facing tool calls merely to remember or recall, but
    user-visible memory operations may still be exposed through the generated
    `tools` module.
 4. Durable queue/history autosave is atomic and has a documented TLA+

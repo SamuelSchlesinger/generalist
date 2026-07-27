@@ -9,8 +9,10 @@ research corpus.
 The previously completed product baseline remains:
 
 - asynchronous Ratatui interaction, stable queued steering/follow-ups, exact
-  wrapped scrolling, copy mode, reasoning inspection, and durable `/goal`;
-- code mode as the only model-facing tool boundary; and
+  wrapped scrolling, copy mode, reasoning inspection, and durable `/goal`
+  autorun through the host-owned `update_goal` completion control;
+- code mode as the only model-facing capability boundary, with native host
+  controls kept separate; and
 - OpenRouter `moonshotai/kimi-k3` as the default remote model when
   `OPENROUTER_API_KEY` exists.
 
@@ -34,7 +36,9 @@ document.
 - Episodes retain user/assistant text, provider/model/outcome, tool names, and
   tool success/error metadata. Tool inputs/results, provider reasoning,
   signatures, and redacted-reasoning payloads are structurally omitted. An
-  in-turn compaction that moves the exact boundary degrades capture to the
+  automatic goal-continuation prompt is also omitted rather than retained as
+  user-authored text. An in-turn compaction that moves the exact boundary
+  degrades capture to the
   original prompt with `capture_quality = prompt_only`. Because capture is
   derived from committed history, code-mode metadata names the outer `python`
   call rather than each nested bridge call.

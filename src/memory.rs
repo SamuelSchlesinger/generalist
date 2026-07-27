@@ -6,7 +6,7 @@
 //! A dedicated worker thread is the sole SQLite connection owner so database
 //! work cannot block the current-thread TUI reactor.
 
-use crate::{ContentBlock, Error, Message, Result, TurnOutcome};
+use crate::{ContentBlock, Error, Message, MessageOrigin, Result, TurnOutcome};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -271,7 +271,40 @@ impl EpisodicMemory {
         model: &str,
         started_at: DateTime<Utc>,
     ) -> Result<()> {
-        let episode = self.build_episode(prompt, history, outcome, provider, model, started_at);
+        self.enqueue_settled_turn_with_origin(
+            prompt,
+            MessageOrigin::Conversation,
+            history,
+            outcome,
+            provider,
+            model,
+            started_at,
+        )
+    }
+
+    /// Queue a settled turn whose initiating prompt has explicit host
+    /// provenance. This keeps compaction fallback from retaining internal
+    /// control text as user-authored memory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_settled_turn_with_origin(
+        &self,
+        prompt: &str,
+        prompt_origin: MessageOrigin,
+        history: &[Message],
+        outcome: EpisodeOutcome,
+        provider: &str,
+        model: &str,
+        started_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let episode = self.build_episode(
+            prompt,
+            prompt_origin,
+            history,
+            outcome,
+            provider,
+            model,
+            started_at,
+        );
         self.send(Request::Record {
             episode,
             reply: None,
@@ -290,7 +323,15 @@ impl EpisodicMemory {
         model: &str,
         started_at: DateTime<Utc>,
     ) -> Result<Option<String>> {
-        let episode = self.build_episode(prompt, history, outcome, provider, model, started_at);
+        let episode = self.build_episode(
+            prompt,
+            MessageOrigin::Conversation,
+            history,
+            outcome,
+            provider,
+            model,
+            started_at,
+        );
         let (reply, response) = oneshot::channel();
         self.send(Request::Record {
             episode,
@@ -345,16 +386,18 @@ impl EpisodicMemory {
             .map_err(|_| Error::Other("Memory worker is unavailable".to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_episode(
         &self,
         prompt: &str,
+        prompt_origin: MessageOrigin,
         history: &[Message],
         outcome: EpisodeOutcome,
         provider: &str,
         model: &str,
         started_at: DateTime<Utc>,
     ) -> Episode {
-        let (events, capture_quality) = retained_events(prompt, history);
+        let (events, capture_quality) = retained_events(prompt, prompt_origin, history);
         Episode {
             id: Uuid::new_v4().to_string(),
             project_root: self.project_root.clone(),
@@ -873,7 +916,11 @@ fn stored_episode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEpisode
     })
 }
 
-fn retained_events(prompt: &str, history: &[Message]) -> (Vec<EpisodeEvent>, String) {
+fn retained_events(
+    prompt: &str,
+    prompt_origin: MessageOrigin,
+    history: &[Message],
+) -> (Vec<EpisodeEvent>, String) {
     let has_initial_prompt = history.first().is_some_and(|message| {
         message.role == "user"
             && message
@@ -882,7 +929,9 @@ fn retained_events(prompt: &str, history: &[Message]) -> (Vec<EpisodeEvent>, Str
                 .any(|block| matches!(block, ContentBlock::Text { text } if text == prompt))
     });
     let mut events = Vec::new();
-    if !has_initial_prompt {
+    let is_host_goal_prompt = prompt_origin == MessageOrigin::GoalContinuation
+        && crate::goal::is_goal_continuation_prompt(prompt);
+    if !has_initial_prompt && !is_host_goal_prompt {
         events.push(EpisodeEvent::UserText {
             text: prompt.to_string(),
         });
@@ -890,7 +939,11 @@ fn retained_events(prompt: &str, history: &[Message]) -> (Vec<EpisodeEvent>, Str
     for message in if has_initial_prompt { history } else { &[] } {
         for block in &message.content {
             match block {
-                ContentBlock::Text { text } if !text.is_empty() && message.role == "user" => {
+                ContentBlock::Text { text }
+                    if !text.is_empty()
+                        && message.role == "user"
+                        && !message.is_goal_continuation() =>
+                {
                     events.push(EpisodeEvent::UserText { text: text.clone() });
                 }
                 ContentBlock::Text { text } if !text.is_empty() && message.role == "assistant" => {
@@ -1154,7 +1207,7 @@ mod tests {
                 text: "second answer".to_string(),
             }]),
         ];
-        let (events, quality) = retained_events(prompt, &history);
+        let (events, quality) = retained_events(prompt, MessageOrigin::Conversation, &history);
         assert_eq!(quality, "text_and_tool_metadata");
         assert_eq!(
             events,
@@ -1176,8 +1229,56 @@ mod tests {
     }
 
     #[test]
+    fn host_goal_continuations_are_not_retained_as_user_authored_text() {
+        let prompt = crate::goal::GOAL_CONTINUATION_PROMPT;
+        let history = vec![
+            Message::goal_continuation(),
+            Message::assistant(vec![ContentBlock::Text {
+                text: "made more progress".to_string(),
+            }]),
+        ];
+
+        let (events, quality) = retained_events(prompt, MessageOrigin::GoalContinuation, &history);
+
+        assert_eq!(quality, "text_and_tool_metadata");
+        assert_eq!(
+            events,
+            vec![EpisodeEvent::AssistantText {
+                text: "made more progress".to_string()
+            }]
+        );
+
+        let manual = vec![Message::user_text(prompt)];
+        let (events, _) = retained_events(prompt, MessageOrigin::Conversation, &manual);
+        assert_eq!(
+            events,
+            vec![EpisodeEvent::UserText {
+                text: prompt.to_string()
+            }],
+            "matching text remains user-authored without host provenance"
+        );
+
+        let (events, quality) = retained_events(prompt, MessageOrigin::GoalContinuation, &[]);
+        assert_eq!(quality, "prompt_only");
+        assert!(
+            events.is_empty(),
+            "compaction fallback must not retain host control text"
+        );
+
+        let (events, _) = retained_events("ordinary prompt", MessageOrigin::GoalContinuation, &[]);
+        assert_eq!(
+            events,
+            vec![EpisodeEvent::UserText {
+                text: "ordinary prompt".to_string()
+            }],
+            "provenance alone cannot suppress arbitrary prompt text"
+        );
+    }
+
+    #[test]
     fn a_relocated_history_boundary_degrades_to_prompt_only() {
-        let (events, quality) = retained_events("original prompt", &[]);
+        let (events, quality) =
+            retained_events("original prompt", MessageOrigin::Conversation, &[]);
         assert_eq!(quality, "prompt_only");
         assert_eq!(
             events,

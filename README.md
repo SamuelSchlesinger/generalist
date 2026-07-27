@@ -41,8 +41,8 @@ Smoke tests, all live end-to-end: `cargo run --example smoke` (Anthropic),
 ## Usage
 
 Type a request; the agent calls tools and reports back. Generalist targets Unix-like
-systems; code mode is on by default and `python` is the only model-facing tool.
-Scripts reach all registered capabilities through `import tools`: bash, file
+systems; code mode is on by default and `python` is the only model-facing
+capability tool. Scripts reach all registered capabilities through `import tools`: bash, file
 read/patch, directory listing, HTTP
 fetch, web search/scrape/crawl (Firecrawl), Wikipedia, weather, Z3, and todo
 list. (Calculator, system-info, think, and the former model-controlled memory
@@ -52,18 +52,27 @@ episodic memory is host-owned.)
 Responses stream as they generate. Type `/` to enter visible command mode; the
 footer lists the available slash commands from the same catalog used by the
 parser and help window. `/goal <objective>` sets durable instruction context,
-`/goal edit` opens the editor, `/goal show` displays it, and `/goal clear`
-removes it. Other commands are `/save`, `/load`, `/model`, `/compact`,
-`/clear`, `/memory`, `/help`, and `/exit`.
+starts working, and automatically prompts another turn after each normal answer
+until the model calls the host-owned `update_goal(status="complete")` control.
+`/goal edit` opens the editor and resumes the loop, `/goal show` displays the
+objective, and `/goal clear` stops and removes it. Escape, a provider error,
+refusal, or permission denial pauses automatic continuation without discarding
+the objective; edit the goal or send another prompt to resume. Other commands
+are `/save`, `/load`, `/model`, `/compact`, `/clear`, `/memory`, `/help`, and
+`/exit`.
 
 History-valid boundaries, the active goal, and queue edits are atomically
 autosaved to `~/.generalist/history/autosave.json`. The goal survives restart
-even with no queued work. If the process exits with queued work, the next run
-also recovers that queue together with its conversation context. `/load` reads
-the goal stored in a named session and also supports the legacy
+even with no queued work, and startup schedules its next automatic continuation.
+If the process exits with queued work, the next run also recovers that queue
+together with its conversation context. `/load` reads and resumes the goal
+stored in a named session and also supports the legacy
 `~/.chatbot_history` and `~/.generalist_history` directories. If
 `~/.generalist_history` is instead a regular input-history file, it is left
-untouched.
+untouched. Set `GENERALIST_HOME` to an alternate directory for an isolated
+profile or reproducible harness run; all of the paths above, plus
+`.generalist.env`, MCP configuration, and skills, are then resolved beneath
+that directory.
 
 ## Terminal UI
 
@@ -72,8 +81,10 @@ prompt queue, and recent tool activity visible at once. A single current-thread
 Tokio reactor polls the active model/tool future, terminal events, permission
 requests, and frame ticks together. You can keep editing and scrolling while a
 response is in flight. The header keeps the active goal visible and says
-`code mode / N bridges`: `python` remains the sole model-facing tool, while
-nested bridge activity is shown as `↳ tools.<name>`.
+`code mode / N bridges`: `python` remains the sole model-facing capability
+tool, while nested bridge activity is shown as `↳ tools.<name>`. While a goal
+is active, the separate permission-free `update_goal` host control is also
+advertised.
 
 Keyboard and mouse controls:
 
@@ -122,7 +133,8 @@ Generalist now has a deliberately small host-owned episodic prototype:
   reactor;
 - only settled user/assistant text, tool names, and tool success/error metadata
   are retained; tool inputs/results, provider reasoning, signatures, and
-  redacted payloads are structurally omitted. If in-turn context compaction
+  redacted payloads are structurally omitted. Host-authored goal-continuation
+  text is also omitted rather than misclassified as user-authored. If in-turn context compaction
   moves the exact turn boundary, the record safely degrades to a
   `prompt_only` episode rather than retaining a generated compaction summary.
   In code mode, this smallest slice records the outer `python` call, not each
@@ -207,9 +219,11 @@ Follows what pi, opencode, and Claude Code converged on:
 
 ## Code mode
 
-The agent advertises exactly one tool, `python`, when code mode is enabled (the
-default). Every registered tool is available only to scripts through a generated
-`tools` module:
+The agent advertises exactly one capability tool, `python`, when code mode is
+enabled (the default). Every registered tool is available only to scripts
+through a generated `tools` module. An active goal additionally advertises the
+native `update_goal` host control; it is not a registered capability, is never
+available through the Python bridge, and does not ask for execution permission.
 
 ```python
 import tools
@@ -229,13 +243,14 @@ from CodeAct, Cloudflare's Code Mode, Anthropic's code-execution-with-MCP, and t
 
 Some OpenAI-compatible models return a bridge expression such as
 `tools.firecrawl_search` as an undeclared native call despite receiving only the
-`python` schema. Generalist treats that as a provider-protocol violation: it records a
+`python` capability schema. Generalist treats that as a provider-protocol violation: it records a
 paired error so history stays valid, but does not request permission or execute the
 named tool.
 
 Library users can opt back into independently advertised direct tools with
 `agent.code_mode = false`. Registering a custom tool named `python` also overrides the
-built-in runner.
+built-in runner. The name `update_goal` is reserved for the host controller and
+cannot be registered as a custom capability.
 
 Relation to CaMeL: tool output that stays inside a script cannot prompt-inject the
 model, and per-call approval acts as the policy check. There is no data-flow/taint

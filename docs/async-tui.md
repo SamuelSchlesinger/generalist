@@ -68,18 +68,40 @@ queue until the active turn releases that state.
 
 ### Active goal
 
-`/goal <objective>` sets a user-authored objective, `/goal edit` (or bare
-`/goal`) opens a prefilled editor, `/goal show` displays it, and `/goal clear`
-removes it. `Agent` is the authority for the raw goal. It appends the goal to
-the effective system instructions for every ordinary provider request without
-inserting a synthetic conversation message. Changing it invalidates cached
-context accounting, while `/clear` deliberately preserves it. The prefilled
-editor supports the same Ctrl+A/E/U/K/W replacement controls as the composer.
+`/goal <objective>` sets a user-authored objective and queues a host-authored
+follow-up. `/goal edit` (or bare `/goal`) opens a prefilled editor and resumes
+that loop, `/goal show` displays the objective, and `/goal clear` stops and
+removes it. `Agent` is the authority for the raw goal. It appends the objective
+and exact completion contract to the effective system instructions for every
+provider request without copying the objective into a conversation message.
+Changing it invalidates cached context accounting, while `/clear` deliberately
+preserves it. The prefilled editor supports the same Ctrl+A/E/U/K/W replacement
+controls as the composer.
+
+A normal final answer settles one turn but does not clear an active goal. After
+`Completed` or `MaxIterationsReached`, the controller ensures exactly one
+`PromptSource::GoalContinuation` follow-up exists; the ordinary queue then
+dispatches it with a fresh stable ID. This repeats until the model calls the
+native `update_goal({"status":"complete"})` host control. The control is
+validated and executed synchronously without capability permission, clears the
+authoritative goal, produces the required paired tool result, and emits a
+checkpoint containing both the new goal state and valid history. The next
+provider response can therefore summarize completion without receiving the old
+goal again.
+
+Interruption, refusal, denial, provider error, or exit removes pending automatic
+continuations but leaves the objective available for inspection or editing.
+Submitting an ordinary prompt or editing the goal resumes continuation after
+the next normal settlement. This makes Escape an effective pause instead of
+letting the idle controller immediately restart the turn.
 
 The TUI holds only a sanitized render copy and displays it on the second header
 row. Saved sessions and autosave carry the raw optional goal. Startup restores
-it even when there is no queued turn; named `/load` replaces the current goal
-with the loaded session's value.
+it even when there is no queued turn and schedules one continuation; named
+`/load` replaces the current goal with the loaded session's value and reconciles
+its automatic queue entry. Once dispatched, a continuation carries
+`MessageOrigin::GoalContinuation`; matching text without that provenance
+remains ordinary user input in rendering and episodic capture.
 
 ## Ownership model
 
@@ -162,7 +184,8 @@ The prompt queue is a single shared state store. Each entry has:
 
 - a monotonically increasing `PromptId`;
 - the original text;
-- a delivery class (`Steer` or `FollowUp`).
+- a delivery class (`Steer` or `FollowUp`); and
+- a source (`User` or `GoalContinuation`).
 
 The TUI renders snapshots of this store; it does not maintain a second queue.
 The agent atomically claims steering entries at a safe boundary. The controller
@@ -184,7 +207,9 @@ draft -> queued -> claimed -> committed
 An item is removed from the visible queue only when it is atomically claimed.
 If submission fails before the agent records it, it is returned to the front
 of the queue. Undelivered steering entries become follow-ups when their target
-turn ends.
+turn ends. Goal continuations are labeled separately in the queue. Editing one
+converts it to an ordinary user prompt; loading a forged goal source whose text
+does not exactly match the host prompt also demotes it to user source.
 
 ## Safe steering boundary
 
@@ -211,12 +236,15 @@ Steering is never inserted:
 ## Code-mode boundary
 
 When built-in code mode is active, every provider request advertises exactly one
-native tool, `python`. Bridge names such as `tools.firecrawl_search` occur only
-inside that tool's `code` string. OpenAI-compatible servers are not trusted to
-honor the advertised set: if a model emits another native name, the agent pairs
-the anomalous use with a synthetic error, reports a provider-protocol violation,
-and asks the model to retry through `python`. It emits no tool-start event,
-requests no permission, and executes no registry tool for that response.
+native capability tool, `python`. While a goal is active it also advertises the
+host-owned `update_goal` control. That reserved name cannot be registered or
+called through the Python bridge. Bridge names such as `tools.firecrawl_search`
+occur only inside `python`'s `code` string. OpenAI-compatible servers are not
+trusted to honor the advertised set: if a model emits another native name, the
+agent pairs the anomalous use with a synthetic error, reports a
+provider-protocol violation, and asks the model to retry through `python`. It
+emits no tool-start event, requests no permission, and executes no registry
+tool for that response.
 
 Keeping the anomalous use and its synthetic result in history is intentional.
 Silently dropping either side would produce a transcript that does not match the
@@ -274,7 +302,9 @@ and current queue together to one file using flush, atomic rename, and
 parent-directory flush. A restart recovers queued work only with the
 conversation history from the same atomic snapshot; residual steers become
 follow-ups because their target turn no longer exists. Goal restoration is
-independent of queued-work recovery.
+independent of queued-work recovery. `HistoryCheckpoint` carries the goal along
+with history so the cross-channel display event for completion cannot race a
+checkpoint that still persists the old objective.
 
 Terminal actions explicitly report whether they changed the queue. Submission,
 edit, delete, reclassification, reorder, and restore trigger the atomic write;
@@ -316,6 +346,8 @@ tool data are not rewritten.
 9. The named memory worker is the sole SQLite connection owner in one process.
    Settled-turn capture is sent over a FIFO and never blocks terminal polling
    or enters model-visible prompt construction.
+10. At most one host-authored goal continuation is visible in the queue, and
+    none remains after goal completion or an outcome that pauses autorun.
 
 ## Alternatives rejected
 

@@ -75,17 +75,19 @@ pub(crate) fn python_tool_def(available_tools: &[ToolDef], code_only_tools: &[To
         name: PY_TOOL_NAME.to_string(),
         description: format!(
             "Execute a Python 3 script and return its stdout/stderr. This is the only \
-             model-facing tool while code mode is enabled: perform all tool work inside the \
-             script via the pre-generated `tools` module. A `tools.<name>` expression belongs \
-             inside the `code` string; never emit `<name>` or `tools.<name>` as a native tool \
-             call. Start with `import tools`, then call bridge functions with keyword arguments; \
-             they return str and raise RuntimeError on failure. Complete the largest coherent \
-             work phase in one script instead of returning after one bridged call: loop, branch, \
-             retry, validate, and combine results in code. Tool results stay inside the script \
-             unless printed. Print only conclusions, compact evidence, and paths; write large \
-             intermediate results to files. Output is truncated to the last 50,000 characters \
-             (full output is saved to a temp file whose path is included). Default timeout 120s \
-             (override with timeout_seconds, max 600).\n\nAvailable bridge tools:\n{}{}",
+             model-facing capability tool while code mode is enabled: perform all capability \
+             work inside the script via the pre-generated `tools` module. Host-owned control \
+             tools such as `update_goal` may also be advertised separately and must be called \
+             natively. A `tools.<name>` expression belongs inside the `code` string; never emit \
+             `<name>` or `tools.<name>` as a native tool call. Start with `import tools`, then \
+             call bridge functions with keyword arguments; they return str and raise \
+             RuntimeError on failure. Complete the largest coherent work phase in one script \
+             instead of returning after one bridged call: loop, branch, retry, validate, and \
+             combine results in code. Tool results stay inside the script unless printed. Print \
+             only conclusions, compact evidence, and paths; write large intermediate results to \
+             files. Output is truncated to the last 50,000 characters (full output is saved to a \
+             temp file whose path is included). Default timeout 120s (override with \
+             timeout_seconds, max 600).\n\nAvailable bridge tools:\n{}{}",
             tool_docs, code_only_note
         ),
         input_schema: json!({

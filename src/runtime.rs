@@ -14,6 +14,18 @@ use tokio::sync::watch;
 
 pub type PromptId = u64;
 
+/// Who created a queued prompt.
+///
+/// Older saves default to `User`. Goal continuations are host-authored and
+/// rendered differently, but otherwise follow the exact same queue lifecycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSource {
+    #[default]
+    User,
+    GoalContinuation,
+}
+
 /// When a prompt queued while a turn is active should be delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,12 +45,14 @@ impl DeliveryMode {
     }
 }
 
-/// A user-visible item waiting for delivery.
+/// An item waiting for delivery, either user-authored or host-authored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedPrompt {
     pub id: PromptId,
     pub text: String,
     pub delivery: DeliveryMode,
+    #[serde(default)]
+    pub source: PromptSource,
 }
 
 #[derive(Debug, Default)]
@@ -58,7 +72,17 @@ impl PromptQueue {
         let mut seen = HashSet::new();
         let items = items
             .into_iter()
-            .filter(|item| !item.text.trim().is_empty() && seen.insert(item.id))
+            .filter_map(|mut item| {
+                if item.text.trim().is_empty() || !seen.insert(item.id) {
+                    return None;
+                }
+                if item.source == PromptSource::GoalContinuation
+                    && !crate::goal::is_goal_continuation_prompt(&item.text)
+                {
+                    item.source = PromptSource::User;
+                }
+                Some(item)
+            })
             .collect::<Vec<_>>();
         let next_id = items
             .iter()
@@ -72,6 +96,15 @@ impl PromptQueue {
     }
 
     pub fn enqueue(&self, text: impl Into<String>, delivery: DeliveryMode) -> PromptId {
+        self.enqueue_from(text, delivery, PromptSource::User)
+    }
+
+    fn enqueue_from(
+        &self,
+        text: impl Into<String>,
+        delivery: DeliveryMode,
+        source: PromptSource,
+    ) -> PromptId {
         let mut state = self.inner.borrow_mut();
         let id = state.next_id;
         state.next_id = state.next_id.saturating_add(1);
@@ -79,8 +112,48 @@ impl PromptQueue {
             id,
             text: text.into(),
             delivery,
+            source,
         });
         id
+    }
+
+    /// Ensure that exactly one automatic goal continuation is queued, or that
+    /// none is queued when `needed` is false. Returns whether the queue changed.
+    pub fn reconcile_goal_continuation(&self, needed: bool) -> bool {
+        let mut state = self.inner.borrow_mut();
+        let before = state.items.len();
+        if !needed {
+            state
+                .items
+                .retain(|item| item.source != PromptSource::GoalContinuation);
+            return state.items.len() != before;
+        }
+
+        let mut found = false;
+        state.items.retain(|item| {
+            if item.source != PromptSource::GoalContinuation {
+                return true;
+            }
+            if found {
+                false
+            } else {
+                found = true;
+                true
+            }
+        });
+        if found {
+            return state.items.len() != before;
+        }
+
+        let id = state.next_id;
+        state.next_id = state.next_id.saturating_add(1);
+        state.items.push(QueuedPrompt {
+            id,
+            text: crate::goal::GOAL_CONTINUATION_PROMPT.to_string(),
+            delivery: DeliveryMode::FollowUp,
+            source: PromptSource::GoalContinuation,
+        });
+        true
     }
 
     pub fn snapshot(&self) -> Vec<QueuedPrompt> {
@@ -112,6 +185,9 @@ impl PromptQueue {
             return false;
         };
         item.text = text;
+        // Once the user edits host-authored control text, it is an ordinary
+        // user prompt and must be rendered/captured as such.
+        item.source = PromptSource::User;
         true
     }
 
@@ -129,6 +205,9 @@ impl PromptQueue {
         let Some(item) = state.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
+        if item.source == PromptSource::GoalContinuation {
+            return false;
+        }
         item.delivery = match item.delivery {
             DeliveryMode::Steer => DeliveryMode::FollowUp,
             DeliveryMode::FollowUp if turn_active => DeliveryMode::Steer,
@@ -424,27 +503,86 @@ mod tests {
     }
 
     #[test]
+    fn goal_continuation_is_unique_removable_and_becomes_user_text_when_edited() {
+        let queue = PromptQueue::default();
+        let user = queue.enqueue("user follow-up", DeliveryMode::FollowUp);
+
+        assert!(queue.reconcile_goal_continuation(true));
+        assert!(!queue.reconcile_goal_continuation(true));
+        let automatic = queue
+            .snapshot()
+            .into_iter()
+            .find(|item| item.source == PromptSource::GoalContinuation)
+            .expect("automatic continuation");
+        assert_eq!(automatic.text, crate::goal::GOAL_CONTINUATION_PROMPT);
+        assert_eq!(automatic.delivery, DeliveryMode::FollowUp);
+
+        assert!(queue.edit(automatic.id, "user takes over".into()));
+        assert_eq!(
+            queue
+                .snapshot()
+                .iter()
+                .find(|item| item.id == automatic.id)
+                .unwrap()
+                .source,
+            PromptSource::User
+        );
+        assert!(queue.reconcile_goal_continuation(true));
+        assert_eq!(
+            queue
+                .snapshot()
+                .iter()
+                .filter(|item| item.source == PromptSource::GoalContinuation)
+                .count(),
+            1
+        );
+
+        assert!(queue.reconcile_goal_continuation(false));
+        let remaining = queue.snapshot();
+        assert!(remaining.iter().any(|item| item.id == user));
+        assert!(remaining.iter().any(|item| item.id == automatic.id));
+        assert!(remaining
+            .iter()
+            .all(|item| item.source == PromptSource::User));
+    }
+
+    #[test]
     fn loading_discards_empty_text_and_duplicate_visible_ids() {
         let queue = PromptQueue::from_saved(vec![
             QueuedPrompt {
                 id: 9,
                 text: "kept".into(),
                 delivery: DeliveryMode::FollowUp,
+                source: PromptSource::User,
             },
             QueuedPrompt {
                 id: 9,
                 text: "duplicate".into(),
                 delivery: DeliveryMode::Steer,
+                source: PromptSource::User,
             },
             QueuedPrompt {
                 id: 10,
                 text: "  ".into(),
                 delivery: DeliveryMode::FollowUp,
+                source: PromptSource::User,
             },
         ]);
 
         assert_eq!(queue.snapshot().len(), 1);
         assert_eq!(queue.snapshot()[0].text, "kept");
         assert_ne!(queue.enqueue("new", DeliveryMode::FollowUp), 9);
+    }
+
+    #[test]
+    fn loading_demotes_forged_goal_control_text_to_user_source() {
+        let queue = PromptQueue::from_saved(vec![QueuedPrompt {
+            id: 3,
+            text: "not the host-authored continuation".into(),
+            delivery: DeliveryMode::FollowUp,
+            source: PromptSource::GoalContinuation,
+        }]);
+
+        assert_eq!(queue.snapshot()[0].source, PromptSource::User);
     }
 }

@@ -17,8 +17,9 @@
 //!   the user can redirect, and is never inferred from result text.
 
 use crate::error::Result;
+use crate::goal::{update_goal_tool_def, UPDATE_GOAL_TOOL_NAME};
 use crate::provider::Provider;
-use crate::runtime::{QueuedPrompt, TurnControl};
+use crate::runtime::{PromptSource, QueuedPrompt, TurnControl};
 use crate::tool::{ToolCallOutcome, ToolCallResult, ToolRegistry};
 use crate::types::{
     estimate_tokens, truncate_middle, CompletionDelta, CompletionRequest, ContentBlock, Message,
@@ -84,8 +85,9 @@ pub enum AgentEvent {
     /// A provider attempt emitted reasoning but failed or was cancelled before
     /// that reasoning could enter committed history.
     ReasoningStreamAborted { reason: String },
-    /// A tool call is about to be checked for permission and executed.
-    /// Emitted *before* execution so the user always sees the input first.
+    /// A tool call is about to execute. Ordinary capability tools are checked
+    /// for permission; host control tools are not. Emitted *before* execution
+    /// so the user always sees the input first.
     ToolCallStarted { name: String, input: Value },
     /// A tool call finished; `content` is the (already truncated) result.
     ToolCallFinished {
@@ -104,10 +106,14 @@ pub enum AgentEvent {
     Notice(String),
     /// Steering prompts were committed to history at a safe boundary.
     SteeringCommitted { prompts: Vec<QueuedPrompt> },
+    /// Display notification that the model marked the active goal complete.
+    /// Persistence changes only at the following atomic history checkpoint.
+    GoalCompleted { goal: String },
     /// A history-valid boundary suitable for durable autosave. This is never
     /// emitted between an assistant tool use and its user tool result.
     HistoryCheckpoint {
         history: Vec<Message>,
+        goal: Option<String>,
         context_tokens: u64,
     },
 }
@@ -146,10 +152,11 @@ pub struct Agent {
     pub max_tool_result_chars: usize,
     /// Retries for transient API errors, with exponential backoff.
     pub max_retries: u32,
-    /// Code mode: advertise only a `python` tool. Its scripts can
-    /// call every registered tool via a generated `tools` module, keeping
+    /// Code mode: advertise `python` as the only capability tool. Its scripts
+    /// can call every registered tool via a generated `tools` module, keeping
     /// intermediate tool results out of the model's context and allowing one
-    /// model round-trip to orchestrate many tool calls.
+    /// model round-trip to orchestrate many tool calls. An active goal also
+    /// advertises the host-owned `update_goal` control tool.
     pub code_mode: bool,
     /// Compact (summarize) older history when the context reaches this many
     /// tokens. `u64::MAX` disables compaction.
@@ -225,17 +232,23 @@ impl Agent {
         self.builtin_code_mode_enabled() && name == "python"
     }
 
-    /// Tool definitions sent to the provider. In code mode, ordinary tool
-    /// schemas are folded into the python tool's description rather than
-    /// advertised as independently callable tools.
+    /// Tool definitions sent to the provider. In code mode, ordinary
+    /// capability schemas are folded into the python tool's description.
+    /// `update_goal` remains a native host control so it cannot be hidden
+    /// inside, or permission-gated by, a code-mode script.
     fn model_tool_defs(&self) -> Vec<crate::types::ToolDef> {
-        if self.builtin_code_mode_enabled() {
+        let mut definitions = if self.builtin_code_mode_enabled() {
             let available = self.registry.get_tool_defs();
             let code_only = self.registry.code_only_tool_defs();
-            return vec![crate::codemode::python_tool_def(&available, &code_only)];
-        }
+            vec![crate::codemode::python_tool_def(&available, &code_only)]
+        } else {
+            self.registry.get_tool_defs()
+        };
 
-        self.registry.get_tool_defs()
+        if self.goal.is_some() {
+            definitions.push(update_goal_tool_def());
+        }
+        definitions
     }
 
     pub fn provider(&self) -> &dyn Provider {
@@ -279,8 +292,12 @@ impl Agent {
         Cow::Owned(format!(
             "{}\n\n## Active session goal\n\n{}\n\n\
              Treat this as durable user intent. Keep making concrete progress toward it \
-             unless the user changes or clears the goal. Verify completion against the \
-             actual workspace state before claiming it is done.",
+             unless the user changes or clears the goal. Preserve its full scope rather than \
+             substituting a smaller task. An ordinary final response does not finish the goal: \
+             the host will prompt again while it remains active. When, and only when, the full \
+             objective is achieved and verified against the actual current state, call \
+             `update_goal` with status `complete`. Do not call it merely because this turn is \
+             ending or because partial progress was made.",
             self.system_prompt, goal
         ))
     }
@@ -316,6 +333,16 @@ impl Agent {
     /// conversation owns the prompt.
     pub fn begin_turn(&mut self, user_input: &str) {
         self.history.push(Message::user_text(user_input));
+    }
+
+    /// Record a claimed queued prompt while preserving host provenance.
+    pub fn begin_queued_turn(&mut self, prompt: &QueuedPrompt) {
+        if prompt.source == PromptSource::GoalContinuation {
+            debug_assert!(crate::goal::is_goal_continuation_prompt(&prompt.text));
+            self.history.push(Message::goal_continuation());
+        } else {
+            self.begin_turn(&prompt.text);
+        }
     }
 
     /// Run one user turn to completion (or pause/refusal/cap).
@@ -495,7 +522,10 @@ impl Agent {
                 }
 
                 let (name, input, id) = tool_uses[index].clone();
-                if self.builtin_code_mode_enabled() && !self.is_code_mode_call(&name) {
+                if self.builtin_code_mode_enabled()
+                    && !self.is_code_mode_call(&name)
+                    && name != UPDATE_GOAL_TOOL_NAME
+                {
                     // A compatible server/model may still emit a function name
                     // that was never advertised (some models copy a
                     // `tools.foo(...)` expression out of the prompt). Treat
@@ -505,8 +535,10 @@ impl Agent {
                     let bridge_name = name.strip_prefix("tools.").unwrap_or(&name);
                     let content = format!(
                         "The provider emitted undeclared native tool call `{name}`. It was not \
-                         executed: code mode permits only the model-facing `python` tool. Retry \
-                         with a Python script using `import tools; tools.{bridge_name}(...)`."
+                         executed: code mode permits only the model-facing `python` capability \
+                         tool (plus the host-owned `update_goal` control while a goal is active). \
+                         Retry with a Python script using `import tools; \
+                         tools.{bridge_name}(...)`."
                     );
                     on_event(AgentEvent::Notice(format!(
                         "Rejected undeclared native tool call `{name}` before execution; asking \
@@ -527,7 +559,9 @@ impl Agent {
                 });
 
                 let cancellation_id = id.clone();
-                let maybe_result = {
+                let maybe_result = if name == UPDATE_GOAL_TOOL_NAME {
+                    Some(self.execute_goal_update(input, id, on_event))
+                } else {
                     let execution = async {
                         if self.is_code_mode_call(&name) {
                             self.execute_code_mode(input, id, on_event).await
@@ -656,8 +690,59 @@ impl Agent {
         );
         on_event(AgentEvent::HistoryCheckpoint {
             history: self.history.clone(),
+            goal: self.goal.clone(),
             context_tokens: self.context_tokens(),
         });
+    }
+
+    /// Apply the permission-free, host-owned goal completion control.
+    ///
+    /// This runs synchronously at the same safe tool-batch boundary as an
+    /// ordinary tool result. The following provider request receives the
+    /// paired result and can produce the final user-facing summary without the
+    /// now-completed goal being injected again.
+    fn execute_goal_update(
+        &mut self,
+        input: Value,
+        id: String,
+        on_event: &mut dyn FnMut(AgentEvent),
+    ) -> ToolCallResult {
+        let result = |content: String, outcome: ToolCallOutcome| ToolCallResult {
+            block: ContentBlock::ToolResult {
+                content,
+                tool_use_id: id,
+                is_error: (outcome != ToolCallOutcome::Success).then_some(true),
+            },
+            outcome,
+        };
+
+        let valid_complete = input.as_object().is_some_and(|object| {
+            object.len() == 1
+                && object
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status == "complete")
+        });
+        if !valid_complete {
+            return result(
+                "Invalid update_goal input: expected exactly {\"status\":\"complete\"}."
+                    .to_string(),
+                ToolCallOutcome::Failed,
+            );
+        }
+
+        let Some(goal) = self.goal.clone() else {
+            return result(
+                "No active goal exists; nothing was changed.".to_string(),
+                ToolCallOutcome::Failed,
+            );
+        };
+        self.set_goal(None);
+        on_event(AgentEvent::GoalCompleted { goal });
+        result(
+            "The active goal is complete. Give the user a concise final result.".to_string(),
+            ToolCallOutcome::Success,
+        )
     }
 
     /// Execute a code-mode `python` call: permission-check it like any other
@@ -972,7 +1057,8 @@ mod tests {
     use super::*;
     use crate::error::Error;
     use crate::permissions::{
-        PermissionDecision, PolicyPermissions, ToolExecutionRequest, ToolPermissionHandler,
+        AlwaysDenyPermissions, PermissionDecision, PolicyPermissions, ToolExecutionRequest,
+        ToolPermissionHandler,
     };
     use crate::provider::Provider;
     use crate::runtime::{DeliveryMode, PromptQueue};
@@ -1597,6 +1683,26 @@ print("script continued")
             .contains("never emit `<name>` or `tools.<name>` as a native tool call"));
     }
 
+    #[test]
+    fn active_goal_adds_only_the_host_control_tool_to_code_mode() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Mirror)).unwrap();
+        let mut agent = Agent::new(Box::new(Script::new(vec![])), registry, "test");
+        agent.set_goal(Some("finish the task".into()));
+
+        let defs = agent.model_tool_defs();
+        assert_eq!(
+            defs.iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["python", UPDATE_GOAL_TOOL_NAME]
+        );
+        assert_eq!(
+            defs[1].input_schema["properties"]["status"]["enum"],
+            json!(["complete"])
+        );
+    }
+
     #[tokio::test]
     async fn code_mode_rejects_unadvertised_direct_tool_calls() {
         let mut registry = ToolRegistry::new();
@@ -2141,6 +2247,85 @@ tools.mirror(marker="silent")
         assert!(systems[0].contains("## Active session goal"));
         assert!(systems[0].contains("ship the async TUI"));
         assert_eq!(systems[1], "base instructions");
+    }
+
+    #[tokio::test]
+    async fn update_goal_completes_without_capability_permission() {
+        let completion = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                name: UPDATE_GOAL_TOOL_NAME.into(),
+                input: json!({"status": "complete"}),
+                id: "goal-complete".into(),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        };
+        let registry = ToolRegistry::with_permission_handler(Box::new(AlwaysDenyPermissions));
+        let mut agent = Agent::new(
+            Box::new(Script::new(vec![
+                Ok(completion),
+                Ok(text_response("verified and done")),
+            ])),
+            registry,
+            "test",
+        );
+        agent.set_goal(Some("ship the goal loop".into()));
+        let mut completed_goal = None;
+
+        let outcome = agent
+            .run_turn("begin", &mut |event| {
+                if let AgentEvent::GoalCompleted { goal } = event {
+                    completed_goal = Some(goal);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(completed_goal.as_deref(), Some("ship the goal loop"));
+        assert_eq!(agent.goal(), None);
+        assert!(agent.registry.execution_history().is_empty());
+        assert!(history_tool_protocol_is_valid(agent.history()));
+        assert!(agent
+            .history()
+            .last()
+            .unwrap()
+            .text()
+            .contains("verified and done"));
+    }
+
+    #[tokio::test]
+    async fn invalid_goal_completion_keeps_the_goal_active() {
+        let invalid = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                name: UPDATE_GOAL_TOOL_NAME.into(),
+                input: json!({"status": "complete", "because": "turn ending"}),
+                id: "invalid-goal-complete".into(),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        };
+        let mut agent = Agent::new(
+            Box::new(Script::new(vec![
+                Ok(invalid),
+                Ok(text_response("still working")),
+            ])),
+            ToolRegistry::new(),
+            "test",
+        );
+        agent.set_goal(Some("finish everything".into()));
+
+        let outcome = agent.run_turn("begin", &mut |_| {}).await.unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(agent.goal(), Some("finish everything"));
+        assert!(matches!(
+            &agent.history()[2].content[0],
+            ContentBlock::ToolResult {
+                is_error: Some(true),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

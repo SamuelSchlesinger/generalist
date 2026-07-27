@@ -53,6 +53,7 @@ pub(crate) mod codemode;
 pub mod command;
 pub mod error;
 pub mod execution;
+pub mod goal;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;
@@ -72,6 +73,7 @@ pub use command::{
 };
 pub use error::{Error, Result};
 pub use execution::{ExecutionState, ToolExecution};
+pub use goal::{is_goal_continuation_prompt, GOAL_CONTINUATION_PROMPT, UPDATE_GOAL_TOOL_NAME};
 pub use memory::{
     default_memory_path, discover_project_root, Episode, EpisodeEvent, EpisodeOutcome,
     EpisodeSummary, EpisodicMemory, ForgetResult, MemoryEvent, MemoryStatus,
@@ -83,11 +85,12 @@ pub use permissions::{
 };
 pub use provider::Provider;
 pub use runtime::{
-    CancelHandle, DeliveryMode, PromptClaim, PromptId, PromptQueue, QueuedPrompt, TurnControl,
+    CancelHandle, DeliveryMode, PromptClaim, PromptId, PromptQueue, PromptSource, QueuedPrompt,
+    TurnControl,
 };
 pub use state::SavedState;
 pub use tool::{Tool, ToolCallOutcome, ToolCallResult, ToolRegistry};
 pub use types::{
     estimate_tokens, truncate_middle, CompletionDelta, CompletionRequest, CompletionResponse,
-    ContentBlock, Message, StopReason, ToolDef, ToolUse, Usage,
+    ContentBlock, Message, MessageOrigin, StopReason, ToolDef, ToolUse, Usage,
 };

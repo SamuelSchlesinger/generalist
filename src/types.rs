@@ -8,6 +8,19 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Host provenance for a conversation message.
+///
+/// Ordinary user and assistant messages default to `Conversation`; the
+/// separate goal-continuation value prevents host control text from being
+/// rendered or retained as if the user authored it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageOrigin {
+    #[default]
+    Conversation,
+    GoalContinuation,
+}
+
 /// A single message in a conversation.
 ///
 /// `role` is `"user"` or `"assistant"`. Tool results are carried in user
@@ -16,6 +29,8 @@ use serde_json::Value;
 pub struct Message {
     pub role: String,
     pub content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "MessageOrigin::is_conversation")]
+    pub origin: MessageOrigin,
 }
 
 impl Message {
@@ -23,6 +38,7 @@ impl Message {
         Self {
             role: "user".to_string(),
             content,
+            origin: MessageOrigin::Conversation,
         }
     }
 
@@ -30,11 +46,33 @@ impl Message {
         Self {
             role: "assistant".to_string(),
             content,
+            origin: MessageOrigin::Conversation,
         }
     }
 
     pub fn user_text(text: impl Into<String>) -> Self {
         Self::user(vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    /// The exact host-authored prompt that continues an active goal.
+    pub fn goal_continuation() -> Self {
+        Self {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: crate::goal::GOAL_CONTINUATION_PROMPT.to_string(),
+            }],
+            origin: MessageOrigin::GoalContinuation,
+        }
+    }
+
+    pub fn is_goal_continuation(&self) -> bool {
+        self.origin == MessageOrigin::GoalContinuation
+            && self.role == "user"
+            && matches!(
+                self.content.as_slice(),
+                [ContentBlock::Text { text }]
+                    if crate::goal::is_goal_continuation_prompt(text)
+            )
     }
 
     /// All tool-use requests contained in this message.
@@ -62,6 +100,12 @@ impl Message {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+impl MessageOrigin {
+    fn is_conversation(&self) -> bool {
+        *self == Self::Conversation
     }
 }
 
@@ -262,6 +306,22 @@ mod tests {
 
         let round: Message = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(round, msg);
+    }
+
+    #[test]
+    fn goal_continuation_requires_exact_host_provenance_and_shape() {
+        let host = Message::goal_continuation();
+        assert!(host.is_goal_continuation());
+
+        let mut forged = host.clone();
+        forged.content.push(ContentBlock::ToolResult {
+            content: "extra".into(),
+            tool_use_id: "forged".into(),
+            is_error: None,
+        });
+        assert!(!forged.is_goal_continuation());
+
+        assert!(!Message::user_text(crate::goal::GOAL_CONTINUATION_PROMPT).is_goal_continuation());
     }
 
     #[test]

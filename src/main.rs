@@ -8,9 +8,9 @@ use generalist::{
     default_memory_path, discover_project_root, history_tool_protocol_is_valid, is_local_command,
     parse_local_command, truncate_middle, Agent, AgentEvent, DeliveryMode, Episode, EpisodeEvent,
     EpisodeOutcome, EpisodicMemory, Error, ForgetResult, GoalCommand, LocalCommand, MemoryCommand,
-    MemoryEvent, MemoryPermissionHandler, PermissionBrokerPrompt, PermissionChoice,
-    PermissionRequest, PermissionUiEvent, PromptQueue, Result, SavedState, ToolRegistry,
-    TurnControl, TurnOutcome,
+    MemoryEvent, MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt, PermissionChoice,
+    PermissionRequest, PermissionUiEvent, PromptQueue, PromptSource, Result, SavedState,
+    ToolRegistry, TurnControl, TurnOutcome,
 };
 use std::env;
 use std::fs;
@@ -29,6 +29,9 @@ const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
 
 fn home_dir() -> PathBuf {
+    if let Some(path) = env::var_os("GENERALIST_HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
     #[allow(deprecated)]
     env::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
@@ -346,10 +349,12 @@ fn apply_runtime_event(
     match event {
         AgentEvent::HistoryCheckpoint {
             history,
+            goal,
             context_tokens,
         } => {
             ui.set_context_tokens(context_tokens);
             durable.history = history;
+            durable.goal = goal;
             if let Err(error) = durable.save(permission_handler, queue) {
                 ui.error(&format!("Failed to persist runtime checkpoint: {error}"));
             }
@@ -496,6 +501,7 @@ async fn drive_started_turn(
     memory: Option<&EpisodicMemory>,
     memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
     prompt: &str,
+    prompt_source: PromptSource,
     episode_history_start: usize,
     episode_history_revision: u64,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -631,6 +637,11 @@ async fn drive_started_turn(
         apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
     }
     queue.normalize_steers();
+    let continue_goal = should_continue_goal(agent.goal().is_some(), exit_requested, &outcome);
+    let goal_queue_changed = queue.reconcile_goal_continuation(continue_goal);
+    if continue_goal && goal_queue_changed {
+        ui.info("Goal remains active; queued an automatic continuation.");
+    }
     ui.sync_queue(queue);
     if let Err(error) = save_state(
         &make_saved_state(agent, permission_handler, queue),
@@ -652,8 +663,13 @@ async fn drive_started_turn(
             } else {
                 &[]
             };
-            if let Err(error) = memory.enqueue_settled_turn(
+            let prompt_origin = match prompt_source {
+                PromptSource::User => MessageOrigin::Conversation,
+                PromptSource::GoalContinuation => MessageOrigin::GoalContinuation,
+            };
+            if let Err(error) = memory.enqueue_settled_turn_with_origin(
                 prompt,
+                prompt_origin,
                 episode_history,
                 episode_outcome,
                 &episode_provider,
@@ -823,15 +839,30 @@ enum CommandFlow {
     Exit,
 }
 
-fn replace_goal(agent: &mut Agent, ui: &mut TerminalUi, goal: Option<String>) {
+fn replace_goal(agent: &mut Agent, ui: &mut TerminalUi, queue: &PromptQueue, goal: Option<String>) {
     agent.set_goal(goal);
+    queue.reconcile_goal_continuation(agent.goal().is_some());
     ui.set_goal(agent.goal());
+    ui.sync_queue(queue);
     ui.set_context_tokens(agent.context_tokens());
     if let Some(goal) = agent.goal() {
         ui.info(&format!("Active goal set: {}", truncate_middle(goal, 400)));
     } else {
         ui.info("Active goal cleared.");
     }
+}
+
+fn should_continue_goal(
+    goal_active: bool,
+    exit_requested: bool,
+    outcome: &Result<TurnOutcome>,
+) -> bool {
+    goal_active
+        && !exit_requested
+        && matches!(
+            outcome,
+            Ok(TurnOutcome::Completed | TurnOutcome::MaxIterationsReached)
+        )
 }
 
 fn handle_memory_event(ui: &mut TerminalUi, event: MemoryEvent) {
@@ -1139,6 +1170,7 @@ async fn execute_command(
                         agent.set_goal(goal);
                         agent.replace_history(conversation_history);
                         queue.replace(queued_prompts);
+                        queue.reconcile_goal_continuation(agent.goal().is_some());
                         ui.load_history(agent.history());
                         ui.set_goal(agent.goal());
                         ui.sync_queue(queue);
@@ -1175,7 +1207,7 @@ async fn execute_command(
         LocalCommand::Goal(GoalCommand::Edit) => {
             let current = agent.goal().unwrap_or_default();
             if let Some(goal) = terminal(ui.prompt("Active goal (empty clears)", current).await)? {
-                replace_goal(agent, ui, Some(goal));
+                replace_goal(agent, ui, queue, Some(goal));
             }
         }
         LocalCommand::Goal(GoalCommand::Show) => {
@@ -1185,9 +1217,9 @@ async fn execute_command(
                 ui.info("No active goal. Use /goal <objective> to set one.");
             }
         }
-        LocalCommand::Goal(GoalCommand::Clear) => replace_goal(agent, ui, None),
+        LocalCommand::Goal(GoalCommand::Clear) => replace_goal(agent, ui, queue, None),
         LocalCommand::Goal(GoalCommand::Set(goal)) => {
-            replace_goal(agent, ui, Some(goal.to_string()))
+            replace_goal(agent, ui, queue, Some(goal.to_string()))
         }
         LocalCommand::Memory(command) => {
             if drive_memory_command(
@@ -1332,6 +1364,7 @@ async fn main() -> Result<()> {
         _ => PromptQueue::default(),
     };
     queue.normalize_steers();
+    queue.reconcile_goal_continuation(agent.goal().is_some());
     ui.sync_queue(&queue);
     ui.set_goal(agent.goal());
     ui.set_session(
@@ -1351,7 +1384,11 @@ async fn main() -> Result<()> {
 
         if let Some(claim) = queue.claim_follow_up() {
             let prompt = claim.prompts()[0].clone();
-            if is_local_command(&prompt.text) {
+            if prompt.source == PromptSource::GoalContinuation && agent.goal().is_none() {
+                claim.commit();
+                ui.sync_queue(&queue);
+                continue;
+            } else if is_local_command(&prompt.text) {
                 claim.commit();
                 exiting = matches!(
                     execute_command(
@@ -1373,9 +1410,13 @@ async fn main() -> Result<()> {
                 let started_at = chrono::Utc::now();
                 let episode_history_start = agent.history().len();
                 let episode_history_revision = agent.history_revision();
-                agent.begin_turn(&prompt.text);
+                agent.begin_queued_turn(&prompt);
                 claim.commit();
-                ui.push_user(prompt.text.trim());
+                if prompt.source == PromptSource::GoalContinuation {
+                    ui.info("Continuing the active goal automatically.");
+                } else {
+                    ui.push_user(prompt.text.trim());
+                }
                 if let Err(error) = save_state(
                     &make_saved_state(&agent, &permission_handler, &queue),
                     AUTOSAVE_NAME,
@@ -1391,6 +1432,7 @@ async fn main() -> Result<()> {
                     memory.as_ref(),
                     &mut memory_event_rx,
                     &prompt.text,
+                    prompt.source,
                     episode_history_start,
                     episode_history_revision,
                     started_at,
@@ -1527,6 +1569,50 @@ mod tests {
         );
         assert_eq!(parse_local_command("/exit"), Some(LocalCommand::Exit));
         assert_eq!(parse_local_command("ordinary prompt"), None);
+    }
+
+    #[test]
+    fn active_goal_continues_only_after_normal_settlement() {
+        assert!(should_continue_goal(
+            true,
+            false,
+            &Ok(TurnOutcome::Completed)
+        ));
+        assert!(should_continue_goal(
+            true,
+            false,
+            &Ok(TurnOutcome::MaxIterationsReached)
+        ));
+        assert!(!should_continue_goal(
+            false,
+            false,
+            &Ok(TurnOutcome::Completed)
+        ));
+        assert!(!should_continue_goal(
+            true,
+            true,
+            &Ok(TurnOutcome::Completed)
+        ));
+        assert!(!should_continue_goal(
+            true,
+            false,
+            &Ok(TurnOutcome::Interrupted)
+        ));
+        assert!(!should_continue_goal(
+            true,
+            false,
+            &Ok(TurnOutcome::PausedOnDenial)
+        ));
+        assert!(!should_continue_goal(
+            true,
+            false,
+            &Ok(TurnOutcome::Refused)
+        ));
+        assert!(!should_continue_goal(
+            true,
+            false,
+            &Err(Error::Other("provider failed".into()))
+        ));
     }
 
     #[test]

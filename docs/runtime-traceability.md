@@ -20,12 +20,15 @@ the TUI refines that environment by disabling some user transitions; it never
 adds an enqueue transition forbidden by the model. Local commands, goal
 editing, manual save/load/compaction, startup tool discovery, and provider
 selection execute only outside a mutation-capable turn and are reviewed
-separately for that ownership guard. Goal text and other provider payloads are
-hidden data in this model: an idle goal mutation refines a TLA+ stutter step.
-Reasoning-inspector contents and scroll are also hidden display data. Copy-mode
-ownership itself is modeled because it gates all concrete terminal actions:
-while `copyMode` is true, provider/tool progress remains enabled but queue,
-cancel, and permission-choice input is disabled.
+separately for that ownership guard. Goal text, active/completed status,
+prompt/message provenance, and other provider payloads are hidden data in this model. Setting or
+clearing only the objective refines a TLA+ stutter step; scheduling a
+host-authored continuation linearizes to `Enqueue`, and the permission-free
+completion control linearizes to `CompleteTool` plus a hidden goal-state
+mutation. Reasoning-inspector contents and scroll are also hidden display data.
+Copy-mode ownership itself is modeled because it gates all concrete terminal
+actions: while `copyMode` is true, provider/tool progress remains enabled but
+queue, cancel, and permission-choice input is disabled.
 
 ## State mapping
 
@@ -34,7 +37,7 @@ cancel, and permission-choice input is disabled.
 | `copyMode` | `tui::AppState::copy_mode`, changed only by `TerminalUi::toggle_copy_mode` | It controls terminal ownership/redraw only; no queue, history, permission ID, or turn state moves with the toggle. |
 | `phase` | Control location in `main::drive_started_turn`, `Agent::run_started_turn`, and the permission broker | It is a model program counter, not a second mutable Rust enum that could drift. |
 | `activeTurn` | The one prompt synchronously recorded by `Agent::begin_turn` before the controller pins the sole `&mut Agent` future | The current-thread reactor cannot start another turn until that future returns. |
-| `queue`, `delivery` | `runtime::PromptQueue` containing `QueuedPrompt { id, text, delivery }` | `Rc<RefCell<_>>` is the sole store; `tui::AppState::queue` is a render snapshot only. |
+| `queue`, `delivery` | `runtime::PromptQueue` containing `QueuedPrompt { id, text, delivery, source }` | `Rc<RefCell<_>>` is the sole store; `tui::AppState::queue` is a render snapshot only. `PromptSource` is hidden payload, not a second modeled lifecycle. |
 | `lifecycle`, `claimedSteers` | `PromptClaim` ownership plus visible membership in `PromptQueue` | `lifecycle` is a ghost variable. `Drop` requeues uncommitted IDs; `commit` consumes them. |
 | `settledTurns`, `interruptedTurns`, `committedOrder` | `TurnOutcome`, `SteeringCommitted`, and the ordering of queue claim events | These are proof-history variables; committed prompt IDs are not duplicated in model-visible message text. |
 | `toolUses`, `toolResults` | `tool_uses`, `results`, and `index` in `Agent::run_started_turn` | The result message is appended only after every ID has a real or synthetic result. |
@@ -47,7 +50,7 @@ cancel, and permission-choice input is disabled.
 
 | TLA+ action | Concrete Rust transition | Deterministic evidence |
 | --- | --- | --- |
-| `Enqueue` | `tui::submission_delivery` selects steer/follow-up; `main::enqueue_submission` forces idle and local-command submissions to follow-up; `PromptQueue::enqueue` assigns the ID. | `composer_keys_distinguish_busy_steering_from_followups`, `duplicate_text_keeps_distinct_stable_ids` |
+| `Enqueue` | `tui::submission_delivery` selects steer/follow-up; `main::enqueue_submission` forces idle and local-command submissions to follow-up; `PromptQueue::enqueue` assigns user IDs. After a normally settled active-goal turn, `reconcile_goal_continuation(true)` appends at most one host-authored follow-up with the same fresh-ID transition. | `composer_keys_distinguish_busy_steering_from_followups`, `duplicate_text_keeps_distinct_stable_ids`, `goal_continuation_is_unique_removable_and_becomes_user_text_when_edited`, `active_goal_continues_only_after_normal_settlement` |
 | `DeleteQueued` | Queue modal deletion routes the selected stable ID to `PromptQueue::delete`. Restore is the same modeled removal plus a display-only move into an empty composer; it is refused over an existing draft. | `queue_manager_mutations_address_stable_ids`, `restoring_queue_text_never_overwrites_a_draft` |
 | `ReclassifyQueued` | Queue modal `s` calls `PromptQueue::toggle_delivery`; idle cannot create a steer. | `queue_manager_mutations_address_stable_ids`, `ending_turn_normalizes_undelivered_steers` |
 | `MoveQueuedEarlier` | Queue modal Ctrl+Up/Down calls `PromptQueue::move_by` by ID. | `queue_manager_mutations_address_stable_ids` |
@@ -59,7 +62,7 @@ cancel, and permission-choice input is disabled.
 | `ProviderAnswer` | `complete_with_retry` commits a complete assistant response, emits no partial response into history, then reaches the no-tools boundary. Text and provider-supplied reasoning are separate display deltas; aborted streams receive separate display-only uncommitted markers. | `steering_queued_during_final_response_gets_another_model_call`, `provider_cancellation_commits_no_partial_assistant_message`, `cancelling_a_partial_stream_marks_the_visible_text_uncommitted`, `streamed_text_is_not_double_emitted`, `provider_reasoning_stays_out_of_chat_and_has_a_live_inspector` |
 | `ProviderRefusal` | Refusal pairs any anomalous tool uses with synthetic errors, checkpoints, and returns without accepting steering. | `refusal_with_tool_uses_is_repaired_before_checkpointing` |
 | `ProviderToolBatch` | A committed assistant response is scanned into a finite `tool_uses` vector; one loop iteration is consumed. | `tool_results_are_truncated_in_history`, `iteration_limit_leaves_late_steering_for_controller_normalization` |
-| `CompleteTool` | Tools run sequentially; each outcome becomes one `ToolResult`. Truncation and unknown tools also return structured results. In code mode, an undeclared native call is never started or permission-checked and receives a synthetic error result. | `tool_results_are_truncated_in_history`, `history_survives_api_errors_after_tool_execution`, `code_mode_rejects_unadvertised_direct_tool_calls` |
+| `CompleteTool` | Tools run sequentially; each outcome becomes one `ToolResult`. Truncation and unknown tools also return structured results. In code mode, an undeclared native call is never started or permission-checked and receives a synthetic error result. The reserved `update_goal` host control validates exact completion input, clears hidden goal state without capability permission, and produces a normal paired result at this same boundary. | `tool_results_are_truncated_in_history`, `history_survives_api_errors_after_tool_execution`, `code_mode_rejects_unadvertised_direct_tool_calls`, `update_goal_completes_without_capability_permission`, `invalid_goal_completion_keeps_the_goal_active` |
 | `AskPermission` | `PermissionBrokerPrompt::choose` allocates a monotonic request ID, sends one `PermissionRequest`, and awaits its one-shot. | `broker_correlates_the_ui_reply_with_its_request` |
 | `AllowPermission` | The reactor sends the choice only when the modal ID equals the live request ID; the handler records `AllowAlways` before execution. | `broker_request_ids_keep_out_of_order_replies_correlated`, `memory_handler_remembers_decisions_without_prompting` |
 | `DenyPermission` | A denial becomes a structured denied result. Denials inside code-mode bridge calls propagate through `ScriptResult::denied` even if Python exits successfully. | `dropped_broker_reply_denies_instead_of_hanging`, `denial_inside_code_mode_pauses_the_outer_turn` |
@@ -68,7 +71,7 @@ cancel, and permission-choice input is disabled.
 | `CommitSteering` | `Agent::commit_steering` appends claimed text to the valid user boundary, commits IDs, emits `SteeringCommitted`, and checkpoints with no await between those operations. | `steering_queued_during_final_response_gets_another_model_call` |
 | `RequeueSteering` | Dropping an uncommitted steering claim restores the same IDs at the front. Normal commit contains no fallible/await boundary. | `dropped_steering_claim_restores_the_same_ids_at_the_front` |
 | `ContinueAfterTools` | A complete, non-denied tool-result batch with capacity remaining loops to the next provider request. | `tool_results_are_truncated_in_history`, `history_survives_api_errors_after_tool_execution` |
-| `SettleTurn` | Answer, refusal, denial, or iteration cap returns a `TurnOutcome`; the controller releases `&mut Agent`, converts remaining steers to follow-ups, writes one atomic autosave containing history and queue, and only then offers the protocol-valid settled history to the independent memory FIFO. | `refusal_with_tool_uses_is_repaired_before_checkpointing`, `denial_inside_code_mode_pauses_the_outer_turn`, `iteration_limit_leaves_late_steering_for_controller_normalization`, `episodes_omit_reasoning_and_tool_payloads` |
+| `SettleTurn` | Answer, refusal, denial, or iteration cap returns a `TurnOutcome`; the controller releases `&mut Agent`, converts remaining steers to follow-ups, reconciles automatic goal work, writes one atomic autosave containing history, goal, prompt sources, and queue, and only then offers protocol-valid settled history to the independent memory FIFO. Completed/capped active goals linearize to `SettleTurn` followed by modeled `Enqueue`; interruption, refusal, denial, error, or exit removes automatic entries and pauses without clearing the goal. | `refusal_with_tool_uses_is_repaired_before_checkpointing`, `denial_inside_code_mode_pauses_the_outer_turn`, `iteration_limit_leaves_late_steering_for_controller_normalization`, `active_goal_continues_only_after_normal_settlement`, `episodes_omit_reasoning_and_tool_payloads` |
 | `RequestCancel` | Esc/Ctrl+C retires a live permission with deny-once, sets the turn-scoped watch flag, and keeps polling the controlled future until repair completes. | `cancellation_wins_over_a_ready_permission_before_steering`, `provider_cancellation_commits_no_partial_assistant_message` |
 | `RepairCancelledTool` | Cancellation drops the running tool future and emits synthetic error results for it and every unstarted tool use. | `interruption_pairs_the_running_and_unstarted_tool_uses`, `history_tool_protocol_is_valid` debug assertion |
 | `FinishCancellation` | After results are appended, the agent checkpoints and returns `Interrupted`; the controller retires nested TUI activity and normalizes undelivered steers. | `interruption_pairs_the_running_and_unstarted_tool_uses`, `interrupted_turn_retires_all_nested_activity`, `ending_turn_normalizes_undelivered_steers` |
@@ -81,7 +84,7 @@ cancel, and permission-choice input is disabled.
 | `TypeOK` | Rust enums and ownership constrain concrete values; TLC separately checks every modeled variable over the configured state space. |
 | `QueueIdentity` | `PromptQueue` owns one vector, saved duplicate IDs are filtered, all mutations address IDs, and claims remove before returning. Covered by the runtime queue tests. |
 | `SingleTurnOwnership` | A current-thread reactor pins one future borrowing `&mut Agent`; the outer loop cannot dispatch again until it returns. No `Arc<Mutex<Agent>>` or background runtime exists. |
-| `DeliveryIsWellFormed` | `DeliveryMode` has only two variants; idle submissions are forced to follow-up and all residual steers are normalized when ownership ends. |
+| `DeliveryIsWellFormed` | `DeliveryMode` has only two variants; idle submissions and host goal continuations are follow-ups, and all residual steers are normalized when ownership ends. `PromptSource` does not alter delivery semantics. |
 | `SafeSteeringBoundary` | `commit_steering` is called only after a complete assistant answer or after the full result vector is appended. It is not called on refusal, cancellation, or an exhausted iteration budget. |
 | `TerminalReasonIsWellFormed` | Distinct Rust branches implement final answer, refusal, structured denial, and cap. The cancellation/permission race test prevents a cancelled turn from taking the denial-to-steer branch. |
 | `ToolHistoryIsValid` | `history_tool_protocol_is_valid` checks exact adjacent ID sets; every emitted `HistoryCheckpoint` debug-asserts it, every persistence path refuses an invalid history, load rejects invalid saves, and cancellation/refusal tests inspect checkpoint histories. |
@@ -132,8 +135,8 @@ coincidentally identical later user message.
 
 | TLA+ action | Concrete Rust transition | Deterministic evidence |
 | --- | --- | --- |
-| `StartTurn` | The idle controller commits one follow-up with `Agent::begin_turn`; memory has no persisted or retrievable draft. | existing prompt-claim tests; source-order review in `main` |
-| `SettleTurn` | After the ordinary runtime settles and its autosave is attempted, `drive_started_turn` maps `TurnOutcome` (or error) to `EpisodeOutcome` and sends the history tail anchored immediately before `begin_turn`. Duplicate steering text cannot move that boundary. If `history_revision` shows that in-turn compaction relocated it, capture degrades to the original prompt and labels the record `prompt_only`. | `compaction_summarizes_old_history_and_preserves_recent`, `episodes_omit_reasoning_and_tool_payloads`, `duplicate_steering_text_does_not_move_the_episode_boundary`, `a_relocated_history_boundary_degrades_to_prompt_only` |
+| `StartTurn` | The idle controller commits one follow-up with `Agent::begin_turn`; memory has no persisted or retrievable draft. `PromptSource` does not change the modeled lifecycle. | existing prompt-claim tests; source-order review in `main` |
+| `SettleTurn` | After the ordinary runtime settles and its autosave is attempted, `drive_started_turn` maps `TurnOutcome` (or error) to `EpisodeOutcome` and sends the history tail anchored immediately before `begin_turn`. Duplicate steering text cannot move that boundary. Host-authored goal continuations are filtered rather than retained as user text. If `history_revision` shows that in-turn compaction relocated the boundary, capture degrades to the original prompt and labels the record `prompt_only`. | `compaction_summarizes_old_history_and_preserves_recent`, `episodes_omit_reasoning_and_tool_payloads`, `host_goal_continuations_are_not_retained_as_user_authored_text`, `duplicate_steering_text_does_not_move_the_episode_boundary`, `a_relocated_history_boundary_degrades_to_prompt_only` |
 | `RecordEpisode` | `MemoryWorker::record` rechecks the project capture setting and performs one immutable-row `INSERT`; SQLite atomicity chooses a whole row or no row. | `episodes_are_immutable_but_can_be_forgotten_from_the_live_store` |
 | `SkipEpisode` | The worker observes disabled capture and returns `Ok(None)` without executing an insert. | `capture_is_paused_by_default` |
 | `FailEpisode` | Any setting/serialization/SQLite error returns no live ID; asynchronous captures emit `MemoryEvent::CaptureFailed`. | schema/immutability tests plus explicit error branch review |
@@ -146,9 +149,11 @@ concrete operations still run on the worker; `drive_memory_command` continues
 polling terminal input, queue edits, stale permissions, memory events, and
 frame ticks while awaiting the reply. Tool inputs/results and all
 `Thinking`/`RedactedThinking` payloads are structurally omitted before the
-record request is sent. This smallest slice derives tool metadata from
-committed history, so code mode records the outer `python` use/result rather
-than nested bridge activity.
+record request is sent. A message with host goal-continuation provenance is
+likewise omitted before storage rather than misclassified as user-authored
+memory; matching text without that provenance is retained normally. This
+smallest slice derives tool metadata from committed history, so code mode
+records the outer `python` use/result rather than nested bridge activity.
 
 ### Memory property mapping
 
@@ -168,16 +173,20 @@ controller keeps a clone of the latest history-valid boundary and active goal
 while the agent future owns `&mut Agent`. Queue edits write that boundary, goal,
 and current queue together to `~/.generalist/history/autosave.json` using
 flush, atomic rename, and parent-directory flush. `HistoryCheckpoint` replaces
-the history boundary only after `history_tool_protocol_is_valid` holds. On
-restart, the goal is restored independently; queued work is recovered only
-together with that autosaved conversation. Because no turn survives a process
-exit, residual steers are normalized to follow-ups. The
+the history boundary and its corresponding goal only after
+`history_tool_protocol_is_valid` holds. Carrying both in one event prevents the
+separate display notification for `GoalCompleted` from racing persistence. On
+restart, the goal is restored independently and its next continuation is
+reconciled; queued work is recovered only together with that autosaved
+conversation. Because no turn survives a process exit, residual steers are
+normalized to follow-ups. The
 `structured_state_does_not_collide_with_legacy_input_history_file` and
 `persistence_rejects_an_invalid_tool_protocol_boundary` tests exercise the
 filesystem and protocol guards; the state round-trip test covers the optional
-goal. `UiAction::QueueChanged` and `Submit` are the only terminal-event effects
-that request an autosave; idle local commands are persisted by the controller
-after execution. Display-only actions are covered by
+goal and backward-compatible default user prompt source. `UiAction::QueueChanged`
+and `Submit` are the only terminal-event effects that request an autosave; idle
+local commands and host goal scheduling are persisted by the controller after
+execution. Display-only actions are covered by
 `only_queue_mutations_request_terminal_event_persistence`.
 
 ## Deliberate abstraction boundaries and residual risks
@@ -195,9 +204,10 @@ after execution. Display-only actions are covered by
   memory but cannot indefinitely starve terminal input outside the user's
   explicit copy-mode pause.
 - Provider tool-name validation is an implementation strengthening outside the
-  model's payload abstraction. Code mode advertises only `python`; an undeclared
-  response is paired with an error for `ToolHistoryIsValid` but is never exposed
-  as executable tool activity.
+  model's payload abstraction. Code mode advertises only `python` as a
+  capability plus the reserved `update_goal` control while a goal is active; any
+  other undeclared response is paired with an error for `ToolHistoryIsValid`
+  but is never exposed as executable tool activity.
 - `NoAutomaticRetrieval` is not a same-UID filesystem sandbox. The advertised
   `python` tool has standard-library file access and can read the SQLite file if
   explicitly directed to its path; the invariant covers the absence of a
@@ -217,9 +227,13 @@ after execution. Display-only actions are covered by
   subprocess/socket mechanics are outside the model.
 - Typed local commands, including `/goal edit`, and `/load` mutate session
   state only while idle. They are outside the active-turn model and must retain
-  that guard. The active goal is host instruction state, not conversation
+  that guard. The active objective is host instruction state, not conversation
   history; `active_goal_is_injected_without_entering_conversation_history`
-  checks that boundary.
+  checks that boundary. The short host continuation is conversation protocol
+  rather than user-authored text: it carries `PromptSource::GoalContinuation`
+  while queued and `MessageOrigin::GoalContinuation` after dispatch, renders as
+  info, and is omitted from episodic user text. Matching text without that
+  provenance remains ordinary user content.
 - Provider reasoning is payload, not control state. The OpenAI-compatible and
   Anthropic adapters normalize only inspectable text, the TUI keeps it out of
   conversation rendering, and redacted/signature material is never rendered.
@@ -397,3 +411,35 @@ status, resume, a delayed turn, and a follow-up; both settled rows were present
 after clean exit, explicit search found the first, file modes remained
 `0700`/`0600`, and both intercepted provider requests still advertised only
 `python`.
+
+## 2026-07-27 active-goal autorun refinement audit
+
+The exact rebuilt debug binary ran in an isolated 100×30 tmux PTY with
+`GENERALIST_HOME` pointing at a fresh profile and a loopback OpenAI-compatible
+SSE fixture. `/goal finish the loop` entered no local-command text into model
+history. The fixture first returned `partial progress` with a normal stop; the
+settled controller assigned a fresh ID to one host continuation and issued a
+second request without terminal input. The second response called
+`update_goal({"status":"complete"})`; Generalist executed it without a
+permission modal, paired the tool use, cleared the header, and made one final
+provider request. That response returned `goal done`, after which the UI
+remained idle with no queued continuation.
+
+The intercepted first and second requests both contained the exact objective in
+system instructions and advertised `python` plus `update_goal`. The third
+request omitted the active-goal system section and advertised only `python`,
+while retaining the paired `update_goal` use/result in conversation history.
+The final atomic autosave had `goal: null`, an empty queue, two user-role
+continuations marked `origin: goal_continuation`, and a protocol-valid final
+assistant message. Focused tests separately cover invalid completion input,
+permission-policy bypass, unique continuation reconciliation, provenance
+sanitization on load, omission from episodic user text, and the outcome table
+that pauses automatic work after interruption, denial, refusal, error, or
+exit.
+
+No new TLA+ state variable is required for objective text or provenance: those
+remain hidden payload. The host enqueue is a concrete `Enqueue` transition with
+fresh identity and follow-up delivery; `update_goal` is `CompleteTool` plus a
+hidden state mutation; normal settlement followed by scheduling linearizes to
+`SettleTurn` then `Enqueue`. The updated action comments and matrices record
+those refinement points explicitly.

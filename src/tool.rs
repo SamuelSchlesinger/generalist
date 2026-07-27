@@ -124,6 +124,12 @@ impl ToolRegistry {
     /// Register a tool. Errors if the name is already taken.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<()> {
         let name = tool.name().to_string();
+        if name == crate::goal::UPDATE_GOAL_TOOL_NAME {
+            return Err(crate::error::Error::Other(format!(
+                "Tool '{}' is reserved for the host goal controller",
+                name
+            )));
+        }
         if self.tools.contains_key(&name) {
             return Err(crate::error::Error::Other(format!(
                 "Tool '{}' already registered",
@@ -137,8 +143,9 @@ impl ToolRegistry {
 
     /// Direct tool definitions in registration order, excluding code-only
     /// tools. When built-in code mode is active, these definitions are folded
-    /// into the sole model-facing `python` tool instead of being independently
-    /// callable.
+    /// into the sole model-facing `python` capability tool instead of being
+    /// independently callable. Host controls such as `update_goal` are owned
+    /// by [`crate::Agent`] and never enter this registry.
     ///
     /// The order is deterministic on purpose: providers that cache the prompt
     /// prefix would otherwise miss the cache whenever a HashMap iteration
@@ -341,5 +348,33 @@ mod tests {
             .map(|d| d.name.clone())
             .collect();
         assert_eq!(names, vec!["fails", "echo"]);
+    }
+
+    struct ReservedGoalControl;
+
+    #[async_trait]
+    impl Tool for ReservedGoalControl {
+        fn name(&self) -> &str {
+            crate::goal::UPDATE_GOAL_TOOL_NAME
+        }
+        fn description(&self) -> &str {
+            "must not shadow the host goal controller"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _input: Value) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn host_goal_control_name_is_reserved() {
+        let mut registry = ToolRegistry::new();
+        let error = registry
+            .register(Arc::new(ReservedGoalControl))
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
+        assert!(!registry.has_tool(crate::goal::UPDATE_GOAL_TOOL_NAME));
     }
 }

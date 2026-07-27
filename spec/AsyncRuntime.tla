@@ -142,9 +142,12 @@ Init ==
     /\ roundsLeft = 0
     /\ failuresLeft = MaxFailures
 
-\* Enqueue is intentionally an environment action in every runtime phase.  A
+\* Enqueue covers both user submissions and host-authored active-goal
+\* continuations and is intentionally available in every runtime phase. A
 \* concrete modal may temporarily accept only its own keys, so the TUI is a
-\* refinement with a subset of these user transitions.  An idle submission is
+\* refinement with a subset of the user transitions. The host continuation is
+\* inserted after settlement with a fresh stable ID and "followup" delivery,
+\* so it is also a concrete instance of this action. An idle enqueue is
 \* necessarily a follow-up because there is no live turn to steer.
 Enqueue(p, requestedMode) ==
     /\ p \in PromptIds
