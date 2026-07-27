@@ -1,5 +1,15 @@
 # Implementation Handoff and Unified Milestones
 
+> **Implementation update (2026-07-27):** after reviewing the product value
+> question, Generalist implemented a deliberately smaller experiment than the
+> roadmap below. The legacy model-controlled tool is gone; opt-in settled-turn
+> episodes, explicit local commands, one in-process SQLite worker, and a
+> concrete `MemoryRuntime.tla` now exist. Automatic retrieval, trusted
+> admission/redaction, supervisor isolation, candidates, consolidation, and
+> collaboration remain unimplemented. The repository
+> `docs/next-agent-handoff.md` is the authoritative current stop point; this
+> document remains the safety envelope for any later expansion.
+
 ## Handoff status
 
 This corpus is the reviewed design input for the next implementation agent.

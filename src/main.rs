@@ -5,15 +5,18 @@ use generalist::provider::{
 use generalist::tools::*;
 use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
-    history_tool_protocol_is_valid, is_local_command, parse_local_command, truncate_middle, Agent,
-    AgentEvent, DeliveryMode, Error, GoalCommand, LocalCommand, MemoryPermissionHandler,
-    PermissionBrokerPrompt, PermissionChoice, PermissionRequest, PermissionUiEvent, PromptQueue,
-    Result, SavedState, ToolRegistry, TurnControl, TurnOutcome,
+    default_memory_path, discover_project_root, history_tool_protocol_is_valid, is_local_command,
+    parse_local_command, truncate_middle, Agent, AgentEvent, DeliveryMode, Episode, EpisodeEvent,
+    EpisodeOutcome, EpisodicMemory, Error, ForgetResult, GoalCommand, LocalCommand, MemoryCommand,
+    MemoryEvent, MemoryPermissionHandler, PermissionBrokerPrompt, PermissionChoice,
+    PermissionRequest, PermissionUiEvent, PromptQueue, Result, SavedState, ToolRegistry,
+    TurnControl, TurnOutcome,
 };
 use std::env;
 use std::fs;
 use std::io;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,6 +101,38 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| Error::Other(format!("Failed to flush {}: {error}", parent.display())))
+}
+
+fn write_memory_export(home: &Path, episodes: &[Episode]) -> Result<PathBuf> {
+    let directory = home.join(".generalist").join("exports");
+    fs::create_dir_all(&directory).map_err(|error| {
+        Error::Other(format!(
+            "Failed to create export directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        Error::Other(format!(
+            "Failed to restrict export directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    let export_id = uuid::Uuid::new_v4().to_string();
+    let path = directory.join(format!(
+        "episodes-{}-{}.json",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        &export_id[..8]
+    ));
+    let contents = serde_json::to_vec_pretty(episodes)
+        .map_err(|error| Error::Other(format!("Failed to serialize episode export: {error}")))?;
+    write_atomically(&path, &contents)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        Error::Other(format!(
+            "Failed to restrict episode export {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(path)
 }
 
 fn load_state(filename: &str) -> Result<SavedState> {
@@ -236,7 +271,6 @@ fn build_registry(permission_handler: &MemoryPermissionHandler) -> Result<ToolRe
     registry.register(Arc::new(BashTool))?;
     registry.register(Arc::new(WeatherTool))?;
     registry.register(Arc::new(HttpFetchTool))?;
-    registry.register(Arc::new(EnhancedMemoryTool::new()?))?;
     registry.register(Arc::new(WikipediaTool))?;
     registry.register(Arc::new(Z3SolverTool))?;
     registry.register(Arc::new(TodoTool))?;
@@ -452,14 +486,23 @@ fn enqueue_submission(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_started_turn(
     agent: &mut Agent,
     ui: &mut TerminalUi,
     queue: &PromptQueue,
     permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
     permission_handler: &MemoryPermissionHandler,
+    memory: Option<&EpisodicMemory>,
+    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
+    prompt: &str,
+    episode_history_start: usize,
+    episode_history_revision: u64,
+    started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<bool> {
     let mut durable = DurableBoundary::from_agent(agent);
+    let episode_provider = agent.provider().id().to_string();
+    let episode_model = agent.provider().model().to_string();
     let (cancel_handle, mut control) = TurnControl::for_turn(queue.clone());
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (checkpoint_tx, mut checkpoint_rx) = mpsc::unbounded_channel();
@@ -520,6 +563,7 @@ async fn drive_started_turn(
                         }
                     }
                 }
+                Some(event) = memory_events.recv() => handle_memory_event(ui, event),
                 _ = ticker.tick() => {
                     ui.tick();
                     ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
@@ -594,6 +638,34 @@ async fn drive_started_turn(
     ) {
         ui.error(&format!("Failed to persist settled runtime state: {error}"));
     }
+    let episode_outcome = match &outcome {
+        Ok(outcome) => EpisodeOutcome::from(*outcome),
+        Err(_) => EpisodeOutcome::Error,
+    };
+    if let Some(memory) = memory {
+        if history_tool_protocol_is_valid(&agent.history) {
+            let episode_history = if agent.history_revision() == episode_history_revision {
+                agent
+                    .history
+                    .get(episode_history_start..)
+                    .unwrap_or_default()
+            } else {
+                &[]
+            };
+            if let Err(error) = memory.enqueue_settled_turn(
+                prompt,
+                episode_history,
+                episode_outcome,
+                &episode_provider,
+                &episode_model,
+                started_at,
+            ) {
+                ui.error(&format!("Failed to queue settled episode: {error}"));
+            }
+        } else {
+            ui.error("Skipped episodic capture because settled history is not protocol-valid.");
+        }
+    }
 
     match outcome {
         Ok(TurnOutcome::Completed | TurnOutcome::Refused) => ui.set_busy(false, "Ready"),
@@ -627,6 +699,7 @@ async fn drive_compaction(
     queue: &PromptQueue,
     permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
     permission_handler: &MemoryPermissionHandler,
+    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
 ) -> Result<bool> {
     let mut durable = DurableBoundary::from_agent(agent);
     let before = agent.context_tokens();
@@ -673,6 +746,7 @@ async fn drive_compaction(
                         }
                     }
                 }
+                Some(event) = memory_events.recv() => handle_memory_event(ui, event),
                 _ = ticker.tick() => {
                     ui.tick();
                     ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
@@ -760,6 +834,232 @@ fn replace_goal(agent: &mut Agent, ui: &mut TerminalUi, goal: Option<String>) {
     }
 }
 
+fn handle_memory_event(ui: &mut TerminalUi, event: MemoryEvent) {
+    match event {
+        MemoryEvent::CaptureFailed(error) => {
+            ui.error(&format!("Failed to record settled episode: {error}"));
+        }
+    }
+}
+
+fn render_episode(episode: &Episode) -> String {
+    let mut lines = vec![
+        format!("Episode {}", episode.id),
+        format!(
+            "{} · {} · {} / {}",
+            episode.settled_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            episode.outcome.label(),
+            episode.provider,
+            episode.model
+        ),
+        format!(
+            "Capture: {} · project: {}",
+            episode.capture_quality, episode.project_root
+        ),
+    ];
+    for event in &episode.events {
+        match event {
+            EpisodeEvent::UserText { text } => {
+                lines.push(format!("user:\n{}", truncate_middle(text, 1_200)));
+            }
+            EpisodeEvent::AssistantText { text } => {
+                lines.push(format!("assistant:\n{}", truncate_middle(text, 1_200)));
+            }
+            EpisodeEvent::ToolCall { name, .. } => {
+                lines.push(format!("tool: {name} (input omitted)"));
+            }
+            EpisodeEvent::ToolResult { is_error, .. } => {
+                lines.push(format!(
+                    "tool result: {} (content omitted)",
+                    if *is_error { "error" } else { "success" }
+                ));
+            }
+        }
+    }
+    lines.join("\n\n")
+}
+
+async fn run_memory_command(
+    command: MemoryCommand<'_>,
+    memory: &EpisodicMemory,
+) -> Result<Vec<String>> {
+    match command {
+        MemoryCommand::Status => {
+            let status = memory.status().await?;
+            Ok(vec![format!(
+                "Episodic memory: {} · {} episode(s)\nProject: {}\nSQLite {} at {}\n\
+                 Explicit search only; no automatic retrieval. User/assistant text is retained; \
+                 provider reasoning and tool payloads are omitted.",
+                if status.capture_enabled {
+                    "recording"
+                } else {
+                    "paused"
+                },
+                status.episode_count,
+                status.project_root,
+                status.sqlite_version,
+                status.database_path.display()
+            )])
+        }
+        MemoryCommand::Pause => {
+            memory.set_capture_enabled(false).await?;
+            Ok(vec!["Episodic capture paused for this project.".to_string()])
+        }
+        MemoryCommand::Resume => {
+            memory.set_capture_enabled(true).await?;
+            Ok(vec![
+                "Episodic capture enabled for this project. Future settled user/assistant text \
+                 is retained; provider reasoning and tool payloads are omitted. Pause capture \
+                 before entering sensitive text."
+                    .to_string(),
+            ])
+        }
+        MemoryCommand::Search(query) => {
+            let matches = memory.search(query).await?;
+            if matches.is_empty() {
+                return Ok(vec![format!(
+                    "No current-project episodes matched “{query}”."
+                )]);
+            }
+            let mut lines = vec![format!(
+                "{} current-project episode(s) matched “{query}”:",
+                matches.len()
+            )];
+            for episode in matches {
+                let short_id: String = episode.id.chars().take(8).collect();
+                lines.push(format!(
+                    "{} · {} · {} · {}",
+                    short_id,
+                    episode.settled_at.format("%Y-%m-%d %H:%M"),
+                    episode.outcome.label(),
+                    episode.preview
+                ));
+            }
+            Ok(lines)
+        }
+        MemoryCommand::Show(id) => match memory.show(id).await? {
+            Some(episode) => Ok(vec![render_episode(&episode)]),
+            None => Ok(vec![format!(
+                "No current-project episode matches ID prefix '{id}'."
+            )]),
+        },
+        MemoryCommand::Export => {
+            let episodes = memory.export().await?;
+            let count = episodes.len();
+            let export_home = home_dir();
+            let path =
+                tokio::task::spawn_blocking(move || write_memory_export(&export_home, &episodes))
+                    .await
+                    .map_err(|error| {
+                        Error::Other(format!("Episode export worker failed: {error}"))
+                    })??;
+            Ok(vec![format!(
+                "Exported {count} current-project episode(s) to {}",
+                path.display()
+            )])
+        }
+        MemoryCommand::Forget(id) => match memory.forget(id).await? {
+            ForgetResult::Deleted => Ok(vec![
+                "Episode deleted from the live SQLite store. This does not erase external \
+                     exports, backups, or filesystem snapshots."
+                    .to_string(),
+            ]),
+            ForgetResult::DeletedCheckpointPending(error) => Ok(vec![format!(
+                "Episode deleted from live queries, but WAL truncation is still pending: \
+                     {error}. Prior exports, backups, and filesystem snapshots are outside this \
+                     guarantee."
+            )]),
+            ForgetResult::NotFound => Ok(vec![format!(
+                "No current-project episode matches ID prefix '{id}'."
+            )]),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_memory_command(
+    command: MemoryCommand<'_>,
+    memory: Option<&EpisodicMemory>,
+    agent: &Agent,
+    ui: &mut TerminalUi,
+    queue: &PromptQueue,
+    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
+    permission_handler: &MemoryPermissionHandler,
+    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
+) -> Result<bool> {
+    let Some(memory) = memory else {
+        ui.error("Episodic memory is unavailable; see the startup error.");
+        return Ok(false);
+    };
+    ui.set_busy(true, "Memory");
+    let operation = run_memory_command(command, memory);
+    tokio::pin!(operation);
+    let mut ticker = tokio::time::interval(Duration::from_millis(50));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let exit_requested = loop {
+        tokio::select! {
+            biased;
+            result = &mut operation => {
+                match result {
+                    Ok(lines) => {
+                        for line in lines {
+                            ui.info(&line);
+                        }
+                    }
+                    Err(error) => ui.error(&format!("Memory command failed: {error}")),
+                }
+                break false;
+            }
+            Some(permission_event) = permission_rx.recv() => {
+                match permission_event {
+                    PermissionUiEvent::Request(request) => {
+                        let _ = request.reply.send(PermissionChoice::DenyOnce);
+                        ui.error("Ignored a stale permission request with no active turn.");
+                    }
+                    PermissionUiEvent::Automatic { request, allowed } => {
+                        ui.status(&format!(
+                            "{} was {} by remembered policy",
+                            request.tool_name,
+                            if allowed { "auto-allowed" } else { "auto-denied" }
+                        ));
+                    }
+                }
+            }
+            Some(event) = memory_events.recv() => handle_memory_event(ui, event),
+            _ = ticker.tick() => {
+                ui.tick();
+                ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
+            }
+            terminal_event = ui.next_event() => {
+                let action = terminal(ui.handle_event(terminal(terminal_event)?, queue))?;
+                let persist_queue = action.requires_queue_persist();
+                match action {
+                    UiAction::Submit { text, delivery } => {
+                        enqueue_submission(ui, queue, text, delivery, false);
+                    }
+                    UiAction::Exit => break true,
+                    UiAction::Interrupt => {
+                        ui.status("The dispatched memory transaction cannot be safely cancelled.");
+                    }
+                    UiAction::None
+                    | UiAction::QueueChanged
+                    | UiAction::Permission { .. } => {}
+                }
+                if persist_queue {
+                    if let Err(error) = save_state(
+                        &make_saved_state(agent, permission_handler, queue),
+                        AUTOSAVE_NAME,
+                    ) {
+                        ui.error(&format!("Failed to persist runtime state: {error}"));
+                    }
+                }
+            }
+        }
+    };
+    ui.set_busy(false, "Ready");
+    Ok(exit_requested)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_command(
     text: &str,
@@ -768,6 +1068,8 @@ async fn execute_command(
     queue: &PromptQueue,
     permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
     permission_handler: &MemoryPermissionHandler,
+    memory: Option<&EpisodicMemory>,
+    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
     keys: &ApiKeys,
     available: &[&'static str],
 ) -> Result<CommandFlow> {
@@ -776,7 +1078,16 @@ async fn execute_command(
         LocalCommand::Exit => return Ok(CommandFlow::Exit),
         LocalCommand::Help => terminal(ui.show_help().await)?,
         LocalCommand::Compact => {
-            if drive_compaction(agent, ui, queue, permission_rx, permission_handler).await? {
+            if drive_compaction(
+                agent,
+                ui,
+                queue,
+                permission_rx,
+                permission_handler,
+                memory_events,
+            )
+            .await?
+            {
                 return Ok(CommandFlow::Exit);
             }
         }
@@ -878,6 +1189,22 @@ async fn execute_command(
         LocalCommand::Goal(GoalCommand::Set(goal)) => {
             replace_goal(agent, ui, Some(goal.to_string()))
         }
+        LocalCommand::Memory(command) => {
+            if drive_memory_command(
+                command,
+                memory,
+                agent,
+                ui,
+                queue,
+                permission_rx,
+                permission_handler,
+                memory_events,
+            )
+            .await?
+            {
+                return Ok(CommandFlow::Exit);
+            }
+        }
         LocalCommand::Unknown(command) => {
             ui.info(&format!("Unknown local command: {command}. Use /help."));
         }
@@ -914,6 +1241,23 @@ async fn main() -> Result<()> {
     }
 
     let mut ui = terminal(TerminalUi::start("Starting", "selecting model"))?;
+    let (memory_event_tx, mut memory_event_rx) = mpsc::unbounded_channel();
+    let memory = match (|| -> Result<EpisodicMemory> {
+        let working_directory = env::current_dir()
+            .map_err(|error| Error::Other(format!("Failed to read working directory: {error}")))?;
+        let project_root = discover_project_root(&working_directory)?;
+        EpisodicMemory::open_with_events(
+            default_memory_path(&home_dir()),
+            project_root,
+            Some(memory_event_tx),
+        )
+    })() {
+        Ok(memory) => Some(memory),
+        Err(error) => {
+            ui.error(&format!("Episodic memory is unavailable: {error}"));
+            None
+        }
+    };
     let provider_and_model = match cli.local_model {
         Some(model) => Some(("openai".to_string(), model)),
         None => match default_remote_provider_and_model(&keys) {
@@ -1017,6 +1361,8 @@ async fn main() -> Result<()> {
                         &queue,
                         &mut permission_rx,
                         &permission_handler,
+                        memory.as_ref(),
+                        &mut memory_event_rx,
                         &keys,
                         &available,
                     )
@@ -1024,6 +1370,9 @@ async fn main() -> Result<()> {
                     CommandFlow::Exit
                 );
             } else {
+                let started_at = chrono::Utc::now();
+                let episode_history_start = agent.history.len();
+                let episode_history_revision = agent.history_revision();
                 agent.begin_turn(&prompt.text);
                 claim.commit();
                 ui.push_user(prompt.text.trim());
@@ -1039,6 +1388,12 @@ async fn main() -> Result<()> {
                     &queue,
                     &mut permission_rx,
                     &permission_handler,
+                    memory.as_ref(),
+                    &mut memory_event_rx,
+                    &prompt.text,
+                    episode_history_start,
+                    episode_history_revision,
+                    started_at,
                 )
                 .await?;
             }
@@ -1069,6 +1424,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Some(event) = memory_event_rx.recv() => handle_memory_event(&mut ui, event),
             _ = ticker.tick() => {
                 ui.tick();
                 ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
@@ -1099,6 +1455,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(memory) = &memory {
+        memory.flush().await.map_err(|error| {
+            Error::Other(format!(
+                "Failed to flush episodic memory before exit: {error}"
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -1183,5 +1546,15 @@ mod tests {
             default_remote_provider_and_model(&keys),
             Some(("openrouter".to_string(), "moonshotai/kimi-k3".to_string()))
         );
+    }
+
+    #[test]
+    fn registry_has_no_model_facing_memory_tool() {
+        let registry = build_registry(&MemoryPermissionHandler::new()).unwrap();
+        assert!(!registry
+            .tool_names()
+            .iter()
+            .any(|name| name.contains("memory")));
+        assert!(!include_str!("../SYSTEM_PROMPT.md").contains("enhanced_memory"));
     }
 }

@@ -313,6 +313,9 @@ tool data are not rewritten.
    are rendered on the bounded frame tick; no individual delta or scroll event
    forces an immediate frame. Copy mode accumulates those changes until its
    single exit redraw.
+9. The named memory worker is the sole SQLite connection owner in one process.
+   Settled-turn capture is sent over a FIFO and never blocks terminal polling
+   or enters model-visible prompt construction.
 
 ## Alternatives rejected
 
@@ -332,7 +335,9 @@ futures and makes permission re-entry prone to deadlock.
 
 This can work, but it adds cross-runtime shutdown, terminal-broker, and state
 snapshot complexity without providing concurrency we need. The model and tools
-remain sequential; the UI only needs concurrent polling.
+remain sequential; the UI only needs concurrent polling. The episodic
+prototype does use one plain blocking OS thread as the sole SQLite owner, but
+it has no terminal access, no `Agent`, and no second Tokio runtime.
 
 ### One undifferentiated FIFO
 
@@ -349,9 +354,11 @@ earliest safe delivery point.
 ## Formal model and review
 
 `spec/AsyncRuntime.tla` models the controller protocol and copy-mode terminal
-ownership, while reasoning text and Ratatui layout remain hidden payload/display
-state. The
-`spec/AsyncRuntime.cfg` supplies the finite CI bounds. TLC checks queue
+ownership, while reasoning text and Ratatui layout remain hidden
+payload/display state. `spec/MemoryRuntime.tla` separately models opt-in
+settled-turn capture, the FIFO SQLite worker, failure/skip outcomes, immutable
+live episodes, explicit live-store deletion, and the absence of automatic
+retrieval. Their checked-in `.cfg` files supply the finite CI bounds. TLC checks queue
 identity, single-turn ownership, delivery modes, safe steering, terminal
 reasons, tool-result pairing, permission correlation, committed settlement,
 stable ID ordering, weakly fair release of busy ownership, and eventual copy
@@ -359,7 +366,9 @@ mode exit under an explicit user-resumption fairness assumption. Because copy
 mode makes permission keys intermittently unavailable, permission resolution
 has its own strong-fairness assumption when the permission UI is available
 infinitely often; the first version without that assumption produced a TLC
-liveness counterexample.
+liveness counterexample. The memory model's worker fairness similarly assumes
+that the OS and filesystem eventually return; Rust bounds SQLite lock waiting
+but cannot force a failed kernel or disk to progress.
 
 The model is not accepted as a proxy for inspecting Rust. The maintained
 state/action/invariant refinement is in

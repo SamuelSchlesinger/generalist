@@ -1,5 +1,13 @@
 # Current-State Gap Analysis
 
+> **Implementation update (2026-07-27):** this file preserves the historical
+> audit at commit `db900fa`. The model-facing `EnhancedMemoryTool` described
+> below has since been removed. The current checkout implements only an
+> opt-in, host-owned, project-scoped settled-turn SQLite prototype with explicit
+> local search/deletion and no automatic retrieval. See the repository
+> `README.md`, `docs/next-agent-handoff.md`, and
+> `docs/runtime-traceability.md` for current behavior.
+
 ## Scope and evidence
 
 This audit covers Generalist commit `db900fa` (“Fix TUI observability and

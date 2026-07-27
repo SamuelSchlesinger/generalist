@@ -32,7 +32,7 @@ case "$answer" in
         printf 'Acknowledged.\n'
         ;;
     *)
-        printf 'Commit cancelled. Update spec/AsyncRuntime.tla, then try again.\n' >&2
+        printf 'Commit cancelled. Update the affected TLA+ models, then try again.\n' >&2
         exit 1
         ;;
 esac

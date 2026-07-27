@@ -17,6 +17,24 @@ pub enum GoalCommand<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryCommand<'a> {
+    /// Display capture state and the current project scope.
+    Status,
+    /// Stop recording future settled turns.
+    Pause,
+    /// Opt in to recording future settled turns.
+    Resume,
+    /// Search retained user/assistant text and tool names.
+    Search(&'a str),
+    /// Display one episode by full ID or unique prefix.
+    Show(&'a str),
+    /// Export live episodes for the current project.
+    Export,
+    /// Delete one live episode by full ID or unique prefix.
+    Forget(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalCommand<'a> {
     Exit,
     Help,
@@ -26,6 +44,7 @@ pub enum LocalCommand<'a> {
     Load,
     Model,
     Goal(GoalCommand<'a>),
+    Memory(MemoryCommand<'a>),
     Unknown(&'a str),
 }
 
@@ -47,6 +66,7 @@ enum CommandKind {
     Load,
     Model,
     Goal,
+    Memory,
 }
 
 /// The authoritative discovery order for slash commands.
@@ -68,6 +88,12 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         usage: "/model",
         description: "switch API or model",
         kind: CommandKind::Model,
+    },
+    CommandSpec {
+        name: "/memory",
+        usage: "/memory [status|pause|resume|search <query>|show <id>|export|forget <id>]",
+        description: "inspect/manage explicit episodic memory",
+        kind: CommandKind::Memory,
     },
     CommandSpec {
         name: "/save",
@@ -123,7 +149,7 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
         return Some(LocalCommand::Unknown(trimmed));
     };
 
-    if spec.kind != CommandKind::Goal && !arguments.is_empty() {
+    if !matches!(spec.kind, CommandKind::Goal | CommandKind::Memory) && !arguments.is_empty() {
         return Some(LocalCommand::Unknown(trimmed));
     }
 
@@ -146,6 +172,38 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
                 GoalCommand::Set(arguments)
             };
             LocalCommand::Goal(goal)
+        }
+        CommandKind::Memory => {
+            let argument_end = arguments
+                .find(char::is_whitespace)
+                .unwrap_or(arguments.len());
+            let action = &arguments[..argument_end];
+            let value = arguments[argument_end..].trim();
+            let memory = if arguments.is_empty() || action.eq_ignore_ascii_case("status") {
+                if value.is_empty() {
+                    Some(MemoryCommand::Status)
+                } else {
+                    None
+                }
+            } else if action.eq_ignore_ascii_case("pause") && value.is_empty() {
+                Some(MemoryCommand::Pause)
+            } else if action.eq_ignore_ascii_case("resume") && value.is_empty() {
+                Some(MemoryCommand::Resume)
+            } else if action.eq_ignore_ascii_case("search") && !value.is_empty() {
+                Some(MemoryCommand::Search(value))
+            } else if action.eq_ignore_ascii_case("show") && !value.is_empty() {
+                Some(MemoryCommand::Show(value))
+            } else if action.eq_ignore_ascii_case("export") && value.is_empty() {
+                Some(MemoryCommand::Export)
+            } else if action.eq_ignore_ascii_case("forget") && !value.is_empty() {
+                Some(MemoryCommand::Forget(value))
+            } else {
+                None
+            };
+            match memory {
+                Some(memory) => LocalCommand::Memory(memory),
+                None => LocalCommand::Unknown(trimmed),
+            }
         }
     })
 }
@@ -196,6 +254,40 @@ mod tests {
             Some(LocalCommand::Unknown("/unknown value"))
         );
         assert_eq!(parse_local_command("ordinary prompt"), None);
+    }
+
+    #[test]
+    fn memory_commands_preserve_queries_and_require_arguments() {
+        assert_eq!(
+            parse_local_command("/memory"),
+            Some(LocalCommand::Memory(MemoryCommand::Status))
+        );
+        assert_eq!(
+            parse_local_command("/MEMORY status"),
+            Some(LocalCommand::Memory(MemoryCommand::Status))
+        );
+        assert_eq!(
+            parse_local_command("/memory search exact project convention"),
+            Some(LocalCommand::Memory(MemoryCommand::Search(
+                "exact project convention"
+            )))
+        );
+        assert_eq!(
+            parse_local_command("/memory show deadbeef"),
+            Some(LocalCommand::Memory(MemoryCommand::Show("deadbeef")))
+        );
+        assert_eq!(
+            parse_local_command("/memory forget deadbeef"),
+            Some(LocalCommand::Memory(MemoryCommand::Forget("deadbeef")))
+        );
+        assert_eq!(
+            parse_local_command("/memory search"),
+            Some(LocalCommand::Unknown("/memory search"))
+        );
+        assert_eq!(
+            parse_local_command("/memory export elsewhere"),
+            Some(LocalCommand::Unknown("/memory export elsewhere"))
+        );
     }
 
     #[test]

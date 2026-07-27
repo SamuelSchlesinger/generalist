@@ -30,6 +30,7 @@ urlencoding = "2.1"
 uuid = { version = "1.17.0", features = ["v4"] }
 tempfile = "3.8"
 firecrawl = "1.2.0"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [[bin]]
 name = "generalist"

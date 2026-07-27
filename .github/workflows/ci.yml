@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   check:
-    name: Rust and runtime model
+    name: Rust and runtime models
     runs-on: ubuntu-latest
     timeout-minutes: 30
 

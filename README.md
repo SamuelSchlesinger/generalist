@@ -44,16 +44,17 @@ Type a request; the agent calls tools and reports back. Generalist targets Unix-
 systems; code mode is on by default and `python` is the only model-facing tool.
 Scripts reach all registered capabilities through `import tools`: bash, file
 read/patch, directory listing, HTTP
-fetch, web search/scrape/crawl (Firecrawl), Wikipedia, weather, Z3, persistent memory,
-and todo list. (Calculator, system-info, and think tools were retired from the CLI:
-python and bash subsume them.)
+fetch, web search/scrape/crawl (Firecrawl), Wikipedia, weather, Z3, and todo
+list. (Calculator, system-info, think, and the former model-controlled memory
+tool were retired from the CLI: python and bash subsume the first three, while
+episodic memory is host-owned.)
 
 Responses stream as they generate. Type `/` to enter visible command mode; the
 footer lists the available slash commands from the same catalog used by the
 parser and help window. `/goal <objective>` sets durable instruction context,
 `/goal edit` opens the editor, `/goal show` displays it, and `/goal clear`
 removes it. Other commands are `/save`, `/load`, `/model`, `/compact`,
-`/clear`, `/help`, and `/exit`.
+`/clear`, `/memory`, `/help`, and `/exit`.
 
 History-valid boundaries, the active goal, and queue edits are atomically
 autosaved to `~/.generalist/history/autosave.json`. The goal survives restart
@@ -101,25 +102,60 @@ Keyboard and mouse controls:
   while idle, `Esc` clears the editor and `Ctrl+C` exits. A permission modal
   consumes its own keys first.
 
-The exact async semantics, TLA+ model, and maintained model-to-Rust review are
+The exact async semantics, TLA+ models, and maintained model-to-Rust review are
 documented in [the architecture note](docs/async-tui.md) and
 [runtime traceability matrix](docs/runtime-traceability.md).
 
 ## Memory architecture status
 
-The registered `enhanced_memory` bridge is still the legacy flat JSON CRUD
-implementation. It is not the proposed episodic/consolidation architecture and
-should not be expanded into one by adding more model-authored fields.
+The model-controlled `enhanced_memory` bridge has been removed completely. The
+old `~/.generalist_memory.json` and `~/.claude_memory.json` files are neither
+read nor modified; delete or archive them manually after inspecting any data
+you want to keep.
+
+Generalist now has a deliberately small host-owned episodic prototype:
+
+- capture is paused by default and enabled per canonical Git project with
+  `/memory resume`;
+- a dedicated worker per Generalist process owns its SQLite connection at
+  `~/.generalist/memory/episodes.sqlite3`, keeping database work off the TUI
+  reactor;
+- only settled user/assistant text, tool names, and tool success/error metadata
+  are retained; tool inputs/results, provider reasoning, signatures, and
+  redacted payloads are structurally omitted. If in-turn context compaction
+  moves the exact turn boundary, the record safely degrades to a
+  `prompt_only` episode rather than retaining a generated compaction summary.
+  In code mode, this smallest slice records the outer `python` call, not each
+  nested bridge call;
+- `/memory status`, `pause`, `resume`, `search <query>`, `show <id>`, `export`,
+  and `forget <id>` are explicit local commands; and
+- no episode is automatically retrieved, injected into a prompt, exposed as a
+  model-facing tool, consolidated, summarized, or shared with another agent.
+
+`/memory forget` removes the current-project row from the live SQLite store and
+attempts a truncating WAL checkpoint, reporting separately if truncation
+remains pending. It does not claim erasure from prior exports, backups, or
+filesystem snapshots. User and assistant text can itself contain secrets, so
+pause capture before sensitive work. The worker rejects symlinked
+database/directory targets. There is no automatic expiry or storage quota in
+this experiment; inspect and delete retained rows explicitly.
+The `0700` directory and `0600` database protect against other Unix users, not
+same-UID tools; this prototype is not a sandbox or a multi-agent security
+boundary. In particular, code mode's unsandboxed Python process can access the
+database as an ordinary local file if directed to its path. “No model-facing
+memory tool” means there is no advertised memory API or automatic prompt
+retrieval, not that generic local code is prevented from reading it.
+Simultaneous Generalist processes share settings/rows through SQLite locking,
+but have no cross-process queue ordering or collaboration protocol.
 
 The source-grounded design, adversarial safety review, multi-agent analysis,
-and exact next implementation slice are checked in under
-[the agent-memory research corpus](docs/research/agent-memory/index.md). Start
-with the
-[implementation handoff](docs/research/agent-memory/architecture/implementation-handoff.md).
-No SQLite supervisor, episodic capture, automatic retrieval, consolidation,
-simulation, or collaboration runtime described there has been implemented yet.
-The handoff deliberately starts with disabled-by-default M0 contracts and TLA+
-models before immutable episodic M1.
+and possible future lifecycle are checked in under
+[the agent-memory research corpus](docs/research/agent-memory/index.md). The
+current prototype intentionally implements much less than that design. Its
+actual FIFO capture/deletion semantics are modeled in
+[`MemoryRuntime.tla`](spec/MemoryRuntime.tla); product value must be measured
+before adding automatic retrieval, candidate promotion, consolidation,
+simulation, or collaboration.
 
 ## Permissions
 

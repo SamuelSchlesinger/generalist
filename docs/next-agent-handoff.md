@@ -2,77 +2,100 @@
 
 ## Current stop point
 
-This handoff intentionally stops before the episodic-memory implementation.
-The main branch already contains:
+Generalist now contains the smallest explicit episodic-memory prototype. It is
+not the full memory/consolidation/collaboration architecture described in the
+research corpus.
 
-- `992f62f`: asynchronous Ratatui runtime;
-- `0e8ddd4`, `fa7a2ea`, and `db900fa`: wrapped-scroll, durable `/goal`, copy,
-  paste, reasoning-inspection, direct-tool-boundary, persistence, and UI-jank
-  fixes;
-- `732f5f3`: OpenRouter provider with `moonshotai/kimi-k3` as the default remote
-  model when `OPENROUTER_API_KEY` exists.
+The previously completed product baseline remains:
 
-The OpenRouter key in `~/.generalist.env` was detected without printing it. A
-live Kimi smoke request reached OpenRouter but returned HTTP 402 “Insufficient
-credits.” That is the current account-state blocker for live generation, not a
-provider-selection or authentication failure. Do not copy the key into source,
-logs, tests, or this document.
+- asynchronous Ratatui interaction, stable queued steering/follow-ups, exact
+  wrapped scrolling, copy mode, reasoning inspection, and durable `/goal`;
+- code mode as the only model-facing tool boundary; and
+- OpenRouter `moonshotai/kimi-k3` as the default remote model when
+  `OPENROUTER_API_KEY` exists.
 
-The complete episodic-memory, consolidation, and multi-agent research corpus is
-under [agent-memory](research/agent-memory/index.md). It passed parallel
-accuracy, security, and coherence review through three revision cycles. The
-final reviewers reported no remaining Error or Gap. Structural validation
-reports 33 Markdown pages, 310 citation uses, 119 canonical sources, and 19
-threat-control rows.
+The OpenRouter key in `~/.generalist.env` was detected without printing it. The
+last live Kimi smoke request reached OpenRouter but returned HTTP 402
+“Insufficient credits.” Do not copy the key into source, logs, tests, or this
+document.
 
-## What is deliberately not implemented
+## What the episodic prototype implements
 
-- SQLite/rusqlite or a memory supervisor/client protocol
-- immutable episode drafts/finalization
-- `/memory` commands
-- automatic memory retrieval
-- model-generated candidate promotion or consolidation
-- simulations, predictions, procedures, or weight updates
-- durable tasks/messages/delegation for multiple agents
-- `MemoryRuntime.tla` or `CollaborationRuntime.tla`
+- The `enhanced_memory` tool, registration, module, and system-prompt
+  instruction are gone. Existing `~/.generalist_memory.json` and
+  `~/.claude_memory.json` files are left untouched but are never read.
+- Capture is paused by default. `/memory resume` opts in persistently for the
+  canonical current Git project; `/memory pause` opts out.
+- One named blocking worker thread per Generalist process owns a bundled
+  SQLite 3.51.3 connection at `~/.generalist/memory/episodes.sqlite3`. The
+  containing directory is `0700` and database file is `0600`.
+- A protocol-valid settled turn queues one immutable episode without awaiting
+  SQLite. The FIFO is flushed before normal process exit.
+- Episodes retain user/assistant text, provider/model/outcome, tool names, and
+  tool success/error metadata. Tool inputs/results, provider reasoning,
+  signatures, and redacted-reasoning payloads are structurally omitted. An
+  in-turn compaction that moves the exact boundary degrades capture to the
+  original prompt with `capture_quality = prompt_only`. Because capture is
+  derived from committed history, code-mode metadata names the outer `python`
+  call rather than each nested bridge call.
+- `/memory status|pause|resume|search <query>|show <id>|export|forget <id>` are
+  typed idle commands. While a command awaits SQLite, the TUI still polls
+  terminal input, queue mutations, memory events, stale permissions, and frame
+  ticks.
+- Every operation is bound to a byte-valued canonical project key inside the
+  worker. Search is a bounded explicit lexical substring scan.
+- `MemoryRuntime.tla` models opt-in capture, FIFO settlement, complete
+  insert/skip/failure, immutable live rows, live-store deletion, and the
+  permanent absence of automatic retrieval.
 
-`src/tools/enhanced_memory.rs` remains the legacy flat JSON CRUD tool and is
-still registered. Do not describe it as episodic memory.
+`/memory forget` deletes from the live SQLite store with `secure_delete=ON`,
+then attempts a truncating WAL checkpoint and reports if truncation remains
+pending. It deliberately does not claim erasure from prior exports, backups,
+or filesystem snapshots.
+
+## What remains deliberately unimplemented
+
+- automatic memory retrieval or prompt injection;
+- a dedicated model-facing memory read/write API (generic same-UID Python
+  remains unsandboxed and can access local files);
+- trusted secret redaction or capture admission beyond structural payload
+  omission;
+- FTS/embeddings, ranking, summaries, candidates, approval, lineage, or
+  consolidation;
+- retention quotas or automatic expiry;
+- external tombstone ledger, backup non-resurrection, or encryption hierarchy;
+- a process-isolated supervisor or protection from same-UID tools;
+- simulations, predictions, procedures, dreaming, or weight updates;
+- durable multi-agent tasks/messages/delegation and
+  `CollaborationRuntime.tla`.
+
+Concurrent processes receive SQLite transaction/locking semantics only. They
+do not share an in-memory FIFO, so cross-process capture/pause ordering is
+outside `MemoryRuntime.tla` and must not be presented as agent collaboration.
+
+The reviewed future design remains under
+[agent-memory](research/agent-memory/index.md), but it is an options and safety
+corpus rather than an implementation backlog.
 
 ## Exact next action
 
-Read the
-[implementation handoff](research/agent-memory/architecture/implementation-handoff.md)
-and implement M0 only:
+Evaluate the prototype before expanding it:
 
-1. memory disabled by default;
-2. supervisor/client message contracts and a fake supervisor;
-3. principal/project-bound controller-session contract;
-4. schema/measurement/degraded-status scaffolding;
-5. `MemoryRuntime.tla` and `CollaborationRuntime.tla` skeletons/configurations;
-6. shared-interface traceability to the existing `AsyncRuntime.tla`;
-7. CI, hook acknowledgement, and failing threat fixtures.
+1. run real multi-session Generalist workflows with capture paused (B0) and
+   explicit episodic search enabled (B1);
+2. measure whether search recovers useful project facts that saved
+   conversation history does not, along with latency, retained volume, false
+   matches, and deletion behavior;
+3. exercise `/memory` during a stalled provider and under a deliberately held
+   SQLite write lock, confirming typing and queue management remain live;
+4. inject process exit around episode enqueue/insert and confirm each attempt
+   is absent or one complete immutable row; and
+5. stop at explicit search unless measured value justifies a separately
+   reviewed next milestone.
 
-Do not start M1 capture in the same commit. M0 is the reviewable boundary.
-
-## Non-obvious review constraints
-
-- Same-UID `0600`/`0700` files do not isolate model-controlled tool processes.
-- Exact capture means exact admitted canonical bytes after
-  redaction/omission—not raw secrets.
-- Provider reasoning and generated simulations are not evidence.
-- Domain-local FTS isolates ranks/content/cache keys, not shared-resource
-  timing.
-- Prompt memory epochs need a recheck immediately before provider dispatch.
-- Remote effects may be `sent_unknown`; SQLite cannot promise exactly once.
-- The external deletion ledger is fsynced before SQLite applies its high-water
-  mark; startup reconciles ledger-ahead state and fails closed on DB-ahead.
-- M1 `/forget` covers raw episodes only. Descendant invalidation and
-  stale-promotion races belong to M2/M3.
-- Worker attempt sessions are implemented at C2, separately from the M0/M1
-  controller session.
-- M3 offline consolidation requires both M2 and C2. Only a task/attempt-bound
-  fenced worker session may publish proposals; a controller session cannot.
+Do not proceed directly to automatic retrieval or consolidation. If the
+prototype does not outperform ordinary saved-history workflows, retain only
+the useful inspection/export pieces or remove it.
 
 ## Validation
 
@@ -84,8 +107,7 @@ make check
 git diff --check
 ```
 
-When M0 adds the two new TLA+ specifications, extend `make tla`,
-`scripts/check-runtime-traceability.sh`, CI, the Git-hook acknowledgement, and
-the contribution methodology in the same commit. Preserve the current
-442,870-generated / 113,190-distinct / depth-27 `AsyncRuntime.tla` TLC baseline
-until a deliberate model change explains a new state-space count.
+The established `AsyncRuntime.tla` baseline is 442,870 generated states,
+113,190 distinct states, and depth 27. The initial `MemoryRuntime.tla` baseline
+is 1,433 generated states, 694 distinct states, and depth 15. Both must be
+re-run and the model-to-Rust trace repeated after any relevant change.

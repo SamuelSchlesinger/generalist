@@ -1,10 +1,10 @@
-# Async runtime model traceability
+# Runtime model traceability
 
 This document is the refinement review between the executable Unix TUI and
-`spec/AsyncRuntime.tla`. It must be read with the source. TLC proves properties
-of the finite model in `spec/AsyncRuntime.cfg`; the tables below are the
-separate, human-reviewed argument that the Rust paths implement those modeled
-transitions.
+`spec/AsyncRuntime.tla` plus `spec/MemoryRuntime.tla`. It must be read with the
+source. TLC proves properties of the finite models under their checked-in
+configurations; the tables below are the separate, human-reviewed argument
+that the Rust paths implement those modeled transitions.
 
 ## Scope and refinement direction
 
@@ -68,7 +68,7 @@ cancel, and permission-choice input is disabled.
 | `CommitSteering` | `Agent::commit_steering` appends claimed text to the valid user boundary, commits IDs, emits `SteeringCommitted`, and checkpoints with no await between those operations. | `steering_queued_during_final_response_gets_another_model_call` |
 | `RequeueSteering` | Dropping an uncommitted steering claim restores the same IDs at the front. Normal commit contains no fallible/await boundary. | `dropped_steering_claim_restores_the_same_ids_at_the_front` |
 | `ContinueAfterTools` | A complete, non-denied tool-result batch with capacity remaining loops to the next provider request. | `tool_results_are_truncated_in_history`, `history_survives_api_errors_after_tool_execution` |
-| `SettleTurn` | Answer, refusal, denial, or iteration cap returns a `TurnOutcome`; the controller releases `&mut Agent`, converts remaining steers to follow-ups, and writes one atomic autosave containing history and queue. | `refusal_with_tool_uses_is_repaired_before_checkpointing`, `denial_inside_code_mode_pauses_the_outer_turn`, `iteration_limit_leaves_late_steering_for_controller_normalization` |
+| `SettleTurn` | Answer, refusal, denial, or iteration cap returns a `TurnOutcome`; the controller releases `&mut Agent`, converts remaining steers to follow-ups, writes one atomic autosave containing history and queue, and only then offers the protocol-valid settled history to the independent memory FIFO. | `refusal_with_tool_uses_is_repaired_before_checkpointing`, `denial_inside_code_mode_pauses_the_outer_turn`, `iteration_limit_leaves_late_steering_for_controller_normalization`, `episodes_omit_reasoning_and_tool_payloads` |
 | `RequestCancel` | Esc/Ctrl+C retires a live permission with deny-once, sets the turn-scoped watch flag, and keeps polling the controlled future until repair completes. | `cancellation_wins_over_a_ready_permission_before_steering`, `provider_cancellation_commits_no_partial_assistant_message` |
 | `RepairCancelledTool` | Cancellation drops the running tool future and emits synthetic error results for it and every unstarted tool use. | `interruption_pairs_the_running_and_unstarted_tool_uses`, `history_tool_protocol_is_valid` debug assertion |
 | `FinishCancellation` | After results are appended, the agent checkpoints and returns `Interrupted`; the controller retires nested TUI activity and normalizes undelivered steers. | `interruption_pairs_the_running_and_unstarted_tool_uses`, `interrupted_turn_retires_all_nested_activity`, `ending_turn_normalizes_undelivered_steers` |
@@ -90,6 +90,76 @@ cancel, and permission-choice input is disabled.
 | `HistoryOrderHasStableIds` | Queue claims and `SteeringCommitted` preserve stable-ID order. `committedOrder` is a model ghost variable, verified through claim/event tests rather than stored in model-visible text. |
 | `EveryBusyPeriodSettles` | TLC checks settlement for the finite bounds under weakly fair agent progress, weakly fair copy exit, and strongly fair permission resolution when its UI is available infinitely often. Rust bounds provider rounds/retries and keeps polling them during copy mode; permission input waits for resume. External tools/providers, a user who never resumes, or a user who never answers remain environmental blockers. |
 | `CopyModeEventuallyResumes` | `WF_vars(ExitCopyMode)` makes the environmental assumption explicit rather than silently proving liveness through a permanently disabled terminal. The PTY test verifies the concrete exit path; it cannot force a real user to press F3. |
+
+## Episodic-memory model mapping
+
+`MemoryRuntime.tla` models only the prototype that exists: opt-in capture of
+settled turns, a FIFO SQLite worker, immutable live rows, explicit live-store
+deletion, and no prompt retrieval. It does not model candidates,
+consolidation, cross-agent authorization, backup erasure, or the broader
+research architecture. Its FIFO is one Generalist process's worker channel.
+Simultaneous processes share SQLite rows/settings and lock arbitration but not
+that channel; their cross-process ordering is outside this model.
+
+The async and memory models intentionally have different clocks.
+`AsyncRuntime.SettleTurn` returns the conversation controller to idle after it
+enqueues a memory request; `MemoryRuntime.pendingEpisodes` may still be
+draining. The controller can start another turn while the sole worker performs
+SQLite I/O. All capture failures are display-only `MemoryEvent`s and never
+alter conversation history.
+
+### Memory state mapping
+
+| TLA+ state | Authoritative Rust representation | Review note |
+| --- | --- | --- |
+| `captureEnabled` | `memory_settings.capture_enabled`, read by `MemoryWorker::record` in FIFO order | New projects insert `0`; only explicit `/memory resume` opts in. |
+| `activeEpisode` | Ghost identity for the prompt owned between `Agent::begin_turn` and the terminal `TurnOutcome` | Rust allocates the UUID when building the settled record; because no draft is stored or observable, late allocation refines the ghost choice. |
+| `pendingEpisodes` | `std::sync::mpsc::Receiver<Request>` owned by the named `generalist-memory` thread | `enqueue_settled_turn` performs a non-awaiting send. A later `flush` is a FIFO barrier. |
+| `settledEpisodes` | Ghost set of protocol-valid outcomes offered to the worker | `drive_started_turn` checks `history_tool_protocol_is_valid` before enqueueing; malformed history produces a visible error and no request. |
+| `liveEpisodes` | Rows in `episodes` for the handle's canonical byte-valued project key | Every query binds the worker-owned project key before looking at IDs or content. |
+| `skippedEpisodes` | A successful `Record` request returning no ID while capture is paused | Skips are intentionally not persisted; the set is proof-history state. |
+| `failedEpisodes` | A failed atomic insert plus `MemoryEvent::CaptureFailed` | No row is made live. The set is proof-history state, not a retry queue. |
+| `forgottenEpisodes` | Successful live-row deletion observed during the current model execution | This is ghost state only. The implementation explicitly makes no non-resurrection claim across prior exports, restored backups, or filesystem snapshots. |
+| `promptMemories` | No Rust field or provider-request input exists | The former model-facing tool is unregistered and deleted; no memory API is called by `Agent` or prompt construction. |
+
+`Agent::history_revision` is a hidden payload-boundary guard, not modeled
+memory lifecycle state. Appends preserve the recorded turn-start index;
+replacement, clearing, and compaction increment the revision. A changed
+revision therefore selects `prompt_only` instead of risking capture from a
+coincidentally identical later user message.
+
+### Memory action mapping
+
+| TLA+ action | Concrete Rust transition | Deterministic evidence |
+| --- | --- | --- |
+| `StartTurn` | The idle controller commits one follow-up with `Agent::begin_turn`; memory has no persisted or retrievable draft. | existing prompt-claim tests; source-order review in `main` |
+| `SettleTurn` | After the ordinary runtime settles and its autosave is attempted, `drive_started_turn` maps `TurnOutcome` (or error) to `EpisodeOutcome` and sends the history tail anchored immediately before `begin_turn`. Duplicate steering text cannot move that boundary. If `history_revision` shows that in-turn compaction relocated it, capture degrades to the original prompt and labels the record `prompt_only`. | `compaction_summarizes_old_history_and_preserves_recent`, `episodes_omit_reasoning_and_tool_payloads`, `duplicate_steering_text_does_not_move_the_episode_boundary`, `a_relocated_history_boundary_degrades_to_prompt_only` |
+| `RecordEpisode` | `MemoryWorker::record` rechecks the project capture setting and performs one immutable-row `INSERT`; SQLite atomicity chooses a whole row or no row. | `episodes_are_immutable_but_can_be_forgotten_from_the_live_store` |
+| `SkipEpisode` | The worker observes disabled capture and returns `Ok(None)` without executing an insert. | `capture_is_paused_by_default` |
+| `FailEpisode` | Any setting/serialization/SQLite error returns no live ID; asynchronous captures emit `MemoryEvent::CaptureFailed`. | schema/immutability tests plus explicit error branch review |
+| `PauseCapture` | `/memory pause` queues a `SetCapture(false)` request and awaits its one-row settings update while the TUI keeps polling. | parser tests; `capture_and_setting_changes_observe_fifo_order` |
+| `ResumeCapture` | `/memory resume` queues `SetCapture(true)`; prior capture requests on the same channel complete first. | parser tests; `capture_is_paused_by_default`, `capture_and_setting_changes_observe_fifo_order` |
+| `ForgetEpisode` | `/memory forget <id>` resolves a unique current-project prefix and deletes exactly that row. It then attempts a truncating WAL checkpoint and distinguishes completed from still-pending truncation without misreporting the committed delete as a failure. | `project_handles_cannot_search_or_delete_each_others_episodes`, `episodes_are_immutable_but_can_be_forgotten_from_the_live_store` |
+
+Status, search, show, and export are read-only TLA+ stutter steps. Their
+concrete operations still run on the worker; `drive_memory_command` continues
+polling terminal input, queue edits, stale permissions, memory events, and
+frame ticks while awaiting the reply. Tool inputs/results and all
+`Thinking`/`RedactedThinking` payloads are structurally omitted before the
+record request is sent. This smallest slice derives tool metadata from
+committed history, so code mode records the outer `python` use/result rather
+than nested bridge activity.
+
+### Memory property mapping
+
+| TLA+ property | Rust enforcement and review evidence |
+| --- | --- |
+| `TypeOK` | Rust enums define outcomes/events/requests; SQLite `STRICT` tables and checks constrain persistent scalar fields. |
+| `EpisodeIdentity` | UUIDs identify records, the primary key rejects reuse, and the FIFO processes each `Record` request once. |
+| `SettledLifecycleIsTotal` | A worker request returns inserted, skipped, or failed; a live record can later be forgotten. No partial state is returned as an episode. |
+| `EpisodeLifecycleIsDisjoint` | One insert creates live state; skip/failure create none; deletion removes the live row. The corresponding model history sets cannot overlap. |
+| `NoAutomaticRetrieval` | The system prompt has no memory instruction, the registry has no memory tool, and neither prompt construction nor `Agent` accepts an episode bundle. |
+| `EveryPendingEpisodeResolves` | TLC assumes weak fairness for the enabled FIFO-head processor. Concretely, a dedicated OS thread drains requests in the order exercised by `capture_and_setting_changes_observe_fifo_order`, and SQLite has a two-second busy timeout; an indefinitely blocked kernel/filesystem or terminated process remains outside the liveness claim. |
 
 ## Durable-boundary refinement
 
@@ -128,6 +198,14 @@ after execution. Display-only actions are covered by
   model's payload abstraction. Code mode advertises only `python`; an undeclared
   response is paired with an error for `ToolHistoryIsValid` but is never exposed
   as executable tool activity.
+- `NoAutomaticRetrieval` is not a same-UID filesystem sandbox. The advertised
+  `python` tool has standard-library file access and can read the SQLite file if
+  explicitly directed to its path; the invariant covers the absence of a
+  dedicated memory API and host prompt injection.
+- The memory request channel and live episode store have no quota in this
+  experiment. One request is enqueued per settled turn and ordinary SQLite lock
+  contention is bounded by the busy timeout, but a hung filesystem or sustained
+  production faster than the worker can drain can grow process/disk usage.
 - Cancellation repairs protocol history but cannot roll back external side
   effects. The running tool's synthetic result explicitly says completion is
   unknown.
@@ -281,3 +359,41 @@ This concretely exercises the permission/copy-mode fairness boundary identified
 by TLC. A separate 80×24 PTY regression reconfirmed that the final wrapped
 marker and scrollbar thumb reach the real bottom, PageUp pauses, and PageDown
 restores follow-latest.
+
+## 2026-07-27 episodic-memory refinement audit
+
+The prototype was traced from a settled TUI turn through
+`enqueue_settled_turn`, the sole FIFO worker, the project-scoped SQLite row,
+and each explicit `/memory` read/delete path. The exact rebuilt binary ran in
+an isolated 100×30 tmux PTY against a delayed loopback OpenAI-compatible SSE
+server. Capture started paused with zero rows; after explicit resume, a prompt
+typed and queued during the delayed response ran only after that response
+settled. Every intercepted provider request advertised exactly `python`, with
+no model-facing memory tool.
+
+Explicit search found the captured prompt, show rendered its stored
+user/assistant text, and export produced a four-row JSON file with mode `0600`
+inside a `0700` directory. The database itself was `0600`. A separate process
+then held `BEGIN IMMEDIATE`: the memory setting update failed after the
+configured busy timeout with `database is locked`, but text entered during
+that wait was retained and dispatched, and the failed update left the prior
+paused setting unchanged. Forget removed exactly the selected row from the
+live store, search no longer found it, and the warning preserved the explicit
+export/backup/snapshot limitation. Normal `/exit` closed the PTY session and left
+three valid rows on disk. Deterministic tests separately inject reasoning,
+redacted reasoning, tool arguments, and tool-result bodies and confirm that
+none enter the episode or export representation.
+
+TLC explored 1,433 states (694 distinct, depth 15) with no error under
+`spec/MemoryRuntime.cfg`. This establishes the checked finite lifecycle and
+no-retrieval invariants, not the Rust refinement by itself; the source trace,
+fault injection, and exact-binary PTY exercise are the separate refinement
+evidence above.
+
+After the adversarial source pass corrected busy-checkpoint reporting,
+tool-ID retention, and duplicate-prompt boundary selection, the exact source
+was rebuilt and the isolated PTY cycle was repeated. A single key burst queued
+status, resume, a delayed turn, and a follow-up; both settled rows were present
+after clean exit, explicit search found the first, file modes remained
+`0700`/`0600`, and both intercepted provider requests still advertised only
+`python`.

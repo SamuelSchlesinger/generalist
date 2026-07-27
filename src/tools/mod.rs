@@ -1,6 +1,5 @@
 pub mod bash;
 pub mod calculator;
-pub mod enhanced_memory;
 pub mod firecrawl_crawl;
 pub mod firecrawl_extract;
 pub mod firecrawl_map;
@@ -18,7 +17,6 @@ pub mod z3_solver;
 
 pub use bash::BashTool;
 pub use calculator::CalculatorTool;
-pub use enhanced_memory::EnhancedMemoryTool;
 pub use firecrawl_crawl::FirecrawlCrawlTool;
 pub use firecrawl_extract::FirecrawlExtractTool;
 pub use firecrawl_map::FirecrawlMapTool;

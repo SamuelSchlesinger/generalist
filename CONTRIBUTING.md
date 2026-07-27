@@ -15,16 +15,17 @@ hook runs `make check`.
 
 ## Runtime model review
 
-Changes to the TUI or conversation runtime are not complete until the Rust
-control flow has been traced against `spec/AsyncRuntime.tla`. The living
-state/action/invariant mapping is in
+Changes to the TUI, conversation runtime, or episodic-memory lifecycle are not
+complete until the Rust control flow has been traced against the affected
+`spec/AsyncRuntime.tla` and `spec/MemoryRuntime.tla` actions. The living
+state/action/invariant mappings are in
 `docs/runtime-traceability.md`. Treat that file as review evidence, not as
 architecture prose that can be updated from memory.
 
 For every change touching `src/main.rs`, `src/command.rs`, `src/tui.rs`,
 `src/runtime.rs`, `src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`,
 `src/tool.rs`, `src/provider/`, `src/types.rs`, or queue/goal-bearing
-persistence in `src/state.rs`:
+persistence in `src/state.rs`, plus every change to `src/memory.rs`:
 
 1. Read the changed Rust paths and the entire TLA+ action they refine. Do not
    infer equivalence from names.
@@ -41,8 +42,9 @@ persistence in `src/state.rs`:
    duplicate text, claim rollback, FIFO order, safe steering, correlated
    permissions, cancellation repair, iteration limits, and history-valid
    checkpoints as applicable.
-6. Re-run TLC with `make tla`. A green finite model check establishes the
-   configured model properties; it does not prove that Rust refines the model.
+6. Re-run every TLC model with `make tla`. A green finite model check
+   establishes the configured model properties; it does not prove that Rust
+   refines the model.
 7. For interaction changes, build the exact source under review with
    `cargo build --bin generalist --locked`, then run that binary in a PTY
    against a deliberately stalled fake provider. While it is stalled, type in
@@ -100,40 +102,45 @@ commits must answer in a terminal.
 
 ## Memory and collaboration handoff
 
-The current `EnhancedMemoryTool` is legacy code, not an architectural
-foundation. Before changing memory, multi-agent coordination, project scope,
-or offline consolidation, read the reviewed
+The model-facing `EnhancedMemoryTool` has been removed. The implemented
+prototype is intentionally narrower than the research architecture: opt-in
+project-scoped settled-turn capture, one FIFO SQLite worker, explicit local
+search/export/live deletion, and no prompt retrieval. Before expanding memory,
+multi-agent coordination, project scope, or offline consolidation, read the
+current [runtime traceability](docs/runtime-traceability.md), the reviewed
 [research index](docs/research/agent-memory/index.md) and
 [implementation handoff](docs/research/agent-memory/architecture/implementation-handoff.md).
 Run `make memory-research` after editing that corpus.
 
-The first authorized implementation milestone is M0: disabled-by-default
-supervisor/client contracts, schema and measurement scaffolding,
-`MemoryRuntime.tla` and `CollaborationRuntime.tla` skeletons/configurations,
-shared-interface traceability to `AsyncRuntime.tla`, and CI. Do not represent
-the research design as implemented, enable automatic retrieval, or add
-model-controlled promotion to make an early demo look complete.
+Do not represent the prototype as the research design. In particular, its
+same-UID in-process worker is not a supervisor security boundary, its physical
+delete is only a live-store operation, and it has no trusted secret redaction,
+lineage, candidates, tombstone ledger, automatic retrieval, collaboration, or
+consolidation. Product-value evaluation of explicit episodic search is the next
+gate; do not add those later layers merely because the schema could hold them.
 
 Review memory changes against these boundaries:
 
-- exactness applies only to the admitted canonical payload after trusted
-  redaction/omission;
-- provider reasoning and generated simulations are never evidence;
+- capture stays opt-in, visible, pausable, and project-scoped;
+- provider reasoning, signatures, redacted payloads, tool inputs, and tool
+  result content are structurally omitted before the worker request;
+- no model-facing memory tool or automatic prompt retrieval may reappear
+  without a new design/evaluation milestone;
 - same-UID file modes are not worker isolation;
-- FTS/content authorization precedes ranking, while timing remains a measured
-  residual side channel;
-- prompt and effect epochs are rechecked at their dispatch linearization
-  points;
-- external effects without provider idempotency can be `sent_unknown`;
-- external tombstone-ledger and SQLite crash ordering must fail closed; and
-- raw M1 deletion does not claim the later descendant/promotion guarantees;
-  and
-- offline M3 consolidation depends on C2: only a task/attempt-bound fenced
-  worker session may publish proposals, never a controller session.
+- every SQLite request remains off the current-thread reactor while its command
+  driver continues polling terminal, queue, permission, and frame events;
+- every query binds the worker-owned canonical project key before content/ID
+  matching;
+- immutable-row insertion is atomic and failures create no retrievable row;
+- `/memory forget` must continue to say that prior exports, backups, and
+  filesystem snapshots are outside its live-store guarantee; and
+- `AsyncRuntime.tla`, `MemoryRuntime.tla`, Rust transitions, tests, CI, and this
+  review methodology change together whenever their boundary changes.
 
-Once M0 adds the two specifications, extend the Git-hook acknowledgement,
-traceability script, `make tla`, CI, and the painstaking model-to-Rust review to
-all three models in the same commit.
+If future work introduces automatic retrieval, derived records, external
+workers, or multi-agent sharing, the deferred provenance, epoch, tombstone,
+worker-session, and `CollaborationRuntime.tla` requirements in the research
+handoff become active gates rather than optional polish.
 
 ## Change hygiene
 

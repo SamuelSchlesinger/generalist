@@ -157,6 +157,8 @@ pub struct Agent {
     pub compaction_keep_recent_tokens: u64,
     /// Context size measured by the provider on the last completion.
     last_context_tokens: Option<u64>,
+    /// Changes only when existing message indices are invalidated.
+    history_revision: u64,
 }
 
 impl Agent {
@@ -179,6 +181,7 @@ impl Agent {
             compaction_threshold_tokens: 150_000,
             compaction_keep_recent_tokens: 20_000,
             last_context_tokens: None,
+            history_revision: 0,
         }
     }
 
@@ -260,12 +263,22 @@ impl Agent {
     pub fn replace_history(&mut self, history: Vec<Message>) {
         self.history = history;
         self.last_context_tokens = None;
+        self.history_revision = self.history_revision.wrapping_add(1);
     }
 
     /// Clear conversation history and its cached context measurement.
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.last_context_tokens = None;
+        self.history_revision = self.history_revision.wrapping_add(1);
+    }
+
+    /// Revision for consumers that retain an index into conversation history.
+    ///
+    /// Appends keep indices stable. Replacement, clearing, and compaction
+    /// increment this value.
+    pub fn history_revision(&self) -> u64 {
+        self.history_revision
     }
 
     /// Record the initial user message without crossing an await boundary.
@@ -729,6 +742,7 @@ impl Agent {
                 replaced, summary
             ))],
         );
+        self.history_revision = self.history_revision.wrapping_add(1);
         self.last_context_tokens = None;
         on_event(AgentEvent::Notice(format!(
             "Compacted {} messages into a summary (context ~{}k tokens).",
@@ -1813,11 +1827,13 @@ except Exception as e:
         agent.compaction_keep_recent_tokens = 200;
 
         let before = agent.history.len();
+        let history_revision = agent.history_revision();
         let outcome = agent
             .run_turn("latest question", &mut |_| {})
             .await
             .unwrap();
         assert_eq!(outcome, TurnOutcome::Completed);
+        assert_ne!(agent.history_revision(), history_revision);
         assert!(agent.history.len() < before, "history did not shrink");
         match &agent.history[0].content[0] {
             ContentBlock::Text { text } => {

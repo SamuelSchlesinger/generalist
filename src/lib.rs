@@ -12,7 +12,7 @@ The core is small and deliberate:
 - [`agent`] — [`Agent`], the request → tool → result loop, reporting progress
   through [`AgentEvent`] callbacks
 - [`permissions`] — pluggable [`ToolPermissionHandler`] implementations
-- [`tools`] — a batteries-included tool set (bash, file ops, web, memory, ...)
+- [`tools`] — a batteries-included tool set (bash, file ops, web, ...)
 
 ## Quick start
 
@@ -53,6 +53,7 @@ pub mod command;
 pub mod error;
 pub mod execution;
 pub mod mcp;
+pub mod memory;
 pub mod permissions;
 pub mod provider;
 pub mod runtime;
@@ -65,10 +66,15 @@ pub mod types;
 
 pub use agent::{history_tool_protocol_is_valid, Agent, AgentEvent, TurnOutcome};
 pub use command::{
-    is_local_command, parse_local_command, CommandSpec, GoalCommand, LocalCommand, COMMAND_SPECS,
+    is_local_command, parse_local_command, CommandSpec, GoalCommand, LocalCommand, MemoryCommand,
+    COMMAND_SPECS,
 };
 pub use error::{Error, Result};
 pub use execution::{ExecutionState, ToolExecution};
+pub use memory::{
+    default_memory_path, discover_project_root, Episode, EpisodeEvent, EpisodeOutcome,
+    EpisodeSummary, EpisodicMemory, ForgetResult, MemoryEvent, MemoryStatus,
+};
 pub use permissions::{
     AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler, PermissionBrokerPrompt,
     PermissionChoice, PermissionDecision, PermissionPrompt, PermissionRequest, PermissionUiEvent,
