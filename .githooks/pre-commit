@@ -4,6 +4,8 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
+make format-staged
+
 make lint
 
 acknowledgement="Yes, I have updated the TLA+ model to reflect the current architecture"

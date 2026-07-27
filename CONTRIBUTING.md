@@ -10,8 +10,9 @@ make doctor
 
 Use `make check` before sending a change. It runs formatting, Clippy with
 warnings denied, ShellCheck, the documentation traceability lint, TLC, and the
-complete Rust test suite. The pre-commit hook runs `make lint`; the pre-push
-hook runs `make check`.
+complete Rust test suite. The pre-commit hook first runs `make format-staged`
+(rustfmt on the staged `.rs` files, re-staged so the commit and the working
+tree cannot diverge), then `make lint`; the pre-push hook runs `make check`.
 
 ## Runtime model review
 
