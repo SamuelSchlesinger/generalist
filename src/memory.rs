@@ -1,17 +1,19 @@
 //! Host-owned, explicit episodic memory.
 //!
-//! This is intentionally a small prototype rather than a model-facing memory
-//! tool. Capture is opt-in per project, records only settled conversation text
-//! and tool names/outcomes, and never injects records into provider prompts.
-//! A dedicated worker thread is the sole SQLite connection owner so database
-//! work cannot block the current-thread TUI reactor.
+//! Capture is opt-in per scope, records only settled conversation text and tool
+//! names/outcomes, and never injects records into provider prompts. Explicit
+//! model-facing search/read tools sit above this store and pass through the
+//! ordinary permission gate. A dedicated worker thread is the sole SQLite
+//! connection owner so database work cannot block the current-thread TUI
+//! reactor.
 
+pub use crate::scope::discover_project_root;
+use crate::scope::{ScopeFilter, WorkspaceScope};
 use crate::{ContentBlock, Error, Message, MessageOrigin, Result, TurnOutcome};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
@@ -105,9 +107,10 @@ pub struct Episode {
 }
 
 /// Bounded search result for the current project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EpisodeSummary {
     pub id: String,
+    pub project_root: String,
     pub settled_at: DateTime<Utc>,
     pub outcome: EpisodeOutcome,
     pub preview: String,
@@ -150,10 +153,12 @@ enum Request {
     },
     Search {
         query: String,
+        filter: ScopeFilter,
         reply: Reply<Vec<EpisodeSummary>>,
     },
     Show {
         id_prefix: String,
+        filter: ScopeFilter,
         reply: Reply<Option<Episode>>,
     },
     Export(Reply<Vec<Episode>>),
@@ -175,6 +180,7 @@ struct WorkerStatus {
 #[derive(Clone)]
 pub struct EpisodicMemory {
     sender: std_mpsc::Sender<Request>,
+    scope: WorkspaceScope,
     project_root: String,
     database_path: PathBuf,
     session_id: String,
@@ -192,14 +198,23 @@ impl EpisodicMemory {
         project_root: PathBuf,
         events: Option<mpsc::UnboundedSender<MemoryEvent>>,
     ) -> Result<Self> {
-        let project_root = fs::canonicalize(&project_root).map_err(|error| {
-            Error::Other(format!(
-                "Failed to resolve project root {}: {error}",
-                project_root.display()
-            ))
-        })?;
-        let project_key = project_root.as_os_str().as_bytes().to_vec();
-        let project_display = project_root.to_string_lossy().into_owned();
+        let scope = WorkspaceScope::project(&project_root)?;
+        Self::open_scoped_with_events(database_path, scope, events)
+    }
+
+    /// Open memory for either a discovered project or the explicit global
+    /// scope.
+    pub fn open_scoped(database_path: PathBuf, scope: WorkspaceScope) -> Result<Self> {
+        Self::open_scoped_with_events(database_path, scope, None)
+    }
+
+    pub fn open_scoped_with_events(
+        database_path: PathBuf,
+        scope: WorkspaceScope,
+        events: Option<mpsc::UnboundedSender<MemoryEvent>>,
+    ) -> Result<Self> {
+        let project_key = scope.memory_key();
+        let project_display = scope.display_name();
         let worker_path = database_path.clone();
         let worker_display = project_display.clone();
         let (request_tx, request_rx) = std_mpsc::channel();
@@ -229,6 +244,7 @@ impl EpisodicMemory {
 
         Ok(Self {
             sender: request_tx,
+            scope,
             project_root: project_display,
             database_path,
             session_id: Uuid::new_v4().to_string(),
@@ -237,6 +253,10 @@ impl EpisodicMemory {
 
     pub fn database_path(&self) -> &Path {
         &self.database_path
+    }
+
+    pub fn scope(&self) -> &WorkspaceScope {
+        &self.scope
     }
 
     pub async fn status(&self) -> Result<MemoryStatus> {
@@ -341,18 +361,38 @@ impl EpisodicMemory {
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<EpisodeSummary>> {
+        self.search_scoped(query, ScopeFilter::Current).await
+    }
+
+    /// Search an explicitly selected scope set. This is intended for the
+    /// permission-gated model tool; local slash commands use [`Self::search`].
+    pub async fn search_scoped(
+        &self,
+        query: &str,
+        filter: ScopeFilter,
+    ) -> Result<Vec<EpisodeSummary>> {
         let (reply, response) = oneshot::channel();
         self.send(Request::Search {
             query: query.to_string(),
+            filter,
             reply,
         })?;
         receive(response).await
     }
 
     pub async fn show(&self, id_prefix: &str) -> Result<Option<Episode>> {
+        self.show_scoped(id_prefix, ScopeFilter::Current).await
+    }
+
+    pub async fn show_scoped(
+        &self,
+        id_prefix: &str,
+        filter: ScopeFilter,
+    ) -> Result<Option<Episode>> {
         let (reply, response) = oneshot::channel();
         self.send(Request::Show {
             id_prefix: id_prefix.to_string(),
+            filter,
             reply,
         })?;
         receive(response).await
@@ -609,11 +649,19 @@ impl MemoryWorker {
                         }
                     }
                 }
-                Request::Search { query, reply } => {
-                    let _ = reply.send(self.search(&query));
+                Request::Search {
+                    query,
+                    filter,
+                    reply,
+                } => {
+                    let _ = reply.send(self.search(&query, filter));
                 }
-                Request::Show { id_prefix, reply } => {
-                    let _ = reply.send(self.show(&id_prefix));
+                Request::Show {
+                    id_prefix,
+                    filter,
+                    reply,
+                } => {
+                    let _ = reply.send(self.show(&id_prefix, filter));
                 }
                 Request::Export(reply) => {
                     let _ = reply.send(self.export());
@@ -714,36 +762,54 @@ impl MemoryWorker {
         Ok(Some(episode.id))
     }
 
-    fn search(&self, query: &str) -> Result<Vec<EpisodeSummary>> {
+    fn search(&self, query: &str, filter: ScopeFilter) -> Result<Vec<EpisodeSummary>> {
+        if query.trim().is_empty() {
+            return Err(Error::Other("Memory search query cannot be empty".into()));
+        }
+        let global_key = WorkspaceScope::global().memory_key();
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, settled_at, outcome, search_text
+                "SELECT id, project_root, settled_at, outcome, search_text
                  FROM episodes
-                 WHERE project_key = ?1
-                   AND instr(lower(search_text), lower(?2)) > 0
+                 WHERE (
+                        (?1 = 'current' AND project_key = ?2)
+                     OR (?1 = 'global' AND project_key = ?3)
+                     OR (?1 = 'other_projects'
+                         AND project_key != ?2 AND project_key != ?3)
+                     OR (?1 = 'all')
+                 )
+                   AND instr(lower(search_text), lower(?4)) > 0
                  ORDER BY settled_at DESC
-                 LIMIT ?3",
+                 LIMIT ?5",
             )
             .map_err(sqlite_error("prepare episode search"))?;
         let rows = statement
             .query_map(
-                params![&self.project_key, query, SEARCH_LIMIT as i64],
+                params![
+                    filter.as_str(),
+                    &self.project_key,
+                    &global_key,
+                    query,
+                    SEARCH_LIMIT as i64
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .map_err(sqlite_error("search episodes"))?;
         rows.map(|row| {
-            let (id, settled_at, outcome, search_text) =
+            let (id, project_root, settled_at, outcome, search_text) =
                 row.map_err(sqlite_error("read episode search result"))?;
             Ok(EpisodeSummary {
                 id,
+                project_root,
                 settled_at: parse_timestamp(&settled_at)?,
                 outcome: EpisodeOutcome::parse(&outcome)?,
                 preview: preview(&search_text, 180),
@@ -752,17 +818,25 @@ impl MemoryWorker {
         .collect()
     }
 
-    fn show(&self, id_prefix: &str) -> Result<Option<Episode>> {
-        let Some(id) = self.resolve_id(id_prefix)? else {
+    fn show(&self, id_prefix: &str, filter: ScopeFilter) -> Result<Option<Episode>> {
+        let Some(id) = self.resolve_id(id_prefix, filter)? else {
             return Ok(None);
         };
+        let global_key = WorkspaceScope::global().memory_key();
         self.connection
             .query_row(
                 "SELECT id, project_root, session_id, started_at, settled_at,
                         outcome, provider, model, capture_quality, events_json
                  FROM episodes
-                 WHERE project_key = ?1 AND id = ?2",
-                params![&self.project_key, id],
+                 WHERE id = ?1
+                   AND (
+                          (?2 = 'current' AND project_key = ?3)
+                       OR (?2 = 'global' AND project_key = ?4)
+                       OR (?2 = 'other_projects'
+                           AND project_key != ?3 AND project_key != ?4)
+                       OR (?2 = 'all')
+                   )",
+                params![id, filter.as_str(), &self.project_key, &global_key],
                 stored_episode_row,
             )
             .optional()
@@ -790,7 +864,7 @@ impl MemoryWorker {
     }
 
     fn forget(&self, id_prefix: &str) -> Result<ForgetResult> {
-        let Some(id) = self.resolve_id(id_prefix)? else {
+        let Some(id) = self.resolve_id(id_prefix, ScopeFilter::Current)? else {
             return Ok(ForgetResult::NotFound);
         };
         let deleted = self
@@ -823,7 +897,7 @@ impl MemoryWorker {
         }
     }
 
-    fn resolve_id(&self, id_prefix: &str) -> Result<Option<String>> {
+    fn resolve_id(&self, id_prefix: &str, filter: ScopeFilter) -> Result<Option<String>> {
         let prefix = id_prefix.trim();
         if prefix.len() < 4
             || !prefix
@@ -836,19 +910,28 @@ impl MemoryWorker {
             ));
         }
         let pattern = format!("{prefix}%");
+        let global_key = WorkspaceScope::global().memory_key();
         let mut statement = self
             .connection
             .prepare(
                 "SELECT id FROM episodes
-                 WHERE project_key = ?1 AND id LIKE ?2
+                 WHERE (
+                        (?1 = 'current' AND project_key = ?2)
+                     OR (?1 = 'global' AND project_key = ?3)
+                     OR (?1 = 'other_projects'
+                         AND project_key != ?2 AND project_key != ?3)
+                     OR (?1 = 'all')
+                 )
+                   AND id LIKE ?4
                  ORDER BY id
                  LIMIT 2",
             )
             .map_err(sqlite_error("prepare episode ID lookup"))?;
         let ids = statement
-            .query_map(params![&self.project_key, pattern], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                params![filter.as_str(), &self.project_key, &global_key, pattern],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(sqlite_error("look up episode ID"))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(sqlite_error("read episode ID"))?;
@@ -1041,30 +1124,10 @@ fn reject_symlink(path: &Path, description: &str) -> Result<()> {
     }
 }
 
-/// Find the nearest Git worktree root, falling back to the canonical start.
-pub fn discover_project_root(start: &Path) -> Result<PathBuf> {
-    let canonical = fs::canonicalize(start).map_err(|error| {
-        Error::Other(format!(
-            "Failed to resolve working directory {}: {error}",
-            start.display()
-        ))
-    })?;
-    let mut candidate = canonical.as_path();
-    loop {
-        if candidate.join(".git").exists() {
-            return Ok(candidate.to_path_buf());
-        }
-        match candidate.parent() {
-            Some(parent) => candidate = parent,
-            None => return Ok(canonical),
-        }
-    }
-}
-
 pub fn default_memory_path(home: &Path) -> PathBuf {
     home.join(".generalist")
         .join("memory")
-        .join("episodes.sqlite3")
+        .join("scoped-episodes.sqlite3")
 }
 
 #[cfg(test)]
@@ -1107,6 +1170,19 @@ mod tests {
                 },
             ]),
         ]
+    }
+
+    #[test]
+    fn default_database_path_does_not_reuse_the_unscoped_store() {
+        let home = Path::new("/profile");
+        assert_eq!(
+            default_memory_path(home),
+            home.join(".generalist/memory/scoped-episodes.sqlite3")
+        );
+        assert_ne!(
+            default_memory_path(home),
+            home.join(".generalist/memory/episodes.sqlite3")
+        );
     }
 
     #[tokio::test]
@@ -1325,6 +1401,84 @@ mod tests {
             ForgetResult::NotFound
         );
         assert!(first.show(&first_id[..8]).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter() {
+        let temp = TempDir::new().unwrap();
+        let project = open_memory(&temp, "project");
+        let global = EpisodicMemory::open_scoped(
+            temp.path().join("episodes.sqlite3"),
+            WorkspaceScope::Global,
+        )
+        .unwrap();
+        project.set_capture_enabled(true).await.unwrap();
+        global.set_capture_enabled(true).await.unwrap();
+        let project_id = project
+            .record_settled_turn(
+                "shared needle project",
+                &[Message::user_text("shared needle project")],
+                EpisodeOutcome::Completed,
+                "test",
+                "model",
+                Utc::now(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let global_id = global
+            .record_settled_turn(
+                "shared needle global",
+                &[Message::user_text("shared needle global")],
+                EpisodeOutcome::Completed,
+                "test",
+                "model",
+                Utc::now(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let current = project
+            .search_scoped("shared needle", ScopeFilter::Current)
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, project_id);
+        let global_matches = project
+            .search_scoped("shared needle", ScopeFilter::Global)
+            .await
+            .unwrap();
+        assert_eq!(global_matches.len(), 1);
+        assert_eq!(global_matches[0].id, global_id);
+        assert_eq!(global_matches[0].project_root, "global");
+        let all = project
+            .search_scoped("shared needle", ScopeFilter::All)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let global_current = global
+            .search_scoped("shared needle", ScopeFilter::Current)
+            .await
+            .unwrap();
+        assert_eq!(global_current.len(), 1);
+        assert_eq!(global_current[0].id, global_id);
+        let global_other = global
+            .search_scoped("shared needle", ScopeFilter::OtherProjects)
+            .await
+            .unwrap();
+        assert_eq!(global_other.len(), 1);
+        assert_eq!(global_other[0].id, project_id);
+        assert!(project
+            .show_scoped(&global_id, ScopeFilter::Current)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(project
+            .show_scoped(&global_id, ScopeFilter::Global)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

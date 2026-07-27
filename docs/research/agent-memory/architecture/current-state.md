@@ -2,9 +2,10 @@
 
 > **Implementation update (2026-07-27):** this file preserves the historical
 > audit at commit `db900fa`. The model-facing `EnhancedMemoryTool` described
-> below has since been removed. The current checkout implements only an
-> opt-in, host-owned, project-scoped settled-turn SQLite prototype with explicit
-> local search/deletion and no automatic retrieval. See the repository
+> below has since been removed. The current checkout implements an opt-in,
+> host-owned, scope-local settled-turn SQLite prototype, project-scoped
+> conversation storage, and permission-gated read-only cross-scope archive
+> tools with no automatic retrieval. See the repository
 > `README.md`, `docs/next-agent-handoff.md`, and
 > `docs/runtime-traceability.md` for current behavior.
 

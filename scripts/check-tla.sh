@@ -74,3 +74,4 @@ run_model() {
 cd "$repo_root/spec"
 run_model AsyncRuntime.tla AsyncRuntime.cfg
 run_model MemoryRuntime.tla MemoryRuntime.cfg
+run_model ArchiveScopeRuntime.tla ArchiveScopeRuntime.cfg

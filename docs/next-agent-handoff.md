@@ -26,11 +26,17 @@ document.
 - The `enhanced_memory` tool, registration, module, and system-prompt
   instruction are gone. Existing `~/.generalist_memory.json` and
   `~/.claude_memory.json` files are left untouched but are never read.
+- Conversation history, goals, queues, named saves, and remembered permissions
+  are isolated beneath a deterministic scope directory. Normal startup selects
+  the canonical current Git project/worktree (or canonical non-Git working
+  directory); `--global` is an explicit scope and never a fallback. Legacy flat
+  conversations are left untouched and ignored.
 - Capture is paused by default. `/memory resume` opts in persistently for the
-  canonical current Git project; `/memory pause` opts out.
+  active project or explicit global scope; `/memory pause` opts out.
 - One named blocking worker thread per Generalist process owns a bundled
-  SQLite 3.51.3 connection at `~/.generalist/memory/episodes.sqlite3`. The
-  containing directory is `0700` and database file is `0600`.
+  SQLite 3.51.3 connection at
+  `~/.generalist/memory/scoped-episodes.sqlite3`. The containing directory is
+  `0700` and database file is `0600`; the old `episodes.sqlite3` is ignored.
 - A protocol-valid settled turn queues one immutable episode without awaiting
   SQLite. The FIFO is flushed before normal process exit.
 - Episodes retain user/assistant text, provider/model/outcome, tool names, and
@@ -46,11 +52,18 @@ document.
   typed idle commands. While a command awaits SQLite, the TUI still polls
   terminal input, queue mutations, memory events, stale permissions, and frame
   ticks.
-- Every operation is bound to a byte-valued canonical project key inside the
-  worker. Search is a bounded explicit lexical substring scan.
-- `MemoryRuntime.tla` models opt-in capture, FIFO settlement, complete
-  insert/skip/failure, immutable live rows, live-store deletion, and the
-  permanent absence of automatic retrieval.
+- Local operations are bound to the worker's current byte-valued scope key.
+  `search_memories`/`read_memory` and
+  `search_conversations`/`read_conversation` are read-only bridged
+  capabilities under the ordinary permission gate. They require an explicit
+  current/global/other/all scope, filter before opening conversation files or
+  matching memory content/IDs, check returned scope labels, and expose only
+  sanitized historical text/tool metadata in bounded, resumable pages.
+- `MemoryRuntime.tla` models one immutable current-scope handle, FIFO settlement, complete
+  insert/skip/failure, immutable live rows, live-store deletion, and
+  permissioned explicit disclosure. `ArchiveScopeRuntime.tla` separately
+  models project/global selection, same-scope writes, and filtered archive
+  reads. Neither permits automatic retrieval.
 
 `/memory forget` deletes from the live SQLite store with `secure_delete=ON`,
 then attempts a truncating WAL checkpoint and reports if truncation remains
@@ -60,8 +73,8 @@ or filesystem snapshots.
 ## What remains deliberately unimplemented
 
 - automatic memory retrieval or prompt injection;
-- a dedicated model-facing memory read/write API (generic same-UID Python
-  remains unsandboxed and can access local files);
+- model-authored durable memory writes (generic same-UID Python remains
+  unsandboxed and can access local files);
 - trusted secret redaction or capture admission beyond structural payload
   omission;
 - FTS/embeddings, ranking, summaries, candidates, approval, lineage, or
@@ -111,7 +124,10 @@ make check
 git diff --check
 ```
 
-The established `AsyncRuntime.tla` baseline is 442,870 generated states,
-113,190 distinct states, and depth 27. The initial `MemoryRuntime.tla` baseline
-is 1,433 generated states, 694 distinct states, and depth 15. Both must be
-re-run and the model-to-Rust trace repeated after any relevant change.
+The established `AsyncRuntime.tla` baseline is 470,086 generated states,
+117,750 distinct states, and depth 27. The current-handle `MemoryRuntime.tla`
+configuration generates 7,627 states (1,690 distinct, depth 16), and
+`ArchiveScopeRuntime.tla` generates 163,652 states (20,341 distinct, depth 11).
+The current locked Rust suite passes 144 library tests, 6 binary tests, all
+example targets, and 2 documentation tests. All three models and the
+model-to-Rust trace must be repeated after any relevant change.

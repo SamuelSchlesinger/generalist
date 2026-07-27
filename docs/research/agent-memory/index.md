@@ -1,10 +1,12 @@
 # Episodic Memory and Safe Offline Consolidation for Generalist
 
 > **Repository status (2026-07-27):** Generalist has implemented only a small
-> opt-in episodic-search experiment. The model-facing legacy tool was removed;
-> automatic retrieval, consolidation, dreaming, and collaboration remain
-> absent. See `../../next-agent-handoff.md` for the current implementation
-> boundary. This corpus remains research and future design input.
+> opt-in episodic-search experiment. The model-authored legacy write tool was
+> removed; current/global/other archive reads are explicit and
+> permission-gated, while automatic retrieval, consolidation, dreaming, and
+> collaboration remain absent. See `../../next-agent-handoff.md` for the
+> current implementation boundary. This corpus remains research and future
+> design input.
 
 This corpus investigates whether and how Generalist should replace its current
 enhanced-memory tool with an agent-native memory runtime that learns across

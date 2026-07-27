@@ -1,10 +1,11 @@
 # Runtime model traceability
 
 This document is the refinement review between the executable Unix TUI and
-`spec/AsyncRuntime.tla` plus `spec/MemoryRuntime.tla`. It must be read with the
-source. TLC proves properties of the finite models under their checked-in
-configurations; the tables below are the separate, human-reviewed argument
-that the Rust paths implement those modeled transitions.
+`spec/AsyncRuntime.tla`, `spec/MemoryRuntime.tla`, and
+`spec/ArchiveScopeRuntime.tla`. It must be read with the source. TLC proves
+properties of the finite models under their checked-in configurations; the
+tables below are the separate, human-reviewed argument that the Rust paths
+implement those modeled transitions.
 
 ## Scope and refinement direction
 
@@ -61,6 +62,7 @@ queue, cancel, and permission-choice input is disabled.
 | `RequeueStart` | Dropping an uncommitted `PromptClaim` restores the same ID at the front. Production start is currently infallible between claim and commit; the action over-approximates unwinding and future fallible setup. | `dropped_claim_rolls_back_and_commit_removes` |
 | `ProviderAnswer` | `complete_with_retry` commits a complete assistant response, emits no partial response into history, then reaches the no-tools boundary. Text and provider-supplied reasoning are separate display deltas; aborted streams receive separate display-only uncommitted markers. | `steering_queued_during_final_response_gets_another_model_call`, `provider_cancellation_commits_no_partial_assistant_message`, `cancelling_a_partial_stream_marks_the_visible_text_uncommitted`, `streamed_text_is_not_double_emitted`, `provider_reasoning_stays_out_of_chat_and_has_a_live_inspector` |
 | `ProviderRefusal` | Refusal pairs any anomalous tool uses with synthetic errors, checkpoints, and returns without accepting steering. | `refusal_with_tool_uses_is_repaired_before_checkpointing` |
+| `ProviderFailure` | A non-retryable error or exhausted retry sequence commits no partial assistant response and returns `Err`; the controller preserves prior valid history, normalizes queued steers to follow-ups, and returns idle without consuming them. | `non_retryable_errors_surface_immediately`, `history_survives_api_errors_after_tool_execution` |
 | `ProviderToolBatch` | A committed assistant response is scanned into a finite `tool_uses` vector; one loop iteration is consumed. | `tool_results_are_truncated_in_history`, `iteration_limit_leaves_late_steering_for_controller_normalization` |
 | `CompleteTool` | Tools run sequentially; each outcome becomes one `ToolResult`. Truncation and unknown tools also return structured results. In code mode, an undeclared native call is never started or permission-checked and receives a synthetic error result. The reserved `update_goal` host control validates exact completion input, clears hidden goal state without capability permission, and produces a normal paired result at this same boundary. | `tool_results_are_truncated_in_history`, `history_survives_api_errors_after_tool_execution`, `code_mode_rejects_unadvertised_direct_tool_calls`, `update_goal_completes_without_capability_permission`, `invalid_goal_completion_keeps_the_goal_active` |
 | `AskPermission` | `PermissionBrokerPrompt::choose` allocates a monotonic request ID, sends one `PermissionRequest`, and awaits its one-shot. | `broker_correlates_the_ui_reply_with_its_request` |
@@ -71,7 +73,7 @@ queue, cancel, and permission-choice input is disabled.
 | `CommitSteering` | `Agent::commit_steering` appends claimed text to the valid user boundary, commits IDs, emits `SteeringCommitted`, and checkpoints with no await between those operations. | `steering_queued_during_final_response_gets_another_model_call` |
 | `RequeueSteering` | Dropping an uncommitted steering claim restores the same IDs at the front. Normal commit contains no fallible/await boundary. | `dropped_steering_claim_restores_the_same_ids_at_the_front` |
 | `ContinueAfterTools` | A complete, non-denied tool-result batch with capacity remaining loops to the next provider request. | `tool_results_are_truncated_in_history`, `history_survives_api_errors_after_tool_execution` |
-| `SettleTurn` | Answer, refusal, denial, or iteration cap returns a `TurnOutcome`; the controller releases `&mut Agent`, converts remaining steers to follow-ups, reconciles automatic goal work, writes one atomic autosave containing history, goal, prompt sources, and queue, and only then offers protocol-valid settled history to the independent memory FIFO. Completed/capped active goals linearize to `SettleTurn` followed by modeled `Enqueue`; interruption, refusal, denial, error, or exit removes automatic entries and pauses without clearing the goal. | `refusal_with_tool_uses_is_repaired_before_checkpointing`, `denial_inside_code_mode_pauses_the_outer_turn`, `iteration_limit_leaves_late_steering_for_controller_normalization`, `active_goal_continues_only_after_normal_settlement`, `episodes_omit_reasoning_and_tool_payloads` |
+| `SettleTurn` | Answer, refusal, provider failure, denial, or iteration cap releases `&mut Agent`; the controller converts remaining steers to follow-ups, reconciles automatic goal work, writes one atomic autosave containing history, goal, prompt sources, and queue, and only then offers protocol-valid settled history to the independent memory FIFO. Completed/capped active goals linearize to `SettleTurn` followed by modeled `Enqueue`; interruption, refusal, denial, error, or exit removes automatic entries and pauses without clearing the goal. | `refusal_with_tool_uses_is_repaired_before_checkpointing`, `history_survives_api_errors_after_tool_execution`, `denial_inside_code_mode_pauses_the_outer_turn`, `iteration_limit_leaves_late_steering_for_controller_normalization`, `active_goal_continues_only_after_normal_settlement`, `episodes_omit_reasoning_and_tool_payloads` |
 | `RequestCancel` | Esc/Ctrl+C retires a live permission with deny-once, sets the turn-scoped watch flag, and keeps polling the controlled future until repair completes. | `cancellation_wins_over_a_ready_permission_before_steering`, `provider_cancellation_commits_no_partial_assistant_message` |
 | `RepairCancelledTool` | Cancellation drops the running tool future and emits synthetic error results for it and every unstarted tool use. | `interruption_pairs_the_running_and_unstarted_tool_uses`, `history_tool_protocol_is_valid` debug assertion |
 | `FinishCancellation` | After results are appended, the agent checkpoints and returns `Interrupted`; the controller retires nested TUI activity and normalizes undelivered steers. | `interruption_pairs_the_running_and_unstarted_tool_uses`, `interrupted_turn_retires_all_nested_activity`, `ending_turn_normalizes_undelivered_steers` |
@@ -86,7 +88,7 @@ queue, cancel, and permission-choice input is disabled.
 | `SingleTurnOwnership` | A current-thread reactor pins one future borrowing `&mut Agent`; the outer loop cannot dispatch again until it returns. No `Arc<Mutex<Agent>>` or background runtime exists. |
 | `DeliveryIsWellFormed` | `DeliveryMode` has only two variants; idle submissions and host goal continuations are follow-ups, and all residual steers are normalized when ownership ends. `PromptSource` does not alter delivery semantics. |
 | `SafeSteeringBoundary` | `commit_steering` is called only after a complete assistant answer or after the full result vector is appended. It is not called on refusal, cancellation, or an exhausted iteration budget. |
-| `TerminalReasonIsWellFormed` | Distinct Rust branches implement final answer, refusal, structured denial, and cap. The cancellation/permission race test prevents a cancelled turn from taking the denial-to-steer branch. |
+| `TerminalReasonIsWellFormed` | Distinct Rust branches implement final answer, refusal, terminal provider error, structured denial, and cap. Error/refusal/cap cannot consume steering. The cancellation/permission race test prevents a cancelled turn from taking the denial-to-steer branch. |
 | `ToolHistoryIsValid` | `history_tool_protocol_is_valid` checks exact adjacent ID sets; every emitted `HistoryCheckpoint` debug-asserts it, every persistence path refuses an invalid history, load rejects invalid saves, and cancellation/refusal tests inspect checkpoint histories. |
 | `PermissionIsCorrelated` | IDs are monotonic, choices travel over the request's own one-shot, mismatched modal IDs are ignored, and dropping a reply denies once. |
 | `SettledPromptsAreCommitted` | The controller records the initial user message before `PromptClaim::commit`; interrupted and ordinary outcomes therefore refer to a committed follow-up. |
@@ -97,8 +99,9 @@ queue, cancel, and permission-choice input is disabled.
 ## Episodic-memory model mapping
 
 `MemoryRuntime.tla` models only the prototype that exists: opt-in capture of
-settled turns, a FIFO SQLite worker, immutable live rows, explicit live-store
-deletion, and no prompt retrieval. It does not model candidates,
+settled turns in explicit scopes, a FIFO SQLite worker, immutable live rows,
+explicit live-store deletion, and permission-gated explicit archive
+disclosure. It does not model candidates, automatic prompt retrieval,
 consolidation, cross-agent authorization, backup erasure, or the broader
 research architecture. Its FIFO is one Generalist process's worker channel.
 Simultaneous processes share SQLite rows/settings and lock arbitration but not
@@ -115,15 +118,17 @@ alter conversation history.
 
 | TLA+ state | Authoritative Rust representation | Review note |
 | --- | --- | --- |
-| `captureEnabled` | `memory_settings.capture_enabled`, read by `MemoryWorker::record` in FIFO order | New projects insert `0`; only explicit `/memory resume` opts in. |
+| `captureEnabled` | The current handle's `memory_settings.capture_enabled` row, read by `MemoryWorker::record` in FIFO order | Each project or global handle owns one immutable scope/key and starts at `0`; only explicit `/memory resume` opts that handle in. Typed v1 scope keys live in `scoped-episodes.sqlite3`; the pre-scope database is ignored. |
 | `activeEpisode` | Ghost identity for the prompt owned between `Agent::begin_turn` and the terminal `TurnOutcome` | Rust allocates the UUID when building the settled record; because no draft is stored or observable, late allocation refines the ghost choice. |
+| `activeScope`, `episodeScope` | The immutable `WorkspaceScope` shared by `HistoryStore`, `EpisodicMemory`, and the settled `Episode.project_root` label | This lifecycle model follows one current-scope worker. Normal startup discovers the canonical project; `--global` is the explicit global selector covered jointly with `ArchiveScopeRuntime`. An episode cannot move scopes. |
 | `pendingEpisodes` | `std::sync::mpsc::Receiver<Request>` owned by the named `generalist-memory` thread | `enqueue_settled_turn` performs a non-awaiting send. A later `flush` is a FIFO barrier. |
 | `settledEpisodes` | Ghost set of protocol-valid outcomes offered to the worker | `drive_started_turn` checks `history_tool_protocol_is_valid` before enqueueing; malformed history produces a visible error and no request. |
-| `liveEpisodes` | Rows in `episodes` for the handle's canonical byte-valued project key | Every query binds the worker-owned project key before looking at IDs or content. |
+| `liveEpisodes` | Rows in `episodes`, each carrying its byte-valued scope key | Local commands bind the worker-owned current key. Permissioned search uses one SQL predicate for `current`, `global`, `other_projects`, or `all` before text/ID matching. |
 | `skippedEpisodes` | A successful `Record` request returning no ID while capture is paused | Skips are intentionally not persisted; the set is proof-history state. |
 | `failedEpisodes` | A failed atomic insert plus `MemoryEvent::CaptureFailed` | No row is made live. The set is proof-history state, not a retry queue. |
 | `forgottenEpisodes` | Successful live-row deletion observed during the current model execution | This is ghost state only. The implementation explicitly makes no non-resurrection claim across prior exports, restored backups, or filesystem snapshots. |
-| `promptMemories` | No Rust field or provider-request input exists | The former model-facing tool is unregistered and deleted; no memory API is called by `Agent` or prompt construction. |
+| `pendingSearch` | One `search_memories` or `read_memory` registry call awaiting a permission-policy decision | An interactive decision uses the correlated broker; a remembered allow/deny is automatic but still a registry policy decision. Denial returns a structured result and discloses no archive row. |
+| `authorizedByFilter`, `disclosedEpisodes` | Sanitized results returned after the registry grants the exact tool call | Results can enter code-mode computation/conversation only after an allow-once, allow-always, or remembered allow-always transition. They are never appended to the system prompt or used as instruction state automatically. |
 
 `Agent::history_revision` is a hidden payload-boundary guard, not modeled
 memory lifecycle state. Appends preserve the recorded turn-start index;
@@ -142,9 +147,12 @@ coincidentally identical later user message.
 | `FailEpisode` | Any setting/serialization/SQLite error returns no live ID; asynchronous captures emit `MemoryEvent::CaptureFailed`. | schema/immutability tests plus explicit error branch review |
 | `PauseCapture` | `/memory pause` queues a `SetCapture(false)` request and awaits its one-row settings update while the TUI keeps polling. | parser tests; `capture_and_setting_changes_observe_fifo_order` |
 | `ResumeCapture` | `/memory resume` queues `SetCapture(true)`; prior capture requests on the same channel complete first. | parser tests; `capture_is_paused_by_default`, `capture_and_setting_changes_observe_fifo_order` |
-| `ForgetEpisode` | `/memory forget <id>` resolves a unique current-project prefix and deletes exactly that row. It then attempts a truncating WAL checkpoint and distinguishes completed from still-pending truncation without misreporting the committed delete as a failure. | `project_handles_cannot_search_or_delete_each_others_episodes`, `episodes_are_immutable_but_can_be_forgotten_from_the_live_store` |
+| `ForgetEpisode` | `/memory forget <id>` resolves a unique current-scope prefix and deletes exactly that row. It then attempts a truncating WAL checkpoint and distinguishes completed from still-pending truncation without misreporting the committed delete as a failure. | `project_handles_cannot_search_or_delete_each_others_episodes`, `episodes_are_immutable_but_can_be_forgotten_from_the_live_store` |
+| `RequestSearch` | The model calls `search_memories`/`read_memory` with an explicit scope selector; `ToolRegistry` submits that exact input to the permission policy. | `archive_tools_run_through_the_registry_permission_gate` |
+| `DenySearch` | `MemoryPermissionHandler` returns deny and `ToolRegistry` does not call the SQLite-backed tool. | `archive_tools_run_through_the_registry_permission_gate` |
+| `ApproveSearch` | After an interactive or remembered allow, `search_scoped` or `show_scoped` runs on the sole memory worker. SQL applies the selected scope predicate before content/ID matching and rechecks it on the final row read; the read tool also checks the expected returned scope label. Long text is exposed in bounded, resumable pages. | `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter`, `tools_require_explicit_scope_and_return_scope_labels`, `conversation_reads_are_bounded_and_resumably_paginated` |
 
-Status, search, show, and export are read-only TLA+ stutter steps. Their
+Local status, search, show, and export are read-only TLA+ stutter steps. Their
 concrete operations still run on the worker; `drive_memory_command` continues
 polling terminal input, queue edits, stale permissions, memory events, and
 frame ticks while awaiting the reply. Tool inputs/results and all
@@ -163,27 +171,76 @@ records the outer `python` use/result rather than nested bridge activity.
 | `EpisodeIdentity` | UUIDs identify records, the primary key rejects reuse, and the FIFO processes each `Record` request once. |
 | `SettledLifecycleIsTotal` | A worker request returns inserted, skipped, or failed; a live record can later be forgotten. No partial state is returned as an episode. |
 | `EpisodeLifecycleIsDisjoint` | One insert creates live state; skip/failure create none; deletion removes the live row. The corresponding model history sets cannot overlap. |
-| `NoAutomaticRetrieval` | The system prompt has no memory instruction, the registry has no memory tool, and neither prompt construction nor `Agent` accepts an episode bundle. |
+| `NoAutomaticRetrieval` | The only modeled disclosure set equals records authorized by an explicit permission transition. Rust has no automatic retrieval hook: `Agent` and provider prompt construction accept no episode bundle, while archive reads exist only as ordinary permission-gated tools. |
+| `SearchDisclosureIsScoped` | Each approved result is constrained by the requested filter before disclosure. SQL tests exercise project/global isolation and all four filter interpretations; the read path checks the expected scope label. |
 | `EveryPendingEpisodeResolves` | TLC assumes weak fairness for the enabled FIFO-head processor. Concretely, a dedicated OS thread drains requests in the order exercised by `capture_and_setting_changes_observe_fifo_order`, and SQLite has a two-second busy timeout; an indefinitely blocked kernel/filesystem or terminated process remains outside the liveness claim. |
+
+## Archive-scope model mapping
+
+`ArchiveScopeRuntime.tla` isolates the routing contract shared by conversation
+history and episodic memory from the more detailed FIFO lifecycle. It models
+one immutable startup scope, explicit global selection, same-scope writes, and
+permissioned representative disclosures from current/global/other/all filters.
+A representative record abstracts one member of a bounded result batch; the
+Rust SQL and catalog tests separately check every returned member.
+
+### Archive-scope state mapping
+
+| TLA+ state | Authoritative Rust representation | Review note |
+| --- | --- | --- |
+| `activeScope`, `globalWasExplicit` | One `WorkspaceScope` selected in `main` before either store or the model context is built | `WorkspaceScope` has no default. Project discovery cannot return global, unscoped state does not deserialize, and only `--global` or the explicitly named library constructor selects global. |
+| `histories`, `memories` | Scoped state files under manifest-bearing scope directories and scope-keyed rows in `scoped-episodes.sqlite3` | These sets include archives written by prior runs. The model hides their text and disk representation. |
+| `writtenHistories`, `capturedMemories` | Files/rows created through the current `HistoryStore` and `MemoryWorker` | Both clients own an immutable scope and reject mismatched payload labels. |
+| `pendingKind`, `pendingFilter` | The archive tool name plus required `scope` input owned by one `ToolRegistry::execute_tool` invocation | Interactive policy checks additionally have a monotonic broker request ID and one-shot; remembered policy decisions do not open a modal. |
+| `disclosedHistory`, `historyDisclosureFilter` | The representative conversation result and categorical filter returned from an allowed search/read | Conversation manifests are filtered before any state file in an unselected scope is opened. Reads repeat both the filter and exact returned scope label. |
+| `authorizedHistoryDisclosure` | Ghost witness for the registry allow decision that produced the last representative history disclosure | It records only the last witness to keep finite CI practical; it is not a persistent permission set. |
+| `disclosedMemory`, `memoryDisclosureFilter` | The representative episode result and categorical filter returned from an allowed search/read | SQL applies the filter before text/ID matching and on the final row fetch. |
+| `authorizedMemoryDisclosure` | Ghost witness for the registry allow decision that produced the last representative memory disclosure | Allow-always state remains concrete Rust policy state outside this model; each automatic allow refines another approve transition. |
+
+### Archive-scope action mapping
+
+| TLA+ action | Concrete Rust transition | Deterministic evidence |
+| --- | --- | --- |
+| `SelectProjectScope` | Default startup calls `WorkspaceScope::discover`, choosing the nearest canonical Git root or canonical working directory. The resulting value is passed unchanged to `HistoryStore`, `EpisodicMemory`, tool construction, saved state, and the model system context. | `project_discovery_uses_the_nearest_git_root`, `global_is_explicit_and_storage_keys_are_stable_and_distinct` |
+| `SelectGlobalScope` | Only CLI `--global` or the explicitly named library constructor creates `WorkspaceScope::Global`; there is no `Default` implementation and unscoped state is rejected. Global startup also omits project-local `AGENTS.md`/`CLAUDE.md`. Pre-scope flat files are not searched. | `unscoped_state_is_rejected_instead_of_becoming_global` plus source-order review in `main` |
+| `SaveHistory` | Every autosave, checkpoint, queue edit, `/save`, and compaction routes through the active `HistoryStore::save`, which rejects a state claiming another scope and writes beneath the deterministic scope directory. | `project_autosaves_are_isolated_and_global_does_not_fallback`, `save_rejects_scope_mismatch_and_path_traversal`, `persistence_rejects_an_invalid_tool_protocol_boundary` |
+| `CaptureMemory` | `EpisodicMemory::build_episode` stamps the handle's immutable scope label; `MemoryWorker::record` rejects another label and inserts with the worker-owned scope key. | `project_handles_cannot_search_or_delete_each_others_episodes`, `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter` |
+| `RequestSearch` | Each archive tool requires a non-empty query/ID and categorical scope selector; each read also repeats the exact scope label from search. `ToolRegistry` submits that input to the ordinary permission policy before calling the tool. | `archive_tools_run_through_the_registry_permission_gate`, `tools_require_explicit_scope_and_return_scope_labels` |
+| `DenySearch` | A denied registry decision returns a structured denied tool result without calling the history catalog or SQLite worker. | `archive_tools_run_through_the_registry_permission_gate` |
+| `ApproveEmptySearch` | An allowed search with no match returns an empty JSON result without inventing a record or falling back to another scope. | project/global isolation tests in `history` and `memory` |
+| `ApproveHistorySearch` | After an interactive or remembered allow, `HistoryStore` filters scope manifests before opening conversation files, then matches content. `read_archive` resolves only an opaque ID inside that same filter and requires the exact expected scope label; outputs omit reasoning/tool payloads and paginate long text. | `archive_search_requires_an_explicit_scope_filter_and_reads_by_opaque_id`, `archived_conversations_omit_reasoning_and_tool_payloads`, `conversation_search_and_read_are_sanitized`, `conversation_reads_are_bounded_and_resumably_paginated` |
+| `ApproveMemorySearch` | After an interactive or remembered allow, worker SQL applies the selected scope predicate before text/ID matching and on the final fetch; `ReadMemoryTool` requires a full returned UUID and exact expected scope label. | `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter`, `tools_require_explicit_scope_and_return_scope_labels` |
+
+### Archive-scope property mapping
+
+| TLA+ property | Rust enforcement and review evidence |
+| --- | --- |
+| `TypeOK` | Rust enums constrain scope/filter values, typed store clients own their scope, and TLC checks every modeled routing/authorization witness value in the finite configuration. |
+| `GlobalScopeIsExplicit` | `WorkspaceScope::discover` returns only `Project`; `WorkspaceScope` has no default; unscoped persisted state is rejected; `Global` is constructed from parsed `--global` or an explicitly named library API. |
+| `WritesStayInActiveScope` | Both storage clients own immutable scope values. History rejects mismatched `SavedState.scope`; memory rejects mismatched episode labels and binds inserts to its key. |
+| `PermissionGatesDisclosure` | Archive capabilities are ordinary registered tools under `MemoryPermissionHandler`; the model keeps a last-disclosure authorization witness. Allow-always can approve later calls without another modal, but every call still passes the policy. Direct host `/memory` commands are explicit user actions, not model-initiated retrieval. |
+| `DisclosureMatchesRequestedScope` | One shared `ScopeFilter` defines current/global/other/all semantics. History filters before content matching; memory embeds the same logic in SQL before content/ID matching; reads check returned scope labels. |
+| `PendingSearchIsCorrelated` | One registry invocation owns one kind/filter pair. For interactive decisions, the broker additionally correlates a monotonic ID and one-shot response; stale/mismatched replies cannot authorize a different archive call. |
 
 ## Durable-boundary refinement
 
 Disk state is an implementation strengthening, not a TLA+ variable. The
 controller keeps a clone of the latest history-valid boundary and active goal
 while the agent future owns `&mut Agent`. Queue edits write that boundary, goal,
-and current queue together to `~/.generalist/history/autosave.json` using
+and current queue together beneath
+`~/.generalist/history/scopes/<scope-id>/autosave.json` using
 flush, atomic rename, and parent-directory flush. `HistoryCheckpoint` replaces
 the history boundary and its corresponding goal only after
 `history_tool_protocol_is_valid` holds. Carrying both in one event prevents the
 separate display notification for `GoalCompleted` from racing persistence. On
-restart, the goal is restored independently and its next continuation is
+restart, the goal is restored independently from the same scope and its next continuation is
 reconciled; queued work is recovered only together with that autosaved
 conversation. Because no turn survives a process exit, residual steers are
 normalized to follow-ups. The
 `structured_state_does_not_collide_with_legacy_input_history_file` and
 `persistence_rejects_an_invalid_tool_protocol_boundary` tests exercise the
-filesystem and protocol guards; the state round-trip test covers the optional
-goal and backward-compatible default user prompt source. `UiAction::QueueChanged`
+filesystem and protocol guards; the state round-trip test covers the mandatory
+scope, optional goal, and queued prompt provenance. `UiAction::QueueChanged`
 and `Submit` are the only terminal-event effects that request an autosave; idle
 local commands and host goal scheduling are persisted by the controller after
 execution. Display-only actions are covered by
@@ -208,10 +265,11 @@ execution. Display-only actions are covered by
   capability plus the reserved `update_goal` control while a goal is active; any
   other undeclared response is paired with an error for `ToolHistoryIsValid`
   but is never exposed as executable tool activity.
-- `NoAutomaticRetrieval` is not a same-UID filesystem sandbox. The advertised
-  `python` tool has standard-library file access and can read the SQLite file if
-  explicitly directed to its path; the invariant covers the absence of a
-  dedicated memory API and host prompt injection.
+- `NoAutomaticRetrieval` is not a same-UID filesystem sandbox. The dedicated
+  archive APIs are permission-gated and the host performs no prompt injection,
+  but the advertised `python`, `bash`, and file tools can access the same local
+  files if separately authorized. Hard confidentiality between project
+  archives requires an OS sandbox or a dedicated user, not this model.
 - The memory request channel and live episode store have no quota in this
   experiment. One request is enqueued per settled turn and ordinary SQLite lock
   contention is bounded by the busy timeout, but a hung filesystem or sustained
@@ -224,7 +282,10 @@ execution. Display-only actions are covered by
   every key is accepted in every modal.
 - Code-mode bridge calls are flattened into the active tool batch. Their
   permission denials are propagated, but their intermediate payloads and
-  subprocess/socket mechanics are outside the model.
+  subprocess/socket mechanics are outside the model. Archive reads return
+  bounded, resumable transcript pages so the bridge does not receive one
+  unbounded result; building/searching the local archive still has no storage
+  quota.
 - Typed local commands, including `/goal edit`, and `/load` mutate session
   state only while idle. They are outside the active-turn model and must retain
   that guard. The active objective is host instruction state, not conversation
@@ -242,6 +303,62 @@ execution. Display-only actions are covered by
 - TLC's state space is finite and its fingerprint collision probability is
   nonzero. A green run is model evidence, not a proof of Rust refinement or
   external tool termination.
+
+## 2026-07-27 scoped-archive and full refinement audit
+
+After implementing project/global isolation, the three models and their live
+Rust mappings were re-read action by action. The audit corrected these actual
+drifts rather than merely updating prose:
+
+- `WorkspaceScope::default()` and unscoped state could silently select global.
+  The type now has no default, `SavedState` requires a scope, and unscoped
+  files are rejected.
+- `read_conversation` repeated an exact scope label but not the modeled
+  categorical filter. Both conversation and memory reads now repeat the search
+  filter and exact label.
+- conversation catalog construction opened every scoped state file before
+  filtering results. Scope manifests are now filtered before an unselected
+  conversation file is opened; SQLite already applies its predicate before
+  memory matching, and the final episode fetch now repeats that predicate.
+- the memory lifecycle model allowed one worker's scope to change between
+  turns. It now follows one immutable `CurrentScope`; the archive-routing model
+  separately covers pre-existing cross-scope rows and explicit global startup.
+- the archive permission invariant correlated only sentinel/filter values. It
+  now carries a last-disclosure authorization witness and explicitly treats a
+  remembered allow-always decision as a permission-policy approval, not a new
+  interactive prompt.
+- code-mode bridge calls could receive an unbounded archive body before the
+  outer agent result cap. Read tools now return bounded, resumable sanitized
+  transcript pages with `next_offset`.
+- terminal provider failure existed in Rust but not `AsyncRuntime.tla`.
+  `ProviderFailure` now settles without committing partial output or consuming
+  queued steering.
+- valid non-UTF paths had lossy, potentially colliding scope labels, and
+  control-bearing paths could enter model context. Unsafe path labels now use
+  an exact byte-hex representation.
+- the traceability lint searched the entire document, so a stale historical
+  paragraph could satisfy it. It now requires every model variable, action,
+  invariant, and temporal property in the appropriate live mapping section.
+
+TLC then completed all checked configurations without error:
+
+- `AsyncRuntime.cfg`: 470,086 generated states, 117,750 distinct, depth 27;
+- `MemoryRuntime.cfg`: 7,627 generated states, 1,690 distinct, depth 16; and
+- `ArchiveScopeRuntime.cfg`: 163,652 generated states, 20,341 distinct,
+  depth 11.
+
+The complete locked Rust validation passed 144 library tests, 6 binary tests,
+all example targets, and 2 documentation tests. Formatting, Clippy with
+warnings denied, ShellCheck, the strengthened traceability lint, research
+corpus validators, hook tests, and `git diff --check` also passed.
+
+The remaining boundary is explicit: this is finite model checking plus a
+human-reviewed refinement map and deterministic Rust evidence, not a
+machine-checked proof that the Rust program refines TLA+. Archive batches use a
+representative-record abstraction, external provider/tool termination is an
+environmental assumption, and same-UID `python`/`bash`/file capabilities can
+read local archive files if separately authorized. Those are residual limits,
+not claims discharged by the green TLC runs.
 
 ## 2026-07-26 refinement audit
 
@@ -314,9 +431,10 @@ so weak fairness of combined agent progress did not apply. The model now makes
 both environmental assumptions explicit: weak fairness for exiting copy mode,
 and strong fairness for resolving a permission when its UI is available
 infinitely often. TLC then explored 442,870 states (113,190 distinct, depth 27)
-with no error under `spec/AsyncRuntime.cfg`. This is the current baseline to
-repeat, not a permanent certification or a claim that the program can force a
-human response.
+with no error under `spec/AsyncRuntime.cfg`. That historical
+pre-`ProviderFailure` baseline is superseded by the 2026-07-27 audit above; neither
+run is a permanent certification or a claim that the program can force a human
+response.
 
 The final PTY review rebuilt the binary and ran it against a deliberately
 stalled local OpenAI-compatible SSE server. While the first response was
@@ -375,6 +493,10 @@ marker and scrollbar thumb reach the real bottom, PageUp pauses, and PageDown
 restores follow-latest.
 
 ## 2026-07-27 episodic-memory refinement audit
+
+This section records the pre-scoped episodic baseline. Its observation that no
+model-facing memory tool existed was true for that exact rebuilt binary and is
+superseded by the permission-gated, read-only archive design mapped above.
 
 The prototype was traced from a settled TUI turn through
 `enqueue_settled_turn`, the sole FIFO worker, the project-scoped SQLite row,

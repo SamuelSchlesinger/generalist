@@ -54,11 +54,13 @@ pub mod command;
 pub mod error;
 pub mod execution;
 pub mod goal;
+pub mod history;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;
 pub mod provider;
 pub mod runtime;
+pub mod scope;
 pub mod skills;
 pub mod state;
 pub mod tool;
@@ -74,9 +76,12 @@ pub use command::{
 pub use error::{Error, Result};
 pub use execution::{ExecutionState, ToolExecution};
 pub use goal::{is_goal_continuation_prompt, GOAL_CONTINUATION_PROMPT, UPDATE_GOAL_TOOL_NAME};
+pub use history::{
+    ArchivedConversation, ArchivedConversationEvent, ConversationSummary, HistoryStore,
+};
 pub use memory::{
-    default_memory_path, discover_project_root, Episode, EpisodeEvent, EpisodeOutcome,
-    EpisodeSummary, EpisodicMemory, ForgetResult, MemoryEvent, MemoryStatus,
+    default_memory_path, Episode, EpisodeEvent, EpisodeOutcome, EpisodeSummary, EpisodicMemory,
+    ForgetResult, MemoryEvent, MemoryStatus,
 };
 pub use permissions::{
     AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler, PermissionBrokerPrompt,
@@ -88,6 +93,7 @@ pub use runtime::{
     CancelHandle, DeliveryMode, PromptClaim, PromptId, PromptQueue, PromptSource, QueuedPrompt,
     TurnControl,
 };
+pub use scope::{discover_project_root, ScopeFilter, WorkspaceScope};
 pub use state::SavedState;
 pub use tool::{Tool, ToolCallOutcome, ToolCallResult, ToolRegistry};
 pub use types::{

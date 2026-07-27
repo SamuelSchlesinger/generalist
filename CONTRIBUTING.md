@@ -18,17 +18,19 @@ formatting it so unstaged work cannot be pulled into the commit accidentally.
 
 ## Runtime model review
 
-Changes to the TUI, conversation runtime, or episodic-memory lifecycle are not
-complete until the Rust control flow has been traced against the affected
-`spec/AsyncRuntime.tla` and `spec/MemoryRuntime.tla` actions. The living
-state/action/invariant mappings are in
+Changes to the TUI, conversation runtime, episodic-memory lifecycle, or archive
+scope routing are not complete until the Rust control flow has been traced
+against the affected `spec/AsyncRuntime.tla`, `spec/MemoryRuntime.tla`, and
+`spec/ArchiveScopeRuntime.tla` actions. The living state/action/invariant
+mappings are in
 `docs/runtime-traceability.md`. Treat that file as review evidence, not as
 architecture prose that can be updated from memory.
 
 For every change touching `src/main.rs`, `src/command.rs`, `src/goal.rs`, `src/tui.rs`,
 `src/runtime.rs`, `src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`,
 `src/tool.rs`, `src/provider/`, `src/types.rs`, or queue/goal-bearing
-persistence in `src/state.rs`, plus every change to `src/memory.rs`:
+persistence in `src/state.rs`, plus every change to `src/memory.rs`,
+`src/history.rs`, `src/scope.rs`, or `src/tools/archive.rs`:
 
 1. Read the changed Rust paths and the entire TLA+ action they refine. Do not
    infer equivalence from names.
@@ -105,11 +107,13 @@ commits must answer in a terminal.
 
 ## Memory and collaboration handoff
 
-The model-facing `EnhancedMemoryTool` has been removed. The implemented
-prototype is intentionally narrower than the research architecture: opt-in
-project-scoped settled-turn capture, one FIFO SQLite worker, explicit local
-search/export/live deletion, and no prompt retrieval. Before expanding memory,
-multi-agent coordination, project scope, or offline consolidation, read the
+The model-authored `EnhancedMemoryTool` write path remains removed. The
+implemented prototype is intentionally narrower than the research architecture:
+opt-in scope-local settled-turn capture, one FIFO SQLite worker, scoped
+conversation storage, explicit local search/export/live deletion, and
+permission-gated read-only model search with no automatic prompt retrieval.
+Before expanding memory, multi-agent coordination, scope policy, or offline
+consolidation, read the
 current [runtime traceability](docs/runtime-traceability.md), the reviewed
 [research index](docs/research/agent-memory/index.md) and
 [implementation handoff](docs/research/agent-memory/architecture/implementation-handoff.md).
@@ -124,21 +128,26 @@ gate; do not add those later layers merely because the schema could hold them.
 
 Review memory changes against these boundaries:
 
-- capture stays opt-in, visible, pausable, and project-scoped;
+- capture stays opt-in, visible, pausable, and bound to the active project or
+  explicitly selected global scope;
 - provider reasoning, signatures, redacted payloads, tool inputs, and tool
   result content are structurally omitted before the worker request;
-- no model-facing memory tool or automatic prompt retrieval may reappear
-  without a new design/evaluation milestone;
+- model-facing archive access stays read-only, permission-gated, explicitly
+  scoped, sanitized, and separate from automatic prompt construction; no
+  model-authored memory write or automatic retrieval may reappear without a
+  new design/evaluation milestone;
 - same-UID file modes are not worker isolation;
 - every SQLite request remains off the current-thread reactor while its command
   driver continues polling terminal, queue, permission, and frame events;
-- every query binds the worker-owned canonical project key before content/ID
-  matching;
+- local commands bind the worker-owned current-scope key before content/ID
+  matching; cross-scope model searches apply the selected scope predicate
+  before content/ID matching;
 - immutable-row insertion is atomic and failures create no retrievable row;
 - `/memory forget` must continue to say that prior exports, backups, and
   filesystem snapshots are outside its live-store guarantee; and
-- `AsyncRuntime.tla`, `MemoryRuntime.tla`, Rust transitions, tests, CI, and this
-  review methodology change together whenever their boundary changes.
+- `spec/AsyncRuntime.tla`, `spec/MemoryRuntime.tla`,
+  `spec/ArchiveScopeRuntime.tla`, Rust transitions, tests, CI, and this review
+  methodology change together whenever their boundary changes.
 
 If future work introduces automatic retrieval, derived records, external
 workers, or multi-agent sharing, the deferred provenance, epoch, tombstone,

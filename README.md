@@ -45,9 +45,11 @@ systems; code mode is on by default and `python` is the only model-facing
 capability tool. Scripts reach all registered capabilities through `import tools`: bash, file
 read/patch, directory listing, HTTP
 fetch, web search/scrape/crawl (Firecrawl), Wikipedia, weather, Z3, and todo
-list. (Calculator, system-info, think, and the former model-controlled memory
-tool were retired from the CLI: python and bash subsume the first three, while
-episodic memory is host-owned.)
+list. Permission-gated archive tools can explicitly search/read sanitized
+episodic memories and saved conversations in selected scopes. (Calculator,
+system-info, think, and the former model-controlled memory *write* tool were
+retired from the CLI: python and bash subsume the first three, while episodic
+capture remains host-owned.)
 
 Responses stream as they generate. Type `/` to enter visible command mode; the
 footer lists the available slash commands from the same catalog used by the
@@ -61,18 +63,23 @@ the objective; edit the goal or send another prompt to resume. Other commands
 are `/save`, `/load`, `/model`, `/compact`, `/clear`, `/memory`, `/help`, and
 `/exit`.
 
-History-valid boundaries, the active goal, and queue edits are atomically
-autosaved to `~/.generalist/history/autosave.json`. The goal survives restart
-even with no queued work, and startup schedules its next automatic continuation.
-If the process exits with queued work, the next run also recovers that queue
-together with its conversation context. `/load` reads and resumes the goal
-stored in a named session and also supports the legacy
-`~/.chatbot_history` and `~/.generalist_history` directories. If
-`~/.generalist_history` is instead a regular input-history file, it is left
-untouched. Set `GENERALIST_HOME` to an alternate directory for an isolated
-profile or reproducible harness run; all of the paths above, plus
-`.generalist.env`, MCP configuration, and skills, are then resolved beneath
-that directory.
+History-valid boundaries, the active goal, queue, named sessions, and remembered
+tool decisions are isolated by default to the canonical Git worktree root (or
+canonical working directory outside Git). Scoped state lives beneath
+`~/.generalist/history/scopes/<scope-id>/`; the project autosave never falls
+back to another project or to global history. The goal survives restart even
+with no queued work, and startup schedules its next automatic continuation. If
+the process exits with queued work, the next run also recovers that queue
+together with its conversation context. Current save files must carry their
+scope explicitly; unscoped state is rejected rather than treated as global.
+
+Run `generalist --global` to select the explicit cross-project namespace.
+Pre-scoping flat history and the legacy `~/.chatbot_history` and
+`~/.generalist_history` paths are left untouched but are not read by the new
+stores; there is no implicit migration or compatibility fallback. Set
+`GENERALIST_HOME` to an alternate directory for an isolated profile or
+reproducible harness run; all of the paths above, plus `.generalist.env`, MCP
+configuration, and skills, are then resolved beneath that directory.
 
 ## Terminal UI
 
@@ -126,11 +133,11 @@ you want to keep.
 
 Generalist now has a deliberately small host-owned episodic prototype:
 
-- capture is paused by default and enabled per canonical Git project with
-  `/memory resume`;
+- capture is paused by default and enabled independently for the active project
+  or explicit global scope with `/memory resume`;
 - a dedicated worker per Generalist process owns its SQLite connection at
-  `~/.generalist/memory/episodes.sqlite3`, keeping database work off the TUI
-  reactor;
+  `~/.generalist/memory/scoped-episodes.sqlite3`, keeping database work off the
+  TUI reactor. The pre-scoping `episodes.sqlite3` is left untouched and ignored;
 - only settled user/assistant text, tool names, and tool success/error metadata
   are retained; tool inputs/results, provider reasoning, signatures, and
   redacted payloads are structurally omitted. Host-authored goal-continuation
@@ -141,10 +148,16 @@ Generalist now has a deliberately small host-owned episodic prototype:
   nested bridge call;
 - `/memory status`, `pause`, `resume`, `search <query>`, `show <id>`, `export`,
   and `forget <id>` are explicit local commands; and
-- no episode is automatically retrieved, injected into a prompt, exposed as a
-  model-facing tool, consolidated, summarized, or shared with another agent.
+- `search_memories`/`read_memory` and
+  `search_conversations`/`read_conversation` are read-only model capabilities.
+  Each call requires the ordinary tool permission flow and an explicit
+  `current`, `global`, `other_projects`, or `all` scope. Results omit provider
+  reasoning and tool payloads and are labeled as untrusted historical context.
+  Reads repeat the search filter and exact returned scope label; long
+  transcripts use bounded pages with `next_offset`. No episode or conversation
+  is automatically retrieved or injected.
 
-`/memory forget` removes the current-project row from the live SQLite store and
+`/memory forget` removes the current-scope row from the live SQLite store and
 attempts a truncating WAL checkpoint, reporting separately if truncation
 remains pending. It does not claim erasure from prior exports, backups, or
 filesystem snapshots. User and assistant text can itself contain secrets, so
@@ -154,9 +167,8 @@ this experiment; inspect and delete retained rows explicitly.
 The `0700` directory and `0600` database protect against other Unix users, not
 same-UID tools; this prototype is not a sandbox or a multi-agent security
 boundary. In particular, code mode's unsandboxed Python process can access the
-database as an ordinary local file if directed to its path. “No model-facing
-memory tool” means there is no advertised memory API or automatic prompt
-retrieval, not that generic local code is prevented from reading it.
+database as an ordinary local file if directed to its path. Permission-gated
+archive reads are not a same-UID sandbox and do not weaken this caveat.
 Simultaneous Generalist processes share settings/rows through SQLite locking,
 but have no cross-process queue ordering or collaboration protocol.
 
@@ -164,8 +176,10 @@ The source-grounded design, adversarial safety review, multi-agent analysis,
 and possible future lifecycle are checked in under
 [the agent-memory research corpus](docs/research/agent-memory/index.md). The
 current prototype intentionally implements much less than that design. Its
-actual FIFO capture/deletion semantics are modeled in
-[`MemoryRuntime.tla`](spec/MemoryRuntime.tla); product value must be measured
+actual scoped FIFO capture/deletion and permissioned-disclosure semantics are modeled in
+[`MemoryRuntime.tla`](spec/MemoryRuntime.tla), while shared conversation/memory
+scope routing is modeled in
+[`ArchiveScopeRuntime.tla`](spec/ArchiveScopeRuntime.tla); product value must be measured
 before adding automatic retrieval, candidate promotion, consolidation,
 simulation, or collaboration.
 
@@ -184,6 +198,9 @@ Caveats:
 
 - "Always allow" is per tool name. Always-allowing `bash` approves every future
   command; each command is still shown in tool activity before it runs.
+- The same rule applies to archive tools: always-allowing
+  `search_conversations` or `search_memories` covers future inputs including
+  broader scope selectors. Use allow-once when that breadth is not intended.
 - The prompts are not a sandbox. An agent that can write and run code can circumvent
   in-process fences; use a container or dedicated user for real isolation.
 - Fetched web content is untrusted input; the approval step exists mainly to catch

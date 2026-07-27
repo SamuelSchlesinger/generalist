@@ -44,7 +44,7 @@ Phases ==
 
 DeliveryModes == {"steer", "followup"}
 LifecycleStates == {"fresh", "queued", "claimed", "committed", "discarded"}
-TerminalReasons == {"none", "answer", "refusal", "denial", "limit"}
+TerminalReasons == {"none", "answer", "refusal", "error", "denial", "limit"}
 
 VARIABLES
     copyMode,
@@ -282,6 +282,21 @@ ProviderRefusal ==
                    settledTurns, interruptedTurns, committedOrder,
                    permission, permissionOwner, usedRequests, failuresLeft>>
 
+\* A provider/API failure after retries commits no partial assistant response
+\* and settles the current turn without consuming queued steering.
+ProviderFailure ==
+    /\ phase = "provider"
+    /\ roundsLeft > 0
+    /\ phase' = "boundary"
+    /\ continuationNeeded' = FALSE
+    /\ terminalReason' = "error"
+    /\ roundsLeft' = roundsLeft - 1
+    /\ toolUses' = 0
+    /\ toolResults' = 0
+    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+                   settledTurns, interruptedTurns, committedOrder,
+                   permission, permissionOwner, usedRequests, failuresLeft>>
+
 ProviderToolBatch(count) ==
     /\ phase = "provider"
     /\ roundsLeft > 0
@@ -356,7 +371,7 @@ ClaimSteering ==
     /\ phase = "boundary"
     /\ Len(QueuedSteers) > 0
     /\ roundsLeft > 0
-    /\ terminalReason \notin {"refusal", "limit"}
+    /\ terminalReason \notin {"refusal", "error", "limit"}
     /\ phase' = "claiming"
     /\ claimedSteers' = QueuedSteers
     /\ queue' = DropMode(queue, "steer")
@@ -420,7 +435,7 @@ SettleTurn ==
     /\ terminalReason # "none"
     /\ \/ Len(QueuedSteers) = 0
        \/ roundsLeft = 0
-       \/ terminalReason = "refusal"
+       \/ terminalReason \in {"refusal", "error"}
     /\ phase' = "idle"
     /\ settledTurns' = settledTurns \cup {activeTurn}
     /\ activeTurn' = NoPrompt
@@ -497,6 +512,7 @@ AgentProgress ==
     \/ RequeueStart
     \/ ProviderAnswer
     \/ ProviderRefusal
+    \/ ProviderFailure
     \/ \E count \in 1..MaxTools : ProviderToolBatch(count)
     \/ CompleteTool
     \/ \E requestId \in RequestIds : AskPermission(requestId)
@@ -596,12 +612,12 @@ SafeSteeringBoundary ==
        /\ permissionOwner = NoPrompt
        /\ Len(claimedSteers) > 0
        /\ roundsLeft > 0
-       /\ terminalReason \notin {"refusal", "limit"}
+       /\ terminalReason \notin {"refusal", "error", "limit"}
 
 TerminalReasonIsWellFormed ==
     /\ phase \in {"idle", "starting", "provider", "cancelling"}
         => terminalReason = "none"
-    /\ terminalReason \in {"answer", "refusal"}
+    /\ terminalReason \in {"answer", "refusal", "error"}
         => ~continuationNeeded
     /\ terminalReason \in {"denial", "limit"}
         => continuationNeeded

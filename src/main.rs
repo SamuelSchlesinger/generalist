@@ -5,12 +5,12 @@ use generalist::provider::{
 use generalist::tools::*;
 use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
-    default_memory_path, discover_project_root, history_tool_protocol_is_valid, is_local_command,
-    parse_local_command, truncate_middle, Agent, AgentEvent, DeliveryMode, Episode, EpisodeEvent,
-    EpisodeOutcome, EpisodicMemory, Error, ForgetResult, GoalCommand, LocalCommand, MemoryCommand,
+    default_memory_path, history_tool_protocol_is_valid, is_local_command, parse_local_command,
+    truncate_middle, Agent, AgentEvent, DeliveryMode, Episode, EpisodeEvent, EpisodeOutcome,
+    EpisodicMemory, Error, ForgetResult, GoalCommand, HistoryStore, LocalCommand, MemoryCommand,
     MemoryEvent, MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt, PermissionChoice,
     PermissionRequest, PermissionUiEvent, PromptQueue, PromptSource, Result, SavedState,
-    ToolRegistry, TurnControl, TurnOutcome,
+    ToolRegistry, TurnControl, TurnOutcome, WorkspaceScope,
 };
 use std::env;
 use std::fs;
@@ -24,7 +24,6 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 const AUTOSAVE_NAME: &str = "autosave";
-const PENDING_QUEUE_NAME: &str = "pending-queue";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
 
@@ -34,52 +33,6 @@ fn home_dir() -> PathBuf {
     }
     #[allow(deprecated)]
     env::home_dir().unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn history_dir_for(home: &Path) -> Result<PathBuf> {
-    let dir = home.join(".generalist").join("history");
-    fs::create_dir_all(&dir).map_err(|error| {
-        Error::Other(format!(
-            "Failed to create state directory {}: {error}",
-            dir.display()
-        ))
-    })?;
-    Ok(dir)
-}
-
-fn history_dir() -> Result<PathBuf> {
-    history_dir_for(&home_dir())
-}
-
-fn state_search_dirs() -> Vec<PathBuf> {
-    let home = home_dir();
-    let mut dirs = Vec::new();
-    if let Ok(current) = history_dir_for(&home) {
-        dirs.push(current);
-    }
-    // Older releases used both paths. `.generalist_history` may also be a
-    // regular readline-history file, so only read_dir/read_to_string callers
-    // decide whether a particular candidate has the shape they need.
-    dirs.push(home.join(".generalist_history"));
-    dirs.push(home.join(".chatbot_history"));
-    dirs
-}
-
-fn save_state(state: &SavedState, filename: &str) -> Result<PathBuf> {
-    let filepath = history_dir()?.join(format!("{}.json", filename));
-    let json_data = serialize_state(state)?;
-    write_atomically(&filepath, &json_data)?;
-    Ok(filepath)
-}
-
-fn serialize_state(state: &SavedState) -> Result<Vec<u8>> {
-    if !history_tool_protocol_is_valid(&state.conversation_history) {
-        return Err(Error::Other(
-            "Refusing to persist history with an unpaired tool use/result".to_string(),
-        ));
-    }
-    serde_json::to_vec_pretty(state)
-        .map_err(|error| Error::Other(format!("Failed to serialize state: {error}")))
 }
 
 fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
@@ -136,42 +89,6 @@ fn write_memory_export(home: &Path, episodes: &[Episode]) -> Result<PathBuf> {
         ))
     })?;
     Ok(path)
-}
-
-fn load_state(filename: &str) -> Result<SavedState> {
-    for dir in state_search_dirs() {
-        let filepath = dir.join(format!("{}.json", filename));
-        if let Ok(json_data) = fs::read_to_string(&filepath) {
-            return SavedState::from_legacy_json(&json_data, anthropic::SUGGESTED_MODELS[0])
-                .ok_or_else(|| Error::Other(format!("Failed to parse {}", filepath.display())));
-        }
-    }
-    Err(Error::Other(format!(
-        "No saved conversation named '{}'",
-        filename
-    )))
-}
-
-fn list_saved_conversations() -> Vec<String> {
-    let mut conversations = Vec::new();
-    for dir in state_search_dirs() {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Some(stem) = name.strip_suffix(".json") {
-                        if stem == PENDING_QUEUE_NAME {
-                            continue;
-                        }
-                        if !conversations.contains(&stem.to_string()) {
-                            conversations.push(stem.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    conversations.sort();
-    conversations
 }
 
 struct ApiKeys {
@@ -266,7 +183,11 @@ fn default_remote_provider_and_model(keys: &ApiKeys) -> Option<(String, String)>
     })
 }
 
-fn build_registry(permission_handler: &MemoryPermissionHandler) -> Result<ToolRegistry> {
+fn build_registry(
+    permission_handler: &MemoryPermissionHandler,
+    history_store: &HistoryStore,
+    memory: Option<&EpisodicMemory>,
+) -> Result<ToolRegistry> {
     let mut registry = ToolRegistry::with_permission_handler(Box::new(permission_handler.clone()));
     registry.register(Arc::new(ReadFileTool))?;
     registry.register(Arc::new(PatchFileTool))?;
@@ -281,6 +202,14 @@ fn build_registry(permission_handler: &MemoryPermissionHandler) -> Result<ToolRe
     registry.register(Arc::new(FirecrawlSearchTool))?;
     registry.register(Arc::new(FirecrawlMapTool))?;
     registry.register(Arc::new(FirecrawlExtractTool))?;
+    registry.register(Arc::new(SearchConversationsTool::new(
+        history_store.clone(),
+    )))?;
+    registry.register(Arc::new(ReadConversationTool::new(history_store.clone())))?;
+    if let Some(memory) = memory {
+        registry.register(Arc::new(SearchMemoriesTool::new(memory.clone())))?;
+        registry.register(Arc::new(ReadMemoryTool::new(memory.clone())))?;
+    }
     Ok(registry)
 }
 
@@ -288,8 +217,10 @@ fn make_saved_state(
     agent: &Agent,
     handler: &MemoryPermissionHandler,
     queue: &PromptQueue,
+    scope: &WorkspaceScope,
 ) -> SavedState {
     SavedState {
+        scope: scope.clone(),
         provider: agent.provider().id().to_string(),
         model: agent.provider().model().to_string(),
         goal: agent.goal().map(str::to_string),
@@ -319,11 +250,13 @@ impl DurableBoundary {
 
     fn save(
         &self,
+        history_store: &HistoryStore,
         permission_handler: &MemoryPermissionHandler,
         queue: &PromptQueue,
     ) -> Result<()> {
-        save_state(
+        history_store.save(
             &SavedState {
+                scope: history_store.scope().clone(),
                 provider: self.provider.clone(),
                 model: self.model.clone(),
                 goal: self.goal.clone(),
@@ -341,6 +274,7 @@ impl DurableBoundary {
 fn apply_runtime_event(
     ui: &mut TerminalUi,
     queue: &PromptQueue,
+    history_store: &HistoryStore,
     permission_handler: &MemoryPermissionHandler,
     durable: &mut DurableBoundary,
     event: AgentEvent,
@@ -355,7 +289,7 @@ fn apply_runtime_event(
             ui.set_context_tokens(context_tokens);
             durable.history = history;
             durable.goal = goal;
-            if let Err(error) = durable.save(permission_handler, queue) {
+            if let Err(error) = durable.save(history_store, permission_handler, queue) {
                 ui.error(&format!("Failed to persist runtime checkpoint: {error}"));
             }
         }
@@ -368,11 +302,14 @@ fn apply_runtime_event(
 
 struct CliArgs {
     local_model: Option<String>,
+    global_scope: bool,
 }
 
 fn print_usage() {
-    println!("Usage: generalist [--local [model]]");
+    println!("Usage: generalist [--global] [--local [model]]");
     println!();
+    println!("  --global          Use the explicit cross-project history/memory scope");
+    println!("                    (default: project scope discovered from the working directory)");
     println!("  --local [model]   Run against a local OpenAI-compatible server");
     println!(
         "                    (default {}, override with OPENAI_BASE_URL).",
@@ -387,9 +324,11 @@ fn print_usage() {
 
 fn parse_args() -> CliArgs {
     let mut local_model = None;
+    let mut global_scope = false;
     let mut args = env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--global" => global_scope = true,
             "--local" => {
                 let model = match args.peek() {
                     Some(next) if !next.starts_with('-') => args.next().unwrap(),
@@ -411,7 +350,10 @@ fn parse_args() -> CliArgs {
             }
         }
     }
-    CliArgs { local_model }
+    CliArgs {
+        local_model,
+        global_scope,
+    }
 }
 
 fn terminal<T>(result: io::Result<T>) -> Result<T> {
@@ -496,6 +438,7 @@ async fn drive_started_turn(
     agent: &mut Agent,
     ui: &mut TerminalUi,
     queue: &PromptQueue,
+    history_store: &HistoryStore,
     permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
     permission_handler: &MemoryPermissionHandler,
     memory: Option<&EpisodicMemory>,
@@ -538,6 +481,7 @@ async fn drive_started_turn(
                     apply_runtime_event(
                         ui,
                         queue,
+                        history_store,
                         permission_handler,
                         &mut durable,
                         event,
@@ -609,7 +553,9 @@ async fn drive_started_turn(
                         }
                     }
                     if persist_queue {
-                        if let Err(error) = durable.save(permission_handler, queue) {
+                        if let Err(error) =
+                            durable.save(history_store, permission_handler, queue)
+                        {
                             ui.error(&format!("Failed to persist runtime state: {error}"));
                         }
                     }
@@ -621,6 +567,7 @@ async fn drive_started_turn(
                     apply_runtime_event(
                         ui,
                         queue,
+                        history_store,
                         permission_handler,
                         &mut durable,
                         event,
@@ -631,10 +578,24 @@ async fn drive_started_turn(
     };
 
     while let Ok(event) = checkpoint_rx.try_recv() {
-        apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
+        apply_runtime_event(
+            ui,
+            queue,
+            history_store,
+            permission_handler,
+            &mut durable,
+            event,
+        );
     }
     while let Ok(event) = event_rx.try_recv() {
-        apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
+        apply_runtime_event(
+            ui,
+            queue,
+            history_store,
+            permission_handler,
+            &mut durable,
+            event,
+        );
     }
     queue.normalize_steers();
     let continue_goal = should_continue_goal(agent.goal().is_some(), exit_requested, &outcome);
@@ -643,8 +604,8 @@ async fn drive_started_turn(
         ui.info("Goal remains active; queued an automatic continuation.");
     }
     ui.sync_queue(queue);
-    if let Err(error) = save_state(
-        &make_saved_state(agent, permission_handler, queue),
+    if let Err(error) = history_store.save(
+        &make_saved_state(agent, permission_handler, queue, history_store.scope()),
         AUTOSAVE_NAME,
     ) {
         ui.error(&format!("Failed to persist settled runtime state: {error}"));
@@ -713,6 +674,7 @@ async fn drive_compaction(
     agent: &mut Agent,
     ui: &mut TerminalUi,
     queue: &PromptQueue,
+    history_store: &HistoryStore,
     permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
     permission_handler: &MemoryPermissionHandler,
     memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
@@ -743,6 +705,7 @@ async fn drive_compaction(
                 Some(event) = checkpoint_rx.recv() => apply_runtime_event(
                     ui,
                     queue,
+                    history_store,
                     permission_handler,
                     &mut durable,
                     event,
@@ -789,7 +752,9 @@ async fn drive_compaction(
                         UiAction::None | UiAction::QueueChanged | UiAction::Permission { .. } => {}
                     }
                     if persist_queue {
-                        if let Err(error) = durable.save(permission_handler, queue) {
+                        if let Err(error) =
+                            durable.save(history_store, permission_handler, queue)
+                        {
                             ui.error(&format!("Failed to persist runtime state: {error}"));
                         }
                     }
@@ -799,6 +764,7 @@ async fn drive_compaction(
                 Some(event) = event_rx.recv() => apply_runtime_event(
                     ui,
                     queue,
+                    history_store,
                     permission_handler,
                     &mut durable,
                     event,
@@ -808,13 +774,27 @@ async fn drive_compaction(
     };
 
     while let Ok(event) = checkpoint_rx.try_recv() {
-        apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
+        apply_runtime_event(
+            ui,
+            queue,
+            history_store,
+            permission_handler,
+            &mut durable,
+            event,
+        );
     }
     while let Ok(event) = event_rx.try_recv() {
-        apply_runtime_event(ui, queue, permission_handler, &mut durable, event);
+        apply_runtime_event(
+            ui,
+            queue,
+            history_store,
+            permission_handler,
+            &mut durable,
+            event,
+        );
     }
-    if let Err(error) = save_state(
-        &make_saved_state(agent, permission_handler, queue),
+    if let Err(error) = history_store.save(
+        &make_saved_state(agent, permission_handler, queue, history_store.scope()),
         AUTOSAVE_NAME,
     ) {
         ui.error(&format!("Failed to persist compaction state: {error}"));
@@ -918,7 +898,7 @@ async fn run_memory_command(
         MemoryCommand::Status => {
             let status = memory.status().await?;
             Ok(vec![format!(
-                "Episodic memory: {} · {} episode(s)\nProject: {}\nSQLite {} at {}\n\
+                "Episodic memory: {} · {} episode(s)\nScope: {}\nSQLite {} at {}\n\
                  Explicit search only; no automatic retrieval. User/assistant text is retained; \
                  provider reasoning and tool payloads are omitted.",
                 if status.capture_enabled {
@@ -934,12 +914,14 @@ async fn run_memory_command(
         }
         MemoryCommand::Pause => {
             memory.set_capture_enabled(false).await?;
-            Ok(vec!["Episodic capture paused for this project.".to_string()])
+            Ok(vec![
+                "Episodic capture paused for the current scope.".to_string()
+            ])
         }
         MemoryCommand::Resume => {
             memory.set_capture_enabled(true).await?;
             Ok(vec![
-                "Episodic capture enabled for this project. Future settled user/assistant text \
+                "Episodic capture enabled for the current scope. Future settled user/assistant text \
                  is retained; provider reasoning and tool payloads are omitted. Pause capture \
                  before entering sensitive text."
                     .to_string(),
@@ -949,11 +931,11 @@ async fn run_memory_command(
             let matches = memory.search(query).await?;
             if matches.is_empty() {
                 return Ok(vec![format!(
-                    "No current-project episodes matched “{query}”."
+                    "No current-scope episodes matched “{query}”."
                 )]);
             }
             let mut lines = vec![format!(
-                "{} current-project episode(s) matched “{query}”:",
+                "{} current-scope episode(s) matched “{query}”:",
                 matches.len()
             )];
             for episode in matches {
@@ -971,7 +953,7 @@ async fn run_memory_command(
         MemoryCommand::Show(id) => match memory.show(id).await? {
             Some(episode) => Ok(vec![render_episode(&episode)]),
             None => Ok(vec![format!(
-                "No current-project episode matches ID prefix '{id}'."
+                "No current-scope episode matches ID prefix '{id}'."
             )]),
         },
         MemoryCommand::Export => {
@@ -985,7 +967,7 @@ async fn run_memory_command(
                         Error::Other(format!("Episode export worker failed: {error}"))
                     })??;
             Ok(vec![format!(
-                "Exported {count} current-project episode(s) to {}",
+                "Exported {count} current-scope episode(s) to {}",
                 path.display()
             )])
         }
@@ -1001,7 +983,7 @@ async fn run_memory_command(
                      guarantee."
             )]),
             ForgetResult::NotFound => Ok(vec![format!(
-                "No current-project episode matches ID prefix '{id}'."
+                "No current-scope episode matches ID prefix '{id}'."
             )]),
         },
     }
@@ -1014,6 +996,7 @@ async fn drive_memory_command(
     agent: &Agent,
     ui: &mut TerminalUi,
     queue: &PromptQueue,
+    history_store: &HistoryStore,
     permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
     permission_handler: &MemoryPermissionHandler,
     memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
@@ -1077,8 +1060,13 @@ async fn drive_memory_command(
                     | UiAction::Permission { .. } => {}
                 }
                 if persist_queue {
-                    if let Err(error) = save_state(
-                        &make_saved_state(agent, permission_handler, queue),
+                    if let Err(error) = history_store.save(
+                        &make_saved_state(
+                            agent,
+                            permission_handler,
+                            queue,
+                            history_store.scope(),
+                        ),
                         AUTOSAVE_NAME,
                     ) {
                         ui.error(&format!("Failed to persist runtime state: {error}"));
@@ -1097,6 +1085,7 @@ async fn execute_command(
     agent: &mut Agent,
     ui: &mut TerminalUi,
     queue: &PromptQueue,
+    history_store: &HistoryStore,
     permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
     permission_handler: &MemoryPermissionHandler,
     memory: Option<&EpisodicMemory>,
@@ -1113,6 +1102,7 @@ async fn execute_command(
                 agent,
                 ui,
                 queue,
+                history_store,
                 permission_rx,
                 permission_handler,
                 memory_events,
@@ -1131,20 +1121,24 @@ async fn execute_command(
         LocalCommand::Save => {
             let default = format!("chat_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
             if let Some(name) = terminal(ui.prompt("Save conversation as", &default).await)? {
-                match save_state(&make_saved_state(agent, permission_handler, queue), &name) {
+                match history_store.save(
+                    &make_saved_state(agent, permission_handler, queue, history_store.scope()),
+                    &name,
+                ) {
                     Ok(path) => ui.info(&format!("Saved to {}", path.display())),
                     Err(error) => ui.error(&format!("Failed to save: {error}")),
                 }
             }
         }
         LocalCommand::Load => {
-            let saved = list_saved_conversations();
+            let saved = history_store.list();
             if saved.is_empty() {
                 ui.info("No saved conversations found.");
             } else if let Some(index) = terminal(ui.select("Load conversation", &saved).await)? {
-                match load_state(&saved[index]) {
+                match history_store.load(&saved[index]) {
                     Ok(state) => {
                         let SavedState {
+                            scope: _,
                             provider,
                             model,
                             goal,
@@ -1228,6 +1222,7 @@ async fn execute_command(
                 agent,
                 ui,
                 queue,
+                history_store,
                 permission_rx,
                 permission_handler,
                 memory_events,
@@ -1247,8 +1242,9 @@ async fn execute_command(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = parse_args();
+    let generalist_home = home_dir();
 
-    let env_path = home_dir().join(".generalist.env");
+    let env_path = generalist_home.join(".generalist.env");
     if env_path.exists() {
         dotenv::from_path(&env_path).ok();
     }
@@ -1273,17 +1269,22 @@ async fn main() -> Result<()> {
     }
 
     let mut ui = terminal(TerminalUi::start("Starting", "selecting model"))?;
+    let working_directory = env::current_dir()
+        .map_err(|error| Error::Other(format!("Failed to read working directory: {error}")))?;
+    let scope = if cli.global_scope {
+        WorkspaceScope::global()
+    } else {
+        WorkspaceScope::discover(&working_directory)?
+    };
+    let history_store = HistoryStore::open(generalist_home.clone(), scope.clone())?;
+    ui.info(&format!("Storage scope: {}", scope.display_name()));
+
     let (memory_event_tx, mut memory_event_rx) = mpsc::unbounded_channel();
-    let memory = match (|| -> Result<EpisodicMemory> {
-        let working_directory = env::current_dir()
-            .map_err(|error| Error::Other(format!("Failed to read working directory: {error}")))?;
-        let project_root = discover_project_root(&working_directory)?;
-        EpisodicMemory::open_with_events(
-            default_memory_path(&home_dir()),
-            project_root,
-            Some(memory_event_tx),
-        )
-    })() {
+    let memory = match EpisodicMemory::open_scoped_with_events(
+        default_memory_path(&generalist_home),
+        scope.clone(),
+        Some(memory_event_tx),
+    ) {
         Ok(memory) => Some(memory),
         Err(error) => {
             ui.error(&format!("Episodic memory is unavailable: {error}"));
@@ -1306,11 +1307,12 @@ async fn main() -> Result<()> {
     let (permission_tx, mut permission_rx) = mpsc::unbounded_channel();
     let permission_prompt = Arc::new(PermissionBrokerPrompt::new(permission_tx));
     let permission_handler = MemoryPermissionHandler::with_prompt(permission_prompt);
-    let mut registry = build_registry(&permission_handler)?;
+    let mut registry = build_registry(&permission_handler, &history_store, memory.as_ref())?;
 
     ui.set_busy(true, "Connecting tools");
     terminal(ui.draw())?;
-    if let Some(config) = generalist::mcp::McpConfig::load(&home_dir().join(".generalist/mcp.json"))
+    if let Some(config) =
+        generalist::mcp::McpConfig::load(&generalist_home.join(".generalist/mcp.json"))
     {
         for line in generalist::mcp::register_servers(&mut registry, &config).await {
             ui.info(&line);
@@ -1319,18 +1321,33 @@ async fn main() -> Result<()> {
     ui.set_busy(false, "Ready");
 
     let mut system_prompt = include_str!("../SYSTEM_PROMPT.md").to_string();
-    if let Some(index) = generalist::skills::skills_index(&home_dir().join(".generalist/skills")) {
+    system_prompt.push_str(&format!(
+        "\n\n## Active archive scope\n\nThis run's history and episodic-memory scope is `{}`. \
+         Current-scope storage is isolated from every other project. Global or other-project \
+         archives are available only through the permission-gated search/read tools; never \
+         assume or retrieve them automatically.",
+        scope.display_name()
+    ));
+    if let Some(index) =
+        generalist::skills::skills_index(&generalist_home.join(".generalist/skills"))
+    {
         system_prompt.push_str(&index);
     }
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        if let Ok(notes) = fs::read_to_string(name) {
-            system_prompt.push_str(&format!("\n\n## Project notes (./{name})\n\n{notes}"));
-            break;
+    if let Some(project_root) = scope.project_root() {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let path = project_root.join(name);
+            if let Ok(notes) = fs::read_to_string(&path) {
+                system_prompt.push_str(&format!(
+                    "\n\n## Project notes ({})\n\n{notes}",
+                    path.display()
+                ));
+                break;
+            }
         }
     }
 
     let mut agent = Agent::new(provider, registry, system_prompt);
-    let queue = match load_state(AUTOSAVE_NAME) {
+    let queue = match history_store.load(AUTOSAVE_NAME) {
         Ok(mut state) => {
             // The active goal is independent of crash recovery: preserve it
             // across restarts even when there is no queued turn to resume.
@@ -1339,6 +1356,7 @@ async fn main() -> Result<()> {
                 PromptQueue::default()
             } else if history_tool_protocol_is_valid(&state.conversation_history) {
                 let SavedState {
+                    scope: _,
                     conversation_history,
                     always_allow_tools,
                     always_deny_tools,
@@ -1396,6 +1414,7 @@ async fn main() -> Result<()> {
                         &mut agent,
                         &mut ui,
                         &queue,
+                        &history_store,
                         &mut permission_rx,
                         &permission_handler,
                         memory.as_ref(),
@@ -1417,8 +1436,8 @@ async fn main() -> Result<()> {
                 } else {
                     ui.push_user(prompt.text.trim());
                 }
-                if let Err(error) = save_state(
-                    &make_saved_state(&agent, &permission_handler, &queue),
+                if let Err(error) = history_store.save(
+                    &make_saved_state(&agent, &permission_handler, &queue, history_store.scope()),
                     AUTOSAVE_NAME,
                 ) {
                     ui.error(&format!("Failed to persist the started turn: {error}"));
@@ -1427,6 +1446,7 @@ async fn main() -> Result<()> {
                     &mut agent,
                     &mut ui,
                     &queue,
+                    &history_store,
                     &mut permission_rx,
                     &permission_handler,
                     memory.as_ref(),
@@ -1439,8 +1459,8 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
-            if let Err(error) = save_state(
-                &make_saved_state(&agent, &permission_handler, &queue),
+            if let Err(error) = history_store.save(
+                &make_saved_state(&agent, &permission_handler, &queue, history_store.scope()),
                 AUTOSAVE_NAME,
             ) {
                 ui.error(&format!("Failed to persist settled runtime state: {error}"));
@@ -1486,8 +1506,13 @@ async fn main() -> Result<()> {
                     | UiAction::Permission { .. } => {}
                 }
                 if persist_queue {
-                    if let Err(error) = save_state(
-                        &make_saved_state(&agent, &permission_handler, &queue),
+                    if let Err(error) = history_store.save(
+                        &make_saved_state(
+                            &agent,
+                            &permission_handler,
+                            &queue,
+                            history_store.scope(),
+                        ),
                         AUTOSAVE_NAME,
                     ) {
                         ui.error(&format!("Failed to persist runtime state: {error}"));
@@ -1519,20 +1544,22 @@ mod tests {
         let legacy = home.path().join(".generalist_history");
         fs::write(&legacy, "old input history\n").unwrap();
 
-        let directory = history_dir_for(home.path()).unwrap();
-        assert_eq!(directory, home.path().join(".generalist/history"));
-        assert!(directory.is_dir());
+        let store = HistoryStore::open(home.path().to_path_buf(), WorkspaceScope::Global).unwrap();
         assert_eq!(fs::read_to_string(&legacy).unwrap(), "old input history\n");
 
-        let autosave = directory.join("autosave.json");
-        write_atomically(&autosave, br#"{"version":1}"#).unwrap();
-        write_atomically(&autosave, br#"{"version":2}"#).unwrap();
-        assert_eq!(fs::read_to_string(autosave).unwrap(), r#"{"version":2}"#);
+        let mut state = SavedState::new(WorkspaceScope::Global, "openai".into(), "model-v1".into());
+        store.save(&state, AUTOSAVE_NAME).unwrap();
+        state.model = "model-v2".into();
+        let autosave = store.save(&state, AUTOSAVE_NAME).unwrap();
+        assert!(autosave.starts_with(store.directory()));
+        assert_eq!(store.load(AUTOSAVE_NAME).unwrap().model, "model-v2");
     }
 
     #[test]
     fn persistence_rejects_an_invalid_tool_protocol_boundary() {
-        let mut state = SavedState::new("openai".into(), "model".into());
+        let home = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(home.path().to_path_buf(), WorkspaceScope::Global).unwrap();
+        let mut state = SavedState::new(WorkspaceScope::Global, "openai".into(), "model".into());
         state
             .conversation_history
             .push(Message::assistant(vec![ContentBlock::ToolUse {
@@ -1541,7 +1568,7 @@ mod tests {
                 id: "dangling".into(),
             }]));
 
-        let error = serialize_state(&state).unwrap_err().to_string();
+        let error = store.save(&state, "invalid").unwrap_err().to_string();
         assert!(error.contains("unpaired tool use/result"));
     }
 
@@ -1635,12 +1662,25 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_no_model_facing_memory_tool() {
-        let registry = build_registry(&MemoryPermissionHandler::new()).unwrap();
-        assert!(!registry
-            .tool_names()
-            .iter()
-            .any(|name| name.contains("memory")));
+    fn registry_has_permissioned_archive_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let history =
+            HistoryStore::open(home.path().to_path_buf(), WorkspaceScope::Global).unwrap();
+        let memory = EpisodicMemory::open_scoped(
+            home.path().join("episodes.sqlite3"),
+            WorkspaceScope::Global,
+        )
+        .unwrap();
+        let registry =
+            build_registry(&MemoryPermissionHandler::new(), &history, Some(&memory)).unwrap();
+        for expected in [
+            "search_memories",
+            "read_memory",
+            "search_conversations",
+            "read_conversation",
+        ] {
+            assert!(registry.tool_names().iter().any(|name| name == expected));
+        }
         assert!(!include_str!("../SYSTEM_PROMPT.md").contains("enhanced_memory"));
     }
 }

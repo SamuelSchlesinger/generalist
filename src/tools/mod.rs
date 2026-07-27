@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod bash;
 pub mod calculator;
 pub mod firecrawl_crawl;
@@ -15,6 +16,9 @@ pub mod weather;
 pub mod wikipedia;
 pub mod z3_solver;
 
+pub use archive::{
+    ReadConversationTool, ReadMemoryTool, SearchConversationsTool, SearchMemoriesTool,
+};
 pub use bash::BashTool;
 pub use calculator::CalculatorTool;
 pub use firecrawl_crawl::FirecrawlCrawlTool;

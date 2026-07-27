@@ -142,7 +142,8 @@ reactor.
 
 ### R11 — Durable, inspectable storage
 
-The initial backend is local and project-scoped. It provides schema migrations,
+The initial backend is local and project-scoped by default, with a separately
+selected global namespace rather than implicit fallback. It provides schema migrations,
 transactions, crash recovery, restrictive Unix permissions, a dedicated owner,
 and reconstructable indexes. Lexical retrieval must work without a remote
 embedding service. Audit records identify who or what proposed, checked,
@@ -202,7 +203,8 @@ The initial system will not:
 - use provider reasoning as evidence;
 - treat recurrence or embedding similarity as independent corroboration;
 - auto-execute learned procedures;
-- share memory globally across unrelated projects or users;
+- automatically share or inject memory across unrelated projects or users
+  (explicit permissioned cross-scope reads are a separate operation);
 - promise erasure from infrastructure outside the documented storage boundary;
 - make remote embeddings a dependency;
 - use memory to relax tool permissions or current user intent; or
