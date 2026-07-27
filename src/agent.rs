@@ -159,6 +159,11 @@ pub struct Agent {
     last_context_tokens: Option<u64>,
     /// Changes only when existing message indices are invalidated.
     history_revision: u64,
+    /// Memoized `estimate_tokens(&history)`: valid while the history has the
+    /// same revision and length (appends and index-preserving mutations both
+    /// miss and recompute). Avoids re-serializing the whole conversation on
+    /// every loop iteration and TUI frame.
+    estimated_tokens_cache: std::cell::Cell<(u64, usize, u64)>,
 }
 
 impl Agent {
@@ -182,14 +187,24 @@ impl Agent {
             compaction_keep_recent_tokens: 20_000,
             last_context_tokens: None,
             history_revision: 0,
+            estimated_tokens_cache: std::cell::Cell::new((u64::MAX, 0, 0)),
         }
     }
 
     /// Rough context estimate: provider-measured when available, chars/4
     /// over the serialized history otherwise.
     pub fn context_tokens(&self) -> u64 {
-        self.last_context_tokens
-            .unwrap_or_else(|| estimate_tokens(&self.history))
+        if let Some(measured) = self.last_context_tokens {
+            return measured;
+        }
+        let key = (self.history_revision, self.history.len());
+        let cached = self.estimated_tokens_cache.get();
+        if (cached.0, cached.1) == key {
+            return cached.2;
+        }
+        let estimate = estimate_tokens(&self.history);
+        self.estimated_tokens_cache.set((key.0, key.1, estimate));
+        estimate
     }
 
     /// Whether the built-in code-mode runner owns the model-facing tool
@@ -1692,6 +1707,63 @@ print("script continued")
             .unwrap();
         assert_eq!(outcome, TurnOutcome::Completed);
         assert!(retried);
+    }
+
+    /// Empirical check for the estimate cache: repeated context_tokens()
+    /// calls on an unchanging history must be far cheaper than one fresh
+    /// estimate per call. Run with `cargo test -- --nocapture estimate_cache`.
+
+    #[test]
+    fn estimate_cache_is_fast_on_repeated_calls() {
+        let mut agent = agent_with(Script::new(vec![]));
+        for i in 0..100 {
+            agent.history.push(Message::user_text(format!(
+                "user message {i} with a fair amount of text to serialize {}",
+                "x".repeat(400)
+            )));
+            agent
+                .history
+                .push(Message::assistant(vec![ContentBlock::Text {
+                    text: format!("assistant reply {i} {}", "y".repeat(400)),
+                }]));
+        }
+        let calls = 2_000;
+        let start = std::time::Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..calls {
+            acc += agent.context_tokens();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "BENCH context_tokens: {calls} calls in {:?} ({:.1} ns/call), acc={acc}",
+            elapsed,
+            elapsed.as_nanos() as f64 / calls as f64
+        );
+        assert!(
+            elapsed.as_millis() < 100,
+            "cache ineffective: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn estimated_context_cache_tracks_appends() {
+        let mut agent = agent_with(Script::new(vec![]));
+        // No provider measurement yet: falls back to the estimate.
+        let empty = agent.context_tokens();
+        assert_eq!(empty, estimate_tokens(&agent.history));
+        // Cached: same value without a provider measurement.
+        assert_eq!(agent.context_tokens(), empty);
+
+        // An append invalidates the cache (length changed, same revision).
+        agent.begin_turn("hello world, this is a longer message");
+        let after = agent.context_tokens();
+        assert_eq!(after, estimate_tokens(&agent.history));
+        assert!(after > empty);
+
+        // A provider measurement always wins over the estimate.
+        agent.last_context_tokens = Some(123);
+        assert_eq!(agent.context_tokens(), 123);
     }
 
     #[test]
