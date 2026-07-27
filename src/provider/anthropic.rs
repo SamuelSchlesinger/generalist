@@ -259,6 +259,7 @@ impl StreamState {
                 return Err(Error::Api {
                     status: 0,
                     message: message.to_string(),
+                    retry_after: None,
                 });
             }
             // ping / content_block_stop / message_stop carry no state we need.
@@ -321,6 +322,11 @@ impl Provider for AnthropicProvider {
             .await?;
 
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::error::Error::parse_retry_after);
         let text = response.text().await?;
         if !status.is_success() {
             let message = serde_json::from_str::<Value>(&text)
@@ -335,6 +341,7 @@ impl Provider for AnthropicProvider {
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
+                retry_after,
             });
         }
 
@@ -361,6 +368,11 @@ impl Provider for AnthropicProvider {
             .await?;
 
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::error::Error::parse_retry_after);
         if !status.is_success() {
             let text = response.text().await?;
             let message = serde_json::from_str::<Value>(&text)
@@ -374,6 +386,7 @@ impl Provider for AnthropicProvider {
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
+                retry_after,
             });
         }
 
@@ -410,6 +423,7 @@ impl Provider for AnthropicProvider {
             return Err(Error::Api {
                 status: 0,
                 message: "stream ended before message_stop".to_string(),
+                retry_after: None,
             });
         }
         Ok(state.into_response())

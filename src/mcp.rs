@@ -249,6 +249,7 @@ impl McpServer {
                     return Err(Error::Api {
                         status: status.as_u16(),
                         message: body,
+                        retry_after: None,
                     });
                 }
                 let Some(id) = id else { return Ok(None) }; // notification

@@ -842,7 +842,7 @@ impl Agent {
                         format!("stream failed before it was committed: {e}"),
                     );
                     on_event(AgentEvent::ApiCallFinished { usage: None });
-                    let delay_secs = 1u64 << attempt; // 1, 2, 4 ...
+                    let delay_secs = retry_delay_secs(attempt, e.retry_after());
                     on_event(AgentEvent::Retrying {
                         attempt: attempt + 1,
                         max_retries: self.max_retries,
@@ -867,6 +867,19 @@ impl Agent {
             }
         }
     }
+}
+
+/// Delay before the next retry: exponential backoff (1, 2, 4, ...) with the
+/// server's `Retry-After` as a lower bound.
+///
+/// The header is a floor, not an override: rate limits often clear sooner
+/// than its worst-case value, so we never wait *less* than it asks, but also
+/// never longer than our own schedule would. The 60s cap keeps a turn
+/// interruptible and stops a hostile or buggy header from parking the loop.
+fn retry_delay_secs(attempt: u32, retry_after: Option<u64>) -> u64 {
+    (1u64 << attempt.min(20))
+        .max(retry_after.unwrap_or(0))
+        .min(60)
 }
 
 /// Whether every assistant tool use has exactly one result in the immediately
@@ -1643,6 +1656,7 @@ print("script continued")
             Err(Error::Api {
                 status: 400,
                 message: "boom".into(),
+                retry_after: None,
             }),
         ]));
         let result = agent.run_turn("go", &mut |_| {}).await;
@@ -1662,6 +1676,7 @@ print("script continued")
             Err(Error::Api {
                 status: 529,
                 message: "overloaded".into(),
+                retry_after: None,
             }),
             Ok(text_response("recovered")),
         ]);
@@ -1677,6 +1692,20 @@ print("script continued")
             .unwrap();
         assert_eq!(outcome, TurnOutcome::Completed);
         assert!(retried);
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_as_floor_with_cap() {
+        // Pure backoff: 1, 2, 4, 8.
+        assert_eq!(retry_delay_secs(0, None), 1);
+        assert_eq!(retry_delay_secs(1, None), 2);
+        assert_eq!(retry_delay_secs(3, None), 8);
+        // Retry-After raises the floor when it exceeds the backoff.
+        assert_eq!(retry_delay_secs(0, Some(30)), 30);
+        assert_eq!(retry_delay_secs(0, Some(1)), 1);
+        // ... but never past the 60s cap, however large the header.
+        assert_eq!(retry_delay_secs(0, Some(3600)), 60);
+        assert_eq!(retry_delay_secs(2, Some(0)), 4);
     }
 
     /// End-to-end code mode: the model "writes" one script that calls a tool
@@ -1770,6 +1799,49 @@ except Exception as e:
         // ...and the bridged echo result appears nowhere else in history
         // (it reached the model only because the script chose to print it).
         assert_eq!(agent.history.len(), 4);
+    }
+
+    /// A script that succeeds but prints nothing must not return an empty
+    /// tool result: the model would otherwise get no signal that its bridged
+    /// tool calls ran. Requires python3 on PATH.
+    #[tokio::test]
+    async fn silent_script_reports_bridged_call_count() {
+        let code = r#"
+import tools
+tools.mirror(marker="silent")
+# no print: side effect only
+"#;
+        let script_call = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                name: "python".into(),
+                input: json!({"code": code}),
+                id: "t1".into(),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Mirror)).unwrap();
+        let mut agent = Agent::new(
+            Box::new(Script::new(vec![
+                Ok(script_call),
+                Ok(text_response("done")),
+            ])),
+            registry,
+            "test",
+        );
+        let outcome = agent.run_turn("go", &mut |_| {}).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+
+        let result_text = match &agent.history[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            other => panic!("expected tool result, got {:?}", other),
+        };
+        assert!(
+            result_text.contains("1 tool call") && result_text.contains("no output"),
+            "silent script should report its bridged calls, got: {:?}",
+            result_text
+        );
     }
 
     #[tokio::test]
@@ -1972,6 +2044,7 @@ except Exception as e:
         let mut agent = agent_with(Script::new(vec![Err(Error::Api {
             status: 401,
             message: "bad key".into(),
+            retry_after: None,
         })]));
         let result = agent.run_turn("hi", &mut |_| {}).await;
         assert!(result.is_err());

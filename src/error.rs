@@ -7,7 +7,12 @@ pub enum Error {
     /// Transport-level failure (connection, timeout, TLS, ...).
     Network(reqwest::Error),
     /// The provider API returned a non-success status.
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+        /// Server-supplied `Retry-After` hint, in seconds, when present.
+        retry_after: Option<u64>,
+    },
     /// A response could not be parsed.
     Parse(serde_json::Error),
     /// A tool failed to execute.
@@ -30,13 +35,31 @@ impl Error {
             _ => false,
         }
     }
+
+    /// Server-suggested wait before retrying, if the response carried one.
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            Error::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Parse a `Retry-After` header value (delay-seconds form only).
+    ///
+    /// The HTTP-date form is deliberately ignored: the seconds form is what
+    /// every major provider actually sends.
+    pub(crate) fn parse_retry_after(value: &str) -> Option<u64> {
+        value.trim().parse::<u64>().ok()
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Network(e) => write!(f, "Network error: {}", e),
-            Error::Api { status, message } => {
+            Error::Api {
+                status, message, ..
+            } => {
                 write!(f, "API error (status {}): {}", status, message)
             }
             Error::Parse(e) => write!(f, "Parse error: {}", e),
@@ -80,7 +103,8 @@ mod tests {
             assert!(
                 Error::Api {
                     status,
-                    message: String::new()
+                    message: String::new(),
+                    retry_after: None
                 }
                 .is_retryable(),
                 "{} should be retryable",
@@ -91,7 +115,8 @@ mod tests {
             assert!(
                 !Error::Api {
                     status,
-                    message: String::new()
+                    message: String::new(),
+                    retry_after: None
                 }
                 .is_retryable(),
                 "{} should not be retryable",
@@ -99,5 +124,18 @@ mod tests {
             );
         }
         assert!(!Error::Other("nope".into()).is_retryable());
+    }
+
+    #[test]
+    fn retry_after_is_carried_and_parsed() {
+        let err = Error::Api {
+            status: 429,
+            message: "rate limited".into(),
+            retry_after: Error::parse_retry_after(" 17 "),
+        };
+        assert_eq!(err.retry_after(), Some(17));
+        assert_eq!(Error::parse_retry_after("soon"), None);
+        assert_eq!(Error::parse_retry_after(""), None);
+        assert_eq!(Error::Other("x".into()).retry_after(), None);
     }
 }
