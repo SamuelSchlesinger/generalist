@@ -52,7 +52,7 @@ async fn main() -> generalist::Result<()> {
         .run_turn("Use the calculator to compute 111 * 111.", &mut on_event)
         .await?;
     assert_eq!(outcome, TurnOutcome::Completed);
-    let answer = agent.history.last().unwrap().text();
+    let answer = agent.history().last().unwrap().text();
     assert!(answer.contains("12321"), "expected 12321 in: {}", answer);
 
     // Turn 2: replays turn-1 history (including any thinking blocks) on the
@@ -64,18 +64,18 @@ async fn main() -> generalist::Result<()> {
         )
         .await?;
     assert_eq!(outcome, TurnOutcome::Completed);
-    let answer = agent.history.last().unwrap().text();
+    let answer = agent.history().last().unwrap().text();
     assert!(answer.contains("12379"), "expected 12379 in: {}", answer);
 
     let thinking_blocks = agent
-        .history
+        .history()
         .iter()
         .flat_map(|m| &m.content)
         .filter(|b| matches!(b, generalist::ContentBlock::Thinking { .. }))
         .count();
     println!(
         "\nSMOKE OK — {} messages in history, {} thinking blocks replayed",
-        agent.history.len(),
+        agent.history().len(),
         thinking_blocks
     );
     Ok(())

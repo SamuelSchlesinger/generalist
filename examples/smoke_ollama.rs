@@ -85,7 +85,7 @@ async fn main() -> generalist::Result<()> {
     println!(
         "\nSMOKE OK (ollama/{}) — {} messages in history",
         model,
-        agent.history.len()
+        agent.history().len()
     );
     Ok(())
 }

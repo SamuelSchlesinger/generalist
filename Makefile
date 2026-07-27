@@ -12,16 +12,12 @@ test:
 fmt:
 	cargo fmt --all -- --check
 
-# Auto-format the staged Rust files and re-stage them, so a commit always
-# carries rustfmt-clean content and the working tree never diverges from it.
-# `make fmt` still checks the whole tree, so anything outside the staged set
-# is reported rather than silently rewritten.
+# Auto-format fully staged Rust files and re-stage them. Partially staged files
+# are rejected so the hook never broadens a commit with unstaged work.
+# `make fmt` still checks the whole tree, so out-of-scope files are reported
+# rather than silently rewritten.
 format-staged:
-	@staged=$$(git diff --cached --name-only --diff-filter=ACM -- '*.rs'); \
-	if [ -n "$$staged" ]; then \
-		echo "$$staged" | xargs rustfmt --edition 2021; \
-		echo "$$staged" | xargs git add; \
-	fi
+	@python3 scripts/format_staged_rust.py
 
 clippy:
 	cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -40,6 +36,7 @@ memory-research:
 hooks-check:
 	test -x .githooks/pre-commit
 	test -x .githooks/pre-push
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_format_staged_rust.py
 
 tla:
 	./scripts/check-tla.sh

@@ -40,8 +40,9 @@ let outcome = agent
 # }
 ```
 
-The full conversation lives in `agent.history` and survives errors, so a
-failed request never loses the record of tool calls that already ran.
+The full conversation is available through `agent.history()` and survives
+errors, so a failed request never loses the record of tool calls that already
+ran.
 */
 
 #[cfg(not(unix))]

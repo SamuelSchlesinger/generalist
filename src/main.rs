@@ -290,7 +290,7 @@ fn make_saved_state(
         provider: agent.provider().id().to_string(),
         model: agent.provider().model().to_string(),
         goal: agent.goal().map(str::to_string),
-        conversation_history: agent.history.clone(),
+        conversation_history: agent.history().to_vec(),
         always_allow_tools: handler.always_allow().lock().unwrap().clone(),
         always_deny_tools: handler.always_deny().lock().unwrap().clone(),
         queued_prompts: queue.snapshot(),
@@ -310,7 +310,7 @@ impl DurableBoundary {
             provider: agent.provider().id().to_string(),
             model: agent.provider().model().to_string(),
             goal: agent.goal().map(str::to_string),
-            history: agent.history.clone(),
+            history: agent.history().to_vec(),
         }
     }
 
@@ -643,10 +643,10 @@ async fn drive_started_turn(
         Err(_) => EpisodeOutcome::Error,
     };
     if let Some(memory) = memory {
-        if history_tool_protocol_is_valid(&agent.history) {
+        if history_tool_protocol_is_valid(agent.history()) {
             let episode_history = if agent.history_revision() == episode_history_revision {
                 agent
-                    .history
+                    .history()
                     .get(episode_history_start..)
                     .unwrap_or_default()
             } else {
@@ -1139,7 +1139,7 @@ async fn execute_command(
                         agent.set_goal(goal);
                         agent.replace_history(conversation_history);
                         queue.replace(queued_prompts);
-                        ui.load_history(&agent.history);
+                        ui.load_history(agent.history());
                         ui.set_goal(agent.goal());
                         ui.sync_queue(queue);
                         ui.set_session(
@@ -1148,7 +1148,7 @@ async fn execute_command(
                             agent.registry.tool_names().len(),
                         );
                         ui.set_context_tokens(agent.context_tokens());
-                        ui.info(&format!("Loaded {} messages", agent.history.len()));
+                        ui.info(&format!("Loaded {} messages", agent.history().len()));
                     }
                     Err(error) => ui.error(&format!("Failed to load: {error}")),
                 }
@@ -1317,7 +1317,7 @@ async fn main() -> Result<()> {
                 permission_handler.set_always_allow(always_allow_tools);
                 permission_handler.set_always_deny(always_deny_tools);
                 agent.replace_history(conversation_history);
-                ui.load_history(&agent.history);
+                ui.load_history(agent.history());
                 ui.info(&format!(
                     "Recovered {count} queued message(s) with their conversation context."
                 ));
@@ -1371,7 +1371,7 @@ async fn main() -> Result<()> {
                 );
             } else {
                 let started_at = chrono::Utc::now();
-                let episode_history_start = agent.history.len();
+                let episode_history_start = agent.history().len();
                 let episode_history_revision = agent.history_revision();
                 agent.begin_turn(&prompt.text);
                 claim.commit();

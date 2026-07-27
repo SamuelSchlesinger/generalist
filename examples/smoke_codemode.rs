@@ -80,7 +80,7 @@ async fn main() -> generalist::Result<()> {
         bridged_calc_calls >= 1,
         "script never called the calculator through the bridge"
     );
-    let answer = agent.history.last().unwrap().text();
+    let answer = agent.history().last().unwrap().text();
     assert!(
         answer.replace([',', ' '], "").contains("4374"),
         "expected 4374 in: {}",

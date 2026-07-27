@@ -135,7 +135,9 @@ pub struct Agent {
     pub system_prompt: String,
     /// Durable user-authored objective appended to the base instructions.
     goal: Option<String>,
-    pub history: Vec<Message>,
+    /// Conversation history. Exposed read-only through [`Agent::history`] so
+    /// token-accounting caches cannot be bypassed by in-place mutations.
+    history: Vec<Message>,
     /// Cap on request → tool → request rounds within a single turn.
     pub max_iterations: usize,
     /// `max_tokens` per completion.
@@ -160,10 +162,9 @@ pub struct Agent {
     /// Changes only when existing message indices are invalidated.
     history_revision: u64,
     /// Memoized `estimate_tokens(&history)`: valid while the history has the
-    /// same revision and length (appends and index-preserving mutations both
-    /// miss and recompute). Avoids re-serializing the whole conversation on
-    /// every loop iteration and TUI frame.
-    estimated_tokens_cache: std::cell::Cell<(u64, usize, u64)>,
+    /// same revision and length. Appends change the length; the one internal
+    /// index-preserving mutation explicitly clears this cache.
+    estimated_tokens_cache: std::cell::Cell<Option<(u64, usize, u64)>>,
 }
 
 impl Agent {
@@ -187,7 +188,7 @@ impl Agent {
             compaction_keep_recent_tokens: 20_000,
             last_context_tokens: None,
             history_revision: 0,
-            estimated_tokens_cache: std::cell::Cell::new((u64::MAX, 0, 0)),
+            estimated_tokens_cache: std::cell::Cell::new(None),
         }
     }
 
@@ -198,13 +199,19 @@ impl Agent {
             return measured;
         }
         let key = (self.history_revision, self.history.len());
-        let cached = self.estimated_tokens_cache.get();
-        if (cached.0, cached.1) == key {
-            return cached.2;
+        if let Some((revision, len, estimate)) = self.estimated_tokens_cache.get() {
+            if (revision, len) == key {
+                return estimate;
+            }
         }
         let estimate = estimate_tokens(&self.history);
-        self.estimated_tokens_cache.set((key.0, key.1, estimate));
+        self.estimated_tokens_cache
+            .set(Some((key.0, key.1, estimate)));
         estimate
+    }
+
+    fn invalidate_estimated_tokens_cache(&self) {
+        self.estimated_tokens_cache.set(None);
     }
 
     /// Whether the built-in code-mode runner owns the model-facing tool
@@ -237,6 +244,11 @@ impl Agent {
 
     pub fn set_provider(&mut self, provider: Box<dyn Provider>) {
         self.provider = provider;
+    }
+
+    /// The complete conversation history.
+    pub fn history(&self) -> &[Message] {
+        &self.history
     }
 
     /// The active session objective, if one has been set with the host UI.
@@ -279,6 +291,7 @@ impl Agent {
         self.history = history;
         self.last_context_tokens = None;
         self.history_revision = self.history_revision.wrapping_add(1);
+        self.invalidate_estimated_tokens_cache();
     }
 
     /// Clear conversation history and its cached context measurement.
@@ -286,6 +299,7 @@ impl Agent {
         self.history.clear();
         self.last_context_tokens = None;
         self.history_revision = self.history_revision.wrapping_add(1);
+        self.invalidate_estimated_tokens_cache();
     }
 
     /// Revision for consumers that retain an index into conversation history.
@@ -628,6 +642,7 @@ impl Agent {
         } else {
             self.history.push(Message::user(text_blocks));
         }
+        self.invalidate_estimated_tokens_cache();
         let prompts = claim.commit();
         on_event(AgentEvent::SteeringCommitted { prompts });
         self.emit_checkpoint(on_event);
@@ -759,6 +774,7 @@ impl Agent {
         );
         self.history_revision = self.history_revision.wrapping_add(1);
         self.last_context_tokens = None;
+        self.invalidate_estimated_tokens_cache();
         on_event(AgentEvent::Notice(format!(
             "Compacted {} messages into a summary (context ~{}k tokens).",
             replaced,
@@ -1764,6 +1780,22 @@ print("script continued")
         // A provider measurement always wins over the estimate.
         agent.last_context_tokens = Some(123);
         assert_eq!(agent.context_tokens(), 123);
+    }
+
+    #[test]
+    fn estimated_context_cache_tracks_in_place_steering() {
+        let mut agent = agent_with(Script::new(vec![]));
+        agent.begin_turn("initial");
+        let before = agent.context_tokens();
+
+        let queue = PromptQueue::default();
+        queue.enqueue("x".repeat(400), DeliveryMode::Steer);
+        let (_cancel, control) = TurnControl::for_turn(queue);
+        assert!(agent.commit_steering(&control, &mut |_| {}));
+
+        let after = agent.context_tokens();
+        assert_eq!(after, estimate_tokens(agent.history()));
+        assert!(after > before);
     }
 
     #[test]
