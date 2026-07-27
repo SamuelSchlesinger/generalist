@@ -262,13 +262,21 @@ async fn run_script_inner(
     });
 
     let mut denied = false;
+    let mut bridged_calls: u64 = 0;
     let serve_and_wait = async {
         loop {
             tokio::select! {
                 status = child.wait() => break status,
                 accepted = listener.accept() => {
                     if let Ok((stream, _)) = accepted {
-                        serve_connection(stream, registry, on_event, &mut denied).await;
+                        serve_connection(
+                            stream,
+                            registry,
+                            on_event,
+                            &mut denied,
+                            &mut bridged_calls,
+                        )
+                        .await;
                     }
                 }
             }
@@ -308,8 +316,16 @@ async fn run_script_inner(
         )
     };
 
+    let mut content = crate::tools::bash::tail_truncate_with_spill(&content);
+    if !failed && bridged_calls > 0 && content.trim().is_empty() {
+        content = format!(
+            "Script completed successfully with no output.              {bridged_calls} tool call{} executed through the bridge; their              results stayed inside the script. Print any values the next step              needs.",
+            if bridged_calls == 1 { "" } else { "s" }
+        );
+    }
+
     Ok(ScriptResult {
-        content: crate::tools::bash::tail_truncate_with_spill(&content),
+        content,
         failed,
         denied,
     })
@@ -321,11 +337,12 @@ async fn serve_connection(
     registry: &mut ToolRegistry,
     on_event: &mut dyn FnMut(AgentEvent),
     denied: &mut bool,
+    bridged_calls: &mut u64,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let response = handle_request(&line, registry, on_event, denied).await;
+        let response = handle_request(&line, registry, on_event, denied, bridged_calls).await;
         let mut payload = serde_json::to_string(&response).unwrap_or_else(|_| {
             "{\"is_error\": true, \"content\": \"serialization failed\"}".to_string()
         });
@@ -341,7 +358,9 @@ async fn handle_request(
     registry: &mut ToolRegistry,
     on_event: &mut dyn FnMut(AgentEvent),
     denied: &mut bool,
+    bridged_calls: &mut u64,
 ) -> Value {
+    *bridged_calls += 1;
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => return json!({"is_error": true, "content": format!("invalid request: {}", e)}),
