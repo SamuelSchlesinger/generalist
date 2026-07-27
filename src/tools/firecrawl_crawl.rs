@@ -1,7 +1,6 @@
 use crate::{Error, Result, Tool};
 use async_trait::async_trait;
-use firecrawl::crawl::{CrawlOptions, CrawlScrapeOptions};
-use firecrawl::FirecrawlApp;
+use firecrawl::{Client, CrawlOptions, ScrapeOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -111,10 +110,10 @@ impl Tool for FirecrawlCrawlTool {
             Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string())
         })?;
 
-        let firecrawl = FirecrawlApp::new(&api_key)
+        let firecrawl = Client::new(&api_key)
             .map_err(|e| Error::Other(format!("Failed to initialize Firecrawl: {:?}", e)))?;
 
-        let mut scrape_options = CrawlScrapeOptions::default();
+        let mut scrape_options = ScrapeOptions::default();
 
         if let Some(headers) = params.headers {
             scrape_options.headers = Some(headers);
@@ -134,7 +133,7 @@ impl Tool for FirecrawlCrawlTool {
         };
 
         if let Some(max_depth) = params.max_depth {
-            crawl_options.max_depth = Some(max_depth);
+            crawl_options.max_discovery_depth = Some(max_depth);
         }
 
         if let Some(limit) = params.limit {
@@ -150,27 +149,34 @@ impl Tool for FirecrawlCrawlTool {
         }
 
         if let Some(allow_backward) = params.allow_backward_links {
-            crawl_options.allow_backward_links = Some(allow_backward);
+            // v2 renamed `allowBackwardLinks` to `crawlEntireDomain`.
+            crawl_options.crawl_entire_domain = Some(allow_backward);
         }
 
         if let Some(allow_external) = params.allow_external_links {
             crawl_options.allow_external_links = Some(allow_external);
         }
 
-        match firecrawl.crawl_url(&params.url, Some(crawl_options)).await {
+        match firecrawl.crawl(&params.url, Some(crawl_options)).await {
             Ok(crawl_result) => {
                 let pages: Vec<CrawledPage> = crawl_result
                     .data
                     .into_iter()
                     .enumerate()
                     .map(|(i, doc)| CrawledPage {
-                        url: format!("page_{}", i), // Documents don't have URLs in crawl results
-                        title: doc.metadata.title.clone(),
+                        url: doc
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.source_url.clone())
+                            .unwrap_or_else(|| format!("page_{}", i)),
+                        title: doc.metadata.as_ref().and_then(|m| m.title.clone()),
                         content: doc.markdown.clone(),
                         markdown: doc.markdown,
                         html: doc.html,
                         links: doc.links,
-                        metadata: Some(serde_json::to_value(&doc.metadata).unwrap_or(Value::Null)),
+                        metadata: doc
+                            .metadata
+                            .map(|m| serde_json::to_value(&m).unwrap_or(Value::Null)),
                     })
                     .collect();
 

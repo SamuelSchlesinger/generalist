@@ -202,7 +202,7 @@ impl ConsolePermissionPrompt {
         ];
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Allow this tool to execute?")
-            .items(&choices)
+            .items(choices)
             .default(1)
             .interact()
             .unwrap_or(3);

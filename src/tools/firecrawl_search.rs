@@ -1,7 +1,6 @@
 use crate::{Error, Result, Tool};
 use async_trait::async_trait;
-use firecrawl::search::SearchParams;
-use firecrawl::FirecrawlApp;
+use firecrawl::{Client, SearchOptions, SearchResultOrDocument};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -11,11 +10,10 @@ pub struct FirecrawlSearchTool;
 pub struct FirecrawlSearchInput {
     query: String,
     limit: Option<u32>,
-    lang: Option<String>,
-    country: Option<String>,
     location: Option<String>,
     tbs: Option<String>,
-    filter: Option<String>,
+    include_domains: Option<Vec<String>>,
+    exclude_domains: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,25 +54,23 @@ impl Tool for FirecrawlSearchTool {
                     "type": "integer",
                     "description": "Number of results to return (default: 10)"
                 },
-                "lang": {
-                    "type": "string",
-                    "description": "Language code (e.g., 'en', 'es', 'fr')"
-                },
-                "country": {
-                    "type": "string",
-                    "description": "Country code (e.g., 'us', 'uk', 'ca')"
-                },
                 "location": {
                     "type": "string",
-                    "description": "Location for local search results"
+                    "description": "Location for local search results (e.g., 'Germany', 'San Francisco, CA')"
                 },
                 "tbs": {
                     "type": "string",
                     "description": "Time-based search parameter (e.g., 'qdr:d' for past day)"
                 },
-                "filter": {
-                    "type": "string",
-                    "description": "Additional search filters"
+                "include_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only return results from these domains"
+                },
+                "exclude_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exclude results from these domains"
                 }
             },
             "required": ["query"],
@@ -90,31 +86,42 @@ impl Tool for FirecrawlSearchTool {
             Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string())
         })?;
 
-        let firecrawl = FirecrawlApp::new(&api_key)
+        let firecrawl = Client::new(&api_key)
             .map_err(|e| Error::Other(format!("Failed to initialize Firecrawl: {:?}", e)))?;
 
-        let search_params = SearchParams {
-            query: params.query.clone(),
+        let search_options = SearchOptions {
             limit: params.limit,
-            lang: params.lang.or(Some("en".to_string())),
-            country: params.country.or(Some("us".to_string())),
             location: params.location,
             tbs: params.tbs,
-            filter: params.filter,
-            origin: Some("api".to_string()),
+            include_domains: params.include_domains,
+            exclude_domains: params.exclude_domains,
             timeout: Some(60000),
-            scrape_options: None,
+            ..Default::default()
         };
 
-        match firecrawl.search_with_params(search_params).await {
+        match firecrawl.search(&params.query, Some(search_options)).await {
             Ok(search_result) => {
                 let results: Vec<SearchResult> = search_result
                     .data
+                    .web
+                    .unwrap_or_default()
                     .into_iter()
-                    .map(|doc| SearchResult {
-                        title: doc.title,
-                        url: doc.url,
-                        description: doc.description,
+                    .map(|entry| match entry {
+                        SearchResultOrDocument::WebResult(web) => SearchResult {
+                            title: web.title.unwrap_or_default(),
+                            url: web.url,
+                            description: web.description.unwrap_or_default(),
+                        },
+                        // The API returns full documents when scraping is enabled;
+                        // fall back to their metadata for the summary fields.
+                        SearchResultOrDocument::Document(doc) => {
+                            let meta = doc.metadata.unwrap_or_default();
+                            SearchResult {
+                                title: meta.title.unwrap_or_default(),
+                                url: meta.source_url.unwrap_or_default(),
+                                description: meta.description.unwrap_or_default(),
+                            }
+                        }
                     })
                     .collect();
 

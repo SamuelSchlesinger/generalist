@@ -1,7 +1,6 @@
 use crate::{Error, Result, Tool};
 use async_trait::async_trait;
-use firecrawl::scrape::{JsonOptions, ScrapeFormats, ScrapeOptions};
-use firecrawl::FirecrawlApp;
+use firecrawl::{Client, Format, JsonOptions, ScrapeOptions, ScreenshotOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -93,8 +92,8 @@ impl Tool for FirecrawlExtractTool {
                 },
                 "formats": {
                     "type": "array",
-                    "items": {"type": "string", "enum": ["markdown", "html", "rawHtml", "content", "links", "screenshot", "screenshot@fullPage"]},
-                    "description": "Formats to extract (default: ['markdown', 'content', 'links'])"
+                    "items": {"type": "string", "enum": ["markdown", "html", "rawHtml", "links", "images", "summary", "screenshot", "screenshot@fullPage"]},
+                    "description": "Formats to extract (default: ['markdown'])"
                 },
                 "only_main_content": {
                     "type": "boolean",
@@ -140,7 +139,7 @@ impl Tool for FirecrawlExtractTool {
             Error::Other("FIRECRAWL_API_KEY environment variable not set".to_string())
         })?;
 
-        let firecrawl = FirecrawlApp::new(&api_key)
+        let firecrawl = Client::new(&api_key)
             .map_err(|e| Error::Other(format!("Failed to initialize Firecrawl: {:?}", e)))?;
 
         let mut scrape_options = ScrapeOptions::default();
@@ -149,12 +148,21 @@ impl Tool for FirecrawlExtractTool {
             let mut scrape_formats = Vec::new();
             for format in formats {
                 match format.as_str() {
-                    "markdown" => scrape_formats.push(ScrapeFormats::Markdown),
-                    "html" => scrape_formats.push(ScrapeFormats::HTML),
-                    "rawHtml" => scrape_formats.push(ScrapeFormats::RawHTML),
-                    "links" => scrape_formats.push(ScrapeFormats::Links),
-                    "screenshot" => scrape_formats.push(ScrapeFormats::Screenshot),
-                    "screenshot@fullPage" => scrape_formats.push(ScrapeFormats::ScreenshotFullPage),
+                    "markdown" => scrape_formats.push(Format::Markdown),
+                    "html" => scrape_formats.push(Format::Html),
+                    "rawHtml" => scrape_formats.push(Format::RawHtml),
+                    "links" => scrape_formats.push(Format::Links),
+                    "images" => scrape_formats.push(Format::Images),
+                    "summary" => scrape_formats.push(Format::Summary),
+                    "screenshot" => scrape_formats.push(Format::Screenshot),
+                    // v2 folded the full-page variant into screenshot options.
+                    "screenshot@fullPage" => {
+                        scrape_formats.push(Format::Screenshot);
+                        scrape_options.screenshot_options = Some(ScreenshotOptions {
+                            full_page: Some(true),
+                            ..Default::default()
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -191,8 +199,8 @@ impl Tool for FirecrawlExtractTool {
         if let Some(schema) = params.extract_schema {
             // Add Json format to enable LLM extraction
             let mut formats = scrape_options.formats.unwrap_or_default();
-            if !formats.iter().any(|f| matches!(f, ScrapeFormats::Json)) {
-                formats.push(ScrapeFormats::Json);
+            if !formats.iter().any(|f| matches!(f, Format::Json)) {
+                formats.push(Format::Json);
             }
             scrape_options.formats = Some(formats);
 
@@ -201,18 +209,13 @@ impl Tool for FirecrawlExtractTool {
                 schema: Some(schema),
                 system_prompt: None,
                 prompt: None,
-                agent: None,
             };
             scrape_options.json_options = Some(json_options);
         }
 
-        match firecrawl
-            .scrape_url(&params.url, Some(scrape_options))
-            .await
-        {
+        match firecrawl.scrape(&params.url, Some(scrape_options)).await {
             Ok(scrape_result) => {
-                let meta = &scrape_result.metadata;
-                let metadata = Some(PageMetadata {
+                let metadata = scrape_result.metadata.as_ref().map(|meta| PageMetadata {
                     title: meta.title.clone(),
                     description: meta.description.clone(),
                     language: meta.language.clone(),
@@ -224,18 +227,16 @@ impl Tool for FirecrawlExtractTool {
                     og_data: None,
                 });
 
-                let images = None;
-
                 let response = FirecrawlExtractResponse {
                     success: true,
                     url: params.url,
-                    title: scrape_result.metadata.title.clone(),
+                    title: metadata.as_ref().and_then(|m| m.title.clone()),
                     content: scrape_result.markdown.clone(),
                     markdown: scrape_result.markdown,
                     html: scrape_result.html,
-                    extracted_data: scrape_result.extract,
+                    extracted_data: scrape_result.json,
                     links: scrape_result.links,
-                    images,
+                    images: scrape_result.images,
                     metadata,
                     error: None,
                 };

@@ -12,25 +12,25 @@ keywords = ["agent", "llm", "ai", "chatbot", "tools"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "query"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-dialoguer = "0.11"
-colored = "2.2"
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+dialoguer = "0.12"
+colored = "3.1"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = "0.3"
-unicode-width = "0.1"
+unicode-width = "0.2"
 dotenv = "0.15.0"
-exmex = "0.20"
+exmex = "0.21"
 urlencoding = "2.1"
-uuid = { version = "1.17.0", features = ["v4", "v5"] }
-tempfile = "3.8"
-firecrawl = "1.2.0"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+uuid = { version = "1.24.0", features = ["v4", "v5"] }
+tempfile = "3.27"
+firecrawl = "2.12.1"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [[bin]]
 name = "generalist"

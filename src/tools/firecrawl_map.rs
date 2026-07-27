@@ -1,7 +1,6 @@
 use crate::{Error, Result, Tool};
 use async_trait::async_trait;
-use firecrawl::map::MapOptions;
-use firecrawl::FirecrawlApp;
+use firecrawl::{Client, MapOptions, SitemapMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -75,7 +74,7 @@ impl Tool for FirecrawlMapTool {
             Error::Tool("FIRECRAWL_API_KEY environment variable not set".to_string())
         })?;
 
-        let firecrawl = FirecrawlApp::new(&api_key)
+        let firecrawl = Client::new(&api_key)
             .map_err(|e| Error::Tool(format!("Failed to initialize Firecrawl: {:?}", e)))?;
 
         let mut map_options = MapOptions {
@@ -87,13 +86,17 @@ impl Tool for FirecrawlMapTool {
             map_options.search = Some(search);
         }
         if let Some(ignore_sitemap) = params.ignore_sitemap {
-            map_options.ignore_sitemap = Some(ignore_sitemap);
+            map_options.sitemap = Some(if ignore_sitemap {
+                SitemapMode::Skip
+            } else {
+                SitemapMode::Include
+            });
         }
         if let Some(include_subdomains) = params.include_subdomains {
             map_options.include_subdomains = Some(include_subdomains);
         }
 
-        let response = match firecrawl.map_url(&params.url, Some(map_options)).await {
+        let response = match firecrawl.map_urls(&params.url, Some(map_options)).await {
             Ok(links) => FirecrawlMapResponse {
                 success: true,
                 url: params.url,
