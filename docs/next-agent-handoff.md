@@ -64,6 +64,14 @@ document.
   permissioned explicit disclosure. `ArchiveScopeRuntime.tla` separately
   models project/global selection, same-scope writes, and filtered archive
   reads. Neither permits automatic retrieval.
+- Cross-scope history and memory APIs require an exact-input `DisclosureGrant`
+  that only `ToolRegistry` can mint after the permission policy allows the
+  matching tool call. Direct archive-tool execution is rejected.
+- `make conformance` generates payload-free traces through the real queue,
+  agent, registry, history, and memory implementations. TLC must consume each
+  observed sequence through the original model actions and reject three
+  deliberate ordering/lifecycle/scope mutations. This is sampled safety
+  conformance, not exhaustive Rust refinement.
 
 `/memory forget` deletes from the live SQLite store with `secure_delete=ON`,
 then attempts a truncating WAL checkpoint and reports if truncation remains
@@ -120,6 +128,7 @@ Run:
 
 ```sh
 make memory-research
+make conformance
 make check
 git diff --check
 ```
@@ -128,6 +137,7 @@ The established `AsyncRuntime.tla` baseline is 470,086 generated states,
 117,750 distinct states, and depth 27. The current-handle `MemoryRuntime.tla`
 configuration generates 7,627 states (1,690 distinct, depth 16), and
 `ArchiveScopeRuntime.tla` generates 163,652 states (20,341 distinct, depth 11).
-The current locked Rust suite passes 144 library tests, 6 binary tests, all
-example targets, and 2 documentation tests. All three models and the
-model-to-Rust trace must be repeated after any relevant change.
+The exact Rust test count can change with dependency and target updates; rely on
+the current `make check` output rather than this handoff. All three base models,
+the three observed implementation traces, and the three deliberately invalid
+traces must be repeated after any relevant change.

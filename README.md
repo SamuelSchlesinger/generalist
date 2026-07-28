@@ -123,6 +123,11 @@ Keyboard and mouse controls:
 The exact async semantics, TLA+ models, and maintained model-to-Rust review are
 documented in [the architecture note](docs/async-tui.md) and
 [runtime traceability matrix](docs/runtime-traceability.md).
+`make conformance` additionally runs deterministic paths through the real Rust
+queue, agent, permission, history, and memory code, then asks TLC to consume
+those exact abstract action sequences through the original model operators. It
+also verifies that three deliberately invalid traces are rejected. This is a
+sampled executable refinement check, not a proof over every Rust execution.
 
 ## Memory architecture status
 
@@ -154,8 +159,10 @@ Generalist now has a deliberately small host-owned episodic prototype:
   `current`, `global`, `other_projects`, or `all` scope. Results omit provider
   reasoning and tool payloads and are labeled as untrusted historical context.
   Reads repeat the search filter and exact returned scope label; long
-  transcripts use bounded pages with `next_offset`. No episode or conversation
-  is automatically retrieved or injected.
+  transcripts use bounded pages with `next_offset`. After permission, the
+  registry mints an exact-input disclosure grant that the cross-scope storage
+  API must recheck; direct archive-tool execution without that grant is
+  rejected. No episode or conversation is automatically retrieved or injected.
 
 `/memory forget` removes the current-scope row from the live SQLite store and
 attempts a truncating WAL checkpoint, reporting separately if truncation
@@ -201,6 +208,9 @@ Caveats:
 - The same rule applies to archive tools: always-allowing
   `search_conversations` or `search_memories` covers future inputs including
   broader scope selectors. Use allow-once when that breadth is not intended.
+  Each allowed invocation still receives a new capability bound to that exact
+  tool name, complete input, and scope; allow-always does not grant a reusable
+  unscoped storage handle.
 - The prompts are not a sandbox. An agent that can write and run code can circumvent
   in-process fences; use a container or dedicated user for real isolation.
 - Fetched web content is untrusted input; the approval step exists mainly to catch

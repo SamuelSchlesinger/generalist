@@ -9,7 +9,11 @@
 
 pub use crate::scope::discover_project_root;
 use crate::scope::{ScopeFilter, WorkspaceScope};
-use crate::{ContentBlock, Error, Message, MessageOrigin, Result, TurnOutcome};
+use crate::tool::{DisclosureCapability, DisclosureGrant};
+use crate::{
+    ArchiveModelAction, ContentBlock, Error, MemoryModelAction, Message, MessageOrigin, ModelTrace,
+    Result, TurnOutcome,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -184,6 +188,7 @@ pub struct EpisodicMemory {
     project_root: String,
     database_path: PathBuf,
     session_id: String,
+    model_trace: Option<ModelTrace>,
 }
 
 impl EpisodicMemory {
@@ -213,18 +218,42 @@ impl EpisodicMemory {
         scope: WorkspaceScope,
         events: Option<mpsc::UnboundedSender<MemoryEvent>>,
     ) -> Result<Self> {
+        Self::open_scoped_inner(database_path, scope, events, None)
+    }
+
+    #[doc(hidden)]
+    pub fn open_scoped_with_model_trace(
+        database_path: PathBuf,
+        scope: WorkspaceScope,
+        model_trace: ModelTrace,
+    ) -> Result<Self> {
+        Self::open_scoped_inner(database_path, scope, None, Some(model_trace))
+    }
+
+    fn open_scoped_inner(
+        database_path: PathBuf,
+        scope: WorkspaceScope,
+        events: Option<mpsc::UnboundedSender<MemoryEvent>>,
+        model_trace: Option<ModelTrace>,
+    ) -> Result<Self> {
         let project_key = scope.memory_key();
         let project_display = scope.display_name();
         let worker_path = database_path.clone();
         let worker_display = project_display.clone();
+        let worker_trace = model_trace.clone();
         let (request_tx, request_rx) = std_mpsc::channel();
         let (init_tx, init_rx) = std_mpsc::sync_channel(1);
 
         thread::Builder::new()
             .name("generalist-memory".to_string())
             .spawn(move || {
-                let initialized =
-                    MemoryWorker::open(&worker_path, project_key, worker_display, events);
+                let initialized = MemoryWorker::open(
+                    &worker_path,
+                    project_key,
+                    worker_display,
+                    events,
+                    worker_trace,
+                );
                 match initialized {
                     Ok(mut worker) => {
                         let database_path = worker.database_path.clone();
@@ -242,13 +271,18 @@ impl EpisodicMemory {
             .recv()
             .map_err(|_| Error::Other("Memory worker stopped during startup".to_string()))??;
 
-        Ok(Self {
+        let memory = Self {
             sender: request_tx,
             scope,
             project_root: project_display,
             database_path,
             session_id: Uuid::new_v4().to_string(),
-        })
+            model_trace,
+        };
+        if let Some(trace) = &memory.model_trace {
+            trace.record_scope_selection(&memory.scope);
+        }
+        Ok(memory)
     }
 
     pub fn database_path(&self) -> &Path {
@@ -257,6 +291,10 @@ impl EpisodicMemory {
 
     pub fn scope(&self) -> &WorkspaceScope {
         &self.scope
+    }
+
+    pub(crate) fn model_trace(&self) -> Option<&ModelTrace> {
+        self.model_trace.as_ref()
     }
 
     pub async fn status(&self) -> Result<MemoryStatus> {
@@ -325,6 +363,7 @@ impl EpisodicMemory {
             model,
             started_at,
         );
+        self.trace_settled_episode(&episode);
         self.send(Request::Record {
             episode,
             reply: None,
@@ -352,6 +391,7 @@ impl EpisodicMemory {
             model,
             started_at,
         );
+        self.trace_settled_episode(&episode);
         let (reply, response) = oneshot::channel();
         self.send(Request::Record {
             episode,
@@ -361,12 +401,28 @@ impl EpisodicMemory {
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<EpisodeSummary>> {
-        self.search_scoped(query, ScopeFilter::Current).await
+        self.search_scoped_inner(query, ScopeFilter::Current).await
     }
 
     /// Search an explicitly selected scope set. This is intended for the
     /// permission-gated model tool; local slash commands use [`Self::search`].
     pub async fn search_scoped(
+        &self,
+        query: &str,
+        filter: ScopeFilter,
+        grant: &DisclosureGrant,
+    ) -> Result<Vec<EpisodeSummary>> {
+        grant.ensure_search(DisclosureCapability::SearchMemories, query, filter)?;
+        let matches = self.search_scoped_inner(query, filter).await?;
+        if let Some(trace) = &self.model_trace {
+            trace.record_memory(MemoryModelAction::ApproveSearch {
+                episode_ids: matches.iter().map(|episode| episode.id.clone()).collect(),
+            });
+        }
+        Ok(matches)
+    }
+
+    async fn search_scoped_inner(
         &self,
         query: &str,
         filter: ScopeFilter,
@@ -381,10 +437,33 @@ impl EpisodicMemory {
     }
 
     pub async fn show(&self, id_prefix: &str) -> Result<Option<Episode>> {
-        self.show_scoped(id_prefix, ScopeFilter::Current).await
+        self.show_scoped_inner(id_prefix, ScopeFilter::Current)
+            .await
     }
 
     pub async fn show_scoped(
+        &self,
+        id_prefix: &str,
+        filter: ScopeFilter,
+        expected_scope: &str,
+        grant: &DisclosureGrant,
+    ) -> Result<Option<Episode>> {
+        grant.ensure_read(
+            DisclosureCapability::ReadMemory,
+            id_prefix,
+            filter,
+            expected_scope,
+        )?;
+        let episode = self.show_scoped_inner(id_prefix, filter).await?;
+        if let Some(trace) = &self.model_trace {
+            trace.record_memory(MemoryModelAction::ApproveSearch {
+                episode_ids: episode.iter().map(|episode| episode.id.clone()).collect(),
+            });
+        }
+        Ok(episode)
+    }
+
+    async fn show_scoped_inner(
         &self,
         id_prefix: &str,
         filter: ScopeFilter,
@@ -424,6 +503,15 @@ impl EpisodicMemory {
         self.sender
             .send(request)
             .map_err(|_| Error::Other("Memory worker is unavailable".to_string()))
+    }
+
+    fn trace_settled_episode(&self, episode: &Episode) {
+        if let Some(trace) = &self.model_trace {
+            trace.record_memory(MemoryModelAction::StartTurn {
+                episode_id: episode.id.clone(),
+            });
+            trace.record_memory(MemoryModelAction::SettleTurn);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -467,6 +555,7 @@ struct MemoryWorker {
     sqlite_version: String,
     events: Option<mpsc::UnboundedSender<MemoryEvent>>,
     background_failures: Vec<String>,
+    model_trace: Option<ModelTrace>,
 }
 
 impl MemoryWorker {
@@ -475,6 +564,7 @@ impl MemoryWorker {
         project_key: Vec<u8>,
         project_root: String,
         events: Option<mpsc::UnboundedSender<MemoryEvent>>,
+        model_trace: Option<ModelTrace>,
     ) -> Result<Self> {
         let parent = database_path.parent().ok_or_else(|| {
             Error::Other(format!(
@@ -620,6 +710,7 @@ impl MemoryWorker {
             sqlite_version,
             events,
             background_failures: Vec::new(),
+            model_trace,
         })
     }
 
@@ -633,7 +724,26 @@ impl MemoryWorker {
                     let _ = reply.send(self.set_capture_enabled(enabled));
                 }
                 Request::Record { episode, reply } => {
+                    let episode_id = episode.id.clone();
                     let result = self.record(episode);
+                    if let Some(trace) = &self.model_trace {
+                        match &result {
+                            Ok(Some(_)) => {
+                                trace.record_memory(MemoryModelAction::RecordEpisode {
+                                    episode_id: episode_id.clone(),
+                                });
+                                trace.record_archive(ArchiveModelAction::CaptureMemory {
+                                    memory_id: episode_id,
+                                });
+                            }
+                            Ok(None) => {
+                                trace.record_memory(MemoryModelAction::SkipEpisode { episode_id });
+                            }
+                            Err(_) => {
+                                trace.record_memory(MemoryModelAction::FailEpisode { episode_id });
+                            }
+                        }
+                    }
                     match reply {
                         Some(reply) => {
                             let _ = reply.send(result);
@@ -667,7 +777,13 @@ impl MemoryWorker {
                     let _ = reply.send(self.export());
                 }
                 Request::Forget { id_prefix, reply } => {
-                    let _ = reply.send(self.forget(&id_prefix));
+                    let result = self.forget(&id_prefix).map(|(result, deleted_id)| {
+                        if let (Some(trace), Some(episode_id)) = (&self.model_trace, deleted_id) {
+                            trace.record_memory(MemoryModelAction::ForgetEpisode { episode_id });
+                        }
+                        result
+                    });
+                    let _ = reply.send(result);
                 }
                 Request::Flush(reply) => {
                     let failures = std::mem::take(&mut self.background_failures);
@@ -716,12 +832,22 @@ impl MemoryWorker {
     }
 
     fn set_capture_enabled(&self, enabled: bool) -> Result<()> {
+        let was_enabled = self.capture_enabled()?;
         self.connection
             .execute(
                 "UPDATE memory_settings SET capture_enabled = ?2 WHERE project_key = ?1",
                 params![&self.project_key, i64::from(enabled)],
             )
             .map_err(sqlite_error("update capture setting"))?;
+        if was_enabled != enabled {
+            if let Some(trace) = &self.model_trace {
+                trace.record_memory(if enabled {
+                    MemoryModelAction::ResumeCapture
+                } else {
+                    MemoryModelAction::PauseCapture
+                });
+            }
+        }
         Ok(())
     }
 
@@ -863,9 +989,9 @@ impl MemoryWorker {
             .collect()
     }
 
-    fn forget(&self, id_prefix: &str) -> Result<ForgetResult> {
+    fn forget(&self, id_prefix: &str) -> Result<(ForgetResult, Option<String>)> {
         let Some(id) = self.resolve_id(id_prefix, ScopeFilter::Current)? else {
-            return Ok(ForgetResult::NotFound);
+            return Ok((ForgetResult::NotFound, None));
         };
         let deleted = self
             .connection
@@ -875,9 +1001,9 @@ impl MemoryWorker {
             )
             .map_err(sqlite_error("delete episode"))?;
         if deleted != 1 {
-            return Ok(ForgetResult::NotFound);
+            return Ok((ForgetResult::NotFound, None));
         }
-        match self
+        let result = match self
             .connection
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                 Ok((
@@ -886,15 +1012,16 @@ impl MemoryWorker {
                     row.get::<_, i64>(2)?,
                 ))
             }) {
-            Ok((0, _, _)) => Ok(ForgetResult::Deleted),
+            Ok((0, _, _)) => ForgetResult::Deleted,
             Ok((busy, log_frames, checkpointed_frames)) => {
-                Ok(ForgetResult::DeletedCheckpointPending(format!(
+                ForgetResult::DeletedCheckpointPending(format!(
                     "checkpoint busy={busy}, log_frames={log_frames}, \
                      checkpointed_frames={checkpointed_frames}"
-                )))
+                ))
             }
-            Err(error) => Ok(ForgetResult::DeletedCheckpointPending(error.to_string())),
-        }
+            Err(error) => ForgetResult::DeletedCheckpointPending(error.to_string()),
+        };
+        Ok((result, Some(id)))
     }
 
     fn resolve_id(&self, id_prefix: &str, filter: ScopeFilter) -> Result<Option<String>> {
@@ -1440,42 +1567,42 @@ mod tests {
             .unwrap();
 
         let current = project
-            .search_scoped("shared needle", ScopeFilter::Current)
+            .search_scoped_inner("shared needle", ScopeFilter::Current)
             .await
             .unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].id, project_id);
         let global_matches = project
-            .search_scoped("shared needle", ScopeFilter::Global)
+            .search_scoped_inner("shared needle", ScopeFilter::Global)
             .await
             .unwrap();
         assert_eq!(global_matches.len(), 1);
         assert_eq!(global_matches[0].id, global_id);
         assert_eq!(global_matches[0].project_root, "global");
         let all = project
-            .search_scoped("shared needle", ScopeFilter::All)
+            .search_scoped_inner("shared needle", ScopeFilter::All)
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
         let global_current = global
-            .search_scoped("shared needle", ScopeFilter::Current)
+            .search_scoped_inner("shared needle", ScopeFilter::Current)
             .await
             .unwrap();
         assert_eq!(global_current.len(), 1);
         assert_eq!(global_current[0].id, global_id);
         let global_other = global
-            .search_scoped("shared needle", ScopeFilter::OtherProjects)
+            .search_scoped_inner("shared needle", ScopeFilter::OtherProjects)
             .await
             .unwrap();
         assert_eq!(global_other.len(), 1);
         assert_eq!(global_other[0].id, project_id);
         assert!(project
-            .show_scoped(&global_id, ScopeFilter::Current)
+            .show_scoped_inner(&global_id, ScopeFilter::Current)
             .await
             .unwrap()
             .is_none());
         assert!(project
-            .show_scoped(&global_id, ScopeFilter::Global)
+            .show_scoped_inner(&global_id, ScopeFilter::Global)
             .await
             .unwrap()
             .is_some());

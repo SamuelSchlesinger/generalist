@@ -5,6 +5,7 @@
 //! `RefCell` give us an authoritative prompt queue without a terminal or
 //! agent mutex.
 
+use crate::{AsyncModelAction, ModelTrace};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -59,6 +60,7 @@ pub struct QueuedPrompt {
 struct QueueState {
     next_id: PromptId,
     items: Vec<QueuedPrompt>,
+    model_trace: Option<ModelTrace>,
 }
 
 /// Cloneable handle to the single authoritative prompt queue.
@@ -91,8 +93,28 @@ impl PromptQueue {
             .unwrap_or(0)
             .saturating_add(1);
         Self {
-            inner: Rc::new(RefCell::new(QueueState { next_id, items })),
+            inner: Rc::new(RefCell::new(QueueState {
+                next_id,
+                items,
+                model_trace: None,
+            })),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_model_trace(model_trace: ModelTrace) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(QueueState {
+                next_id: 0,
+                items: Vec::new(),
+                model_trace: Some(model_trace),
+            })),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn set_model_trace(&self, model_trace: ModelTrace) {
+        self.inner.borrow_mut().model_trace = Some(model_trace);
     }
 
     pub fn enqueue(&self, text: impl Into<String>, delivery: DeliveryMode) -> PromptId {
@@ -114,6 +136,14 @@ impl PromptQueue {
             delivery,
             source,
         });
+        let model_trace = state.model_trace.clone();
+        drop(state);
+        if let Some(trace) = model_trace {
+            trace.record_async(AsyncModelAction::Enqueue {
+                prompt_id: id,
+                delivery,
+            });
+        }
         id
     }
 
@@ -246,7 +276,17 @@ impl PromptQueue {
             return None;
         }
         let item = state.items.remove(0);
-        Some(PromptClaim::new(self.clone(), vec![item]))
+        let model_trace = state.model_trace.clone();
+        drop(state);
+        if let Some(trace) = &model_trace {
+            trace.record_async(AsyncModelAction::DispatchFollowUp);
+        }
+        Some(PromptClaim::new(
+            self.clone(),
+            vec![item],
+            ClaimKind::Start,
+            model_trace,
+        ))
     }
 
     /// Atomically claim every steer currently waiting, preserving relative
@@ -263,7 +303,20 @@ impl PromptQueue {
             }
         }
         state.items = retained;
-        (!claimed.is_empty()).then(|| PromptClaim::new(self.clone(), claimed))
+        if claimed.is_empty() {
+            return None;
+        }
+        let model_trace = state.model_trace.clone();
+        drop(state);
+        if let Some(trace) = &model_trace {
+            trace.record_async(AsyncModelAction::ClaimSteering);
+        }
+        Some(PromptClaim::new(
+            self.clone(),
+            claimed,
+            ClaimKind::Steering,
+            model_trace,
+        ))
     }
 
     /// A steer whose target turn has ended becomes an ordinary follow-up.
@@ -293,13 +346,28 @@ impl PromptQueue {
 pub struct PromptClaim {
     queue: PromptQueue,
     items: Option<Vec<QueuedPrompt>>,
+    kind: ClaimKind,
+    model_trace: Option<ModelTrace>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClaimKind {
+    Start,
+    Steering,
 }
 
 impl PromptClaim {
-    fn new(queue: PromptQueue, items: Vec<QueuedPrompt>) -> Self {
+    fn new(
+        queue: PromptQueue,
+        items: Vec<QueuedPrompt>,
+        kind: ClaimKind,
+        model_trace: Option<ModelTrace>,
+    ) -> Self {
         Self {
             queue,
             items: Some(items),
+            kind,
+            model_trace,
         }
     }
 
@@ -308,7 +376,14 @@ impl PromptClaim {
     }
 
     pub fn commit(mut self) -> Vec<QueuedPrompt> {
-        self.items.take().unwrap_or_default()
+        let items = self.items.take().unwrap_or_default();
+        if let Some(trace) = &self.model_trace {
+            trace.record_async(match self.kind {
+                ClaimKind::Start => AsyncModelAction::CommitStart,
+                ClaimKind::Steering => AsyncModelAction::CommitSteering,
+            });
+        }
+        items
     }
 }
 
@@ -316,6 +391,12 @@ impl Drop for PromptClaim {
     fn drop(&mut self) {
         if let Some(items) = self.items.take() {
             self.queue.requeue_front(items);
+            if let Some(trace) = &self.model_trace {
+                trace.record_async(match self.kind {
+                    ClaimKind::Start => AsyncModelAction::RequeueStart,
+                    ClaimKind::Steering => AsyncModelAction::RequeueSteering,
+                });
+            }
         }
     }
 }

@@ -57,6 +57,7 @@ pub mod goal;
 pub mod history;
 pub mod mcp;
 pub mod memory;
+pub mod model_trace;
 pub mod permissions;
 pub mod provider;
 pub mod runtime;
@@ -83,6 +84,10 @@ pub use memory::{
     default_memory_path, Episode, EpisodeEvent, EpisodeOutcome, EpisodeSummary, EpisodicMemory,
     ForgetResult, MemoryEvent, MemoryStatus,
 };
+pub use model_trace::{
+    ArchiveModelAction, AsyncModelAction, MemoryModelAction, ModelKind, ModelTrace,
+    ModelTraceSnapshot,
+};
 pub use permissions::{
     AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler, PermissionBrokerPrompt,
     PermissionChoice, PermissionDecision, PermissionPrompt, PermissionRequest, PermissionUiEvent,
@@ -95,7 +100,10 @@ pub use runtime::{
 };
 pub use scope::{discover_project_root, ScopeFilter, WorkspaceScope};
 pub use state::SavedState;
-pub use tool::{Tool, ToolCallOutcome, ToolCallResult, ToolRegistry};
+pub use tool::{
+    DisclosureCapability, DisclosureGrant, Tool, ToolAuthorization, ToolCallOutcome,
+    ToolCallResult, ToolRegistry,
+};
 pub use types::{
     estimate_tokens, truncate_middle, CompletionDelta, CompletionRequest, CompletionResponse,
     ContentBlock, Message, MessageOrigin, StopReason, ToolDef, ToolUse, Usage,

@@ -1,8 +1,10 @@
 //! Project-scoped durable conversation storage and explicit archive access.
 
 use crate::scope::{ScopeFilter, WorkspaceScope};
+use crate::tool::{DisclosureCapability, DisclosureGrant};
 use crate::{
-    history_tool_protocol_is_valid, ContentBlock, Error, MessageOrigin, Result, SavedState,
+    history_tool_protocol_is_valid, ArchiveModelAction, ContentBlock, Error, MessageOrigin,
+    ModelTrace, Result, SavedState,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,10 +33,28 @@ pub struct HistoryStore {
     home: PathBuf,
     scope: WorkspaceScope,
     scope_directory: PathBuf,
+    model_trace: Option<ModelTrace>,
 }
 
 impl HistoryStore {
     pub fn open(home: PathBuf, scope: WorkspaceScope) -> Result<Self> {
+        Self::open_inner(home, scope, None)
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_model_trace(
+        home: PathBuf,
+        scope: WorkspaceScope,
+        model_trace: ModelTrace,
+    ) -> Result<Self> {
+        Self::open_inner(home, scope, Some(model_trace))
+    }
+
+    fn open_inner(
+        home: PathBuf,
+        scope: WorkspaceScope,
+        model_trace: Option<ModelTrace>,
+    ) -> Result<Self> {
         let history_root = home.join(".generalist").join("history");
         let scopes_root = history_root.join(SCOPES_DIRECTORY);
         ensure_private_directory(&history_root)?;
@@ -49,11 +69,16 @@ impl HistoryStore {
             .map_err(|error| Error::Other(format!("Failed to serialize scope: {error}")))?;
         write_atomically(&scope_directory.join(SCOPE_MANIFEST), &manifest_bytes)?;
 
-        Ok(Self {
+        let store = Self {
             home,
             scope,
             scope_directory,
-        })
+            model_trace,
+        };
+        if let Some(trace) = &store.model_trace {
+            trace.record_scope_selection(&store.scope);
+        }
+        Ok(store)
     }
 
     pub fn scope(&self) -> &WorkspaceScope {
@@ -62,6 +87,10 @@ impl HistoryStore {
 
     pub fn directory(&self) -> &Path {
         &self.scope_directory
+    }
+
+    pub(crate) fn model_trace(&self) -> Option<&ModelTrace> {
+        self.model_trace.as_ref()
     }
 
     /// Save only into the active scope. State claiming another scope is
@@ -78,6 +107,11 @@ impl HistoryStore {
         let path = self.scope_directory.join(format!("{filename}.json"));
         let bytes = serialize_state(state)?;
         write_atomically(&path, &bytes)?;
+        if let Some(trace) = &self.model_trace {
+            trace.record_archive(ArchiveModelAction::SaveHistory {
+                history_id: filename.to_string(),
+            });
+        }
         Ok(path)
     }
 
@@ -122,6 +156,16 @@ impl HistoryStore {
         &self,
         query: &str,
         filter: ScopeFilter,
+        grant: &DisclosureGrant,
+    ) -> Result<Vec<ConversationSummary>> {
+        grant.ensure_search(DisclosureCapability::SearchConversations, query, filter)?;
+        self.search_archives_impl(query, filter)
+    }
+
+    fn search_archives_impl(
+        &self,
+        query: &str,
+        filter: ScopeFilter,
     ) -> Result<Vec<ConversationSummary>> {
         let query = query.trim();
         if query.is_empty() {
@@ -155,6 +199,22 @@ impl HistoryStore {
     /// [`Self::search_archives`]. `expected_scope` makes the permission prompt
     /// show which namespace the model intends to read and prevents substitution.
     pub fn read_archive(
+        &self,
+        id: &str,
+        filter: ScopeFilter,
+        expected_scope: &str,
+        grant: &DisclosureGrant,
+    ) -> Result<Option<ArchivedConversation>> {
+        grant.ensure_read(
+            DisclosureCapability::ReadConversation,
+            id,
+            filter,
+            expected_scope,
+        )?;
+        self.read_archive_impl(id, filter, expected_scope)
+    }
+
+    fn read_archive_impl(
         &self,
         id: &str,
         filter: ScopeFilter,
@@ -644,28 +704,28 @@ mod tests {
             .unwrap();
 
         let current = first
-            .search_archives("needle", ScopeFilter::Current)
+            .search_archives_impl("needle", ScopeFilter::Current)
             .unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].scope, first_scope.display_name());
         let other = first
-            .search_archives("needle", ScopeFilter::OtherProjects)
+            .search_archives_impl("needle", ScopeFilter::OtherProjects)
             .unwrap();
         assert_eq!(other.len(), 1);
         assert_eq!(other[0].scope, second_scope.display_name());
         let global_current = global
-            .search_archives("needle", ScopeFilter::Current)
+            .search_archives_impl("needle", ScopeFilter::Current)
             .unwrap();
         assert_eq!(global_current.len(), 1);
         assert_eq!(global_current[0].scope, "global");
         let global_other = global
-            .search_archives("needle", ScopeFilter::OtherProjects)
+            .search_archives_impl("needle", ScopeFilter::OtherProjects)
             .unwrap();
         assert_eq!(global_other.len(), 2);
         assert!(global_other.iter().all(|entry| entry.scope != "global"));
 
         let archive = first
-            .read_archive(&other[0].id, ScopeFilter::OtherProjects, &other[0].scope)
+            .read_archive_impl(&other[0].id, ScopeFilter::OtherProjects, &other[0].scope)
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -673,14 +733,14 @@ mod tests {
             Some(ArchivedConversationEvent::UserText { text }) if text == "foreign needle"
         ));
         assert!(first
-            .read_archive(
+            .read_archive_impl(
                 &other[0].id,
                 ScopeFilter::OtherProjects,
                 &first_scope.display_name(),
             )
             .is_err());
         assert!(first
-            .read_archive(&other[0].id, ScopeFilter::Current, &other[0].scope)
+            .read_archive_impl(&other[0].id, ScopeFilter::Current, &other[0].scope)
             .unwrap()
             .is_none());
     }
@@ -711,10 +771,10 @@ mod tests {
             }]));
         store.save(&saved, "safe").unwrap();
         let result = store
-            .search_archives("safe text", ScopeFilter::Current)
+            .search_archives_impl("safe text", ScopeFilter::Current)
             .unwrap();
         let archive = store
-            .read_archive(&result[0].id, ScopeFilter::Current, &result[0].scope)
+            .read_archive_impl(&result[0].id, ScopeFilter::Current, &result[0].scope)
             .unwrap()
             .unwrap();
         let json = serde_json::to_string(&archive).unwrap();

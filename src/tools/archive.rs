@@ -1,8 +1,9 @@
 //! Permission-gated model tools for explicit cross-scope archive access.
 
 use crate::{
-    truncate_middle, ArchivedConversationEvent, EpisodeEvent, EpisodicMemory, Error, HistoryStore,
-    Result, ScopeFilter, Tool,
+    truncate_middle, ArchiveModelAction, ArchivedConversationEvent, DisclosureCapability,
+    EpisodeEvent, EpisodicMemory, Error, HistoryStore, Result, ScopeFilter, Tool,
+    ToolAuthorization,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -185,9 +186,31 @@ impl Tool for SearchMemoriesTool {
     }
 
     async fn execute(&self, input: Value) -> Result<String> {
+        let _ = input;
+        Err(Error::Other(
+            "Archive tools must execute through the permission-gated ToolRegistry".to_string(),
+        ))
+    }
+
+    async fn execute_authorized(
+        &self,
+        input: Value,
+        authorization: &ToolAuthorization,
+    ) -> Result<String> {
         let query = required_string(&input, "query")?;
         let filter = scope_filter(&input)?;
-        let matches = self.memory.search_scoped(query, filter).await?;
+        let grant = authorization.disclosure_grant(DisclosureCapability::SearchMemories, &input)?;
+        let matches = self.memory.search_scoped(query, filter, &grant).await?;
+        if let Some(trace) = self.memory.model_trace() {
+            if let Some(result) = matches.first() {
+                trace.record_archive(ArchiveModelAction::ApproveMemorySearch {
+                    scope: trace.scope_id(&result.project_root),
+                    memory_id: result.id.clone(),
+                });
+            } else {
+                trace.record_archive(ArchiveModelAction::ApproveEmptySearch);
+            }
+        }
         serde_json::to_string_pretty(&json!({
             "query": query,
             "scope": filter.as_str(),
@@ -249,6 +272,17 @@ impl Tool for ReadMemoryTool {
     }
 
     async fn execute(&self, input: Value) -> Result<String> {
+        let _ = input;
+        Err(Error::Other(
+            "Archive tools must execute through the permission-gated ToolRegistry".to_string(),
+        ))
+    }
+
+    async fn execute_authorized(
+        &self,
+        input: Value,
+        authorization: &ToolAuthorization,
+    ) -> Result<String> {
         let id = required_string(&input, "id")?;
         Uuid::parse_str(id).map_err(|_| {
             Error::Other("Memory ID must be a full UUID from search results".into())
@@ -256,7 +290,15 @@ impl Tool for ReadMemoryTool {
         let filter = scope_filter(&input)?;
         let expected_scope = required_string(&input, "expected_scope")?;
         let offset = offset(&input)?;
-        let Some(episode) = self.memory.show_scoped(id, filter).await? else {
+        let grant = authorization.disclosure_grant(DisclosureCapability::ReadMemory, &input)?;
+        let Some(episode) = self
+            .memory
+            .show_scoped(id, filter, expected_scope, &grant)
+            .await?
+        else {
+            if let Some(trace) = self.memory.model_trace() {
+                trace.record_archive(ArchiveModelAction::ApproveEmptySearch);
+            }
             return Ok(json!({"found": false, "id": id}).to_string());
         };
         if episode.project_root != expected_scope {
@@ -264,6 +306,12 @@ impl Tool for ReadMemoryTool {
                 "Memory scope mismatch: expected '{expected_scope}', found '{}'",
                 episode.project_root
             )));
+        }
+        if let Some(trace) = self.memory.model_trace() {
+            trace.record_archive(ArchiveModelAction::ApproveMemorySearch {
+                scope: trace.scope_id(&episode.project_root),
+                memory_id: episode.id.clone(),
+            });
         }
         let page = transcript_page(&memory_transcript(&episode.events), offset)?;
         serde_json::to_string_pretty(&json!({
@@ -330,16 +378,39 @@ impl Tool for SearchConversationsTool {
     }
 
     async fn execute(&self, input: Value) -> Result<String> {
+        let _ = input;
+        Err(Error::Other(
+            "Archive tools must execute through the permission-gated ToolRegistry".to_string(),
+        ))
+    }
+
+    async fn execute_authorized(
+        &self,
+        input: Value,
+        authorization: &ToolAuthorization,
+    ) -> Result<String> {
         let query = required_string(&input, "query")?.to_string();
         let filter = scope_filter(&input)?;
+        let grant =
+            authorization.disclosure_grant(DisclosureCapability::SearchConversations, &input)?;
+        let trace = self.history.model_trace().cloned();
         let store = self.history.clone();
         let search_query = query.clone();
-        let mut matches =
-            tokio::task::spawn_blocking(move || store.search_archives(&search_query, filter))
-                .await
-                .map_err(|error| {
-                    Error::Other(format!("Conversation search worker failed: {error}"))
-                })??;
+        let mut matches = tokio::task::spawn_blocking(move || {
+            store.search_archives(&search_query, filter, &grant)
+        })
+        .await
+        .map_err(|error| Error::Other(format!("Conversation search worker failed: {error}")))??;
+        if let Some(trace) = trace {
+            if let Some(result) = matches.first() {
+                trace.record_archive(ArchiveModelAction::ApproveHistorySearch {
+                    scope: trace.scope_id(&result.scope),
+                    history_id: result.name.clone(),
+                });
+            } else {
+                trace.record_archive(ArchiveModelAction::ApproveEmptySearch);
+            }
+        }
         for result in &mut matches {
             result.name = bounded_metadata(&result.name);
             result.provider = bounded_metadata(&result.provider);
@@ -406,22 +477,44 @@ impl Tool for ReadConversationTool {
     }
 
     async fn execute(&self, input: Value) -> Result<String> {
+        let _ = input;
+        Err(Error::Other(
+            "Archive tools must execute through the permission-gated ToolRegistry".to_string(),
+        ))
+    }
+
+    async fn execute_authorized(
+        &self,
+        input: Value,
+        authorization: &ToolAuthorization,
+    ) -> Result<String> {
         let id = required_string(&input, "id")?.to_string();
         let filter = scope_filter(&input)?;
         let expected_scope = required_string(&input, "expected_scope")?.to_string();
         let offset = offset(&input)?;
+        let grant =
+            authorization.disclosure_grant(DisclosureCapability::ReadConversation, &input)?;
+        let trace = self.history.model_trace().cloned();
         let store = self.history.clone();
         let read_id = id.clone();
         let read_scope = expected_scope.clone();
-        let conversation =
-            tokio::task::spawn_blocking(move || store.read_archive(&read_id, filter, &read_scope))
-                .await
-                .map_err(|error| {
-                    Error::Other(format!("Conversation read worker failed: {error}"))
-                })??;
+        let conversation = tokio::task::spawn_blocking(move || {
+            store.read_archive(&read_id, filter, &read_scope, &grant)
+        })
+        .await
+        .map_err(|error| Error::Other(format!("Conversation read worker failed: {error}")))??;
         let Some(conversation) = conversation else {
+            if let Some(trace) = trace {
+                trace.record_archive(ArchiveModelAction::ApproveEmptySearch);
+            }
             return Ok(json!({"found": false, "id": id}).to_string());
         };
+        if let Some(trace) = trace {
+            trace.record_archive(ArchiveModelAction::ApproveHistorySearch {
+                scope: trace.scope_id(&conversation.scope),
+                history_id: conversation.name.clone(),
+            });
+        }
         let page = transcript_page(
             &conversation_transcript(conversation.goal.as_deref(), &conversation.events),
             offset,
@@ -449,12 +542,27 @@ impl Tool for ReadConversationTool {
 mod tests {
     use super::*;
     use crate::{
-        AlwaysDenyPermissions, EpisodeOutcome, Message, SavedState, ToolCallOutcome, ToolRegistry,
-        WorkspaceScope,
+        AlwaysDenyPermissions, ContentBlock, EpisodeOutcome, Message, SavedState, ToolCallOutcome,
+        ToolRegistry, WorkspaceScope,
     };
     use chrono::Utc;
     use std::fs;
     use std::sync::Arc;
+
+    async fn call(
+        registry: &mut ToolRegistry,
+        name: &str,
+        input: Value,
+    ) -> (ToolCallOutcome, String) {
+        let result = registry
+            .execute_tool(name, input, Uuid::new_v4().to_string())
+            .await;
+        let content = match result.block {
+            ContentBlock::ToolResult { content, .. } => content,
+            other => panic!("unexpected tool result block: {other:?}"),
+        };
+        (result.outcome, content)
+    }
 
     #[tokio::test]
     async fn tools_require_explicit_scope_and_return_scope_labels() {
@@ -477,26 +585,51 @@ mod tests {
             )
             .await
             .unwrap();
-        let tool = SearchMemoriesTool::new(memory);
-        assert!(tool
-            .execute(json!({"query": "remember this"}))
-            .await
-            .is_err());
-        let output = tool
-            .execute(json!({"query": "remember this", "scope": "current"}))
-            .await
+        let direct = SearchMemoriesTool::new(memory.clone());
+        assert!(
+            direct
+                .execute(json!({
+                    "query": "remember this",
+                    "scope": "current",
+                }))
+                .await
+                .is_err(),
+            "sensitive archive tools must reject calls outside ToolRegistry"
+        );
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(SearchMemoriesTool::new(memory.clone())))
             .unwrap();
+        registry
+            .register(Arc::new(ReadMemoryTool::new(memory)))
+            .unwrap();
+        let (outcome, _) = call(
+            &mut registry,
+            "search_memories",
+            json!({"query": "remember this"}),
+        )
+        .await;
+        assert_eq!(outcome, ToolCallOutcome::Failed);
+        let (outcome, output) = call(
+            &mut registry,
+            "search_memories",
+            json!({"query": "remember this", "scope": "current"}),
+        )
+        .await;
+        assert_eq!(outcome, ToolCallOutcome::Success);
         assert!(output.contains(&scope.display_name()));
         let results: Value = serde_json::from_str(&output).unwrap();
-        let read = ReadMemoryTool::new(tool.memory.clone());
-        let output = read
-            .execute(json!({
+        let (outcome, output) = call(
+            &mut registry,
+            "read_memory",
+            json!({
                 "id": results["matches"][0]["id"],
                 "scope": "current",
                 "expected_scope": results["matches"][0]["project_root"],
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
+        assert_eq!(outcome, ToolCallOutcome::Success);
         let page: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(page["transcript"], "[user]\nremember this\n\n");
     }
@@ -515,29 +648,43 @@ mod tests {
             .push(Message::user_text("find this archive"));
         history.save(&state, "saved").unwrap();
 
-        let search = SearchConversationsTool::new(history.clone());
-        let output = search
-            .execute(json!({"query": "archive", "scope": "current"}))
-            .await
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(SearchConversationsTool::new(history.clone())))
             .unwrap();
+        registry
+            .register(Arc::new(ReadConversationTool::new(history)))
+            .unwrap();
+        let (outcome, output) = call(
+            &mut registry,
+            "search_conversations",
+            json!({"query": "archive", "scope": "current"}),
+        )
+        .await;
+        assert_eq!(outcome, ToolCallOutcome::Success);
         let value: Value = serde_json::from_str(&output).unwrap();
         let result = &value["matches"][0];
-        let read = ReadConversationTool::new(history);
-        assert!(read
-            .execute(json!({
+        let (outcome, _) = call(
+            &mut registry,
+            "read_conversation",
+            json!({
                 "id": result["id"],
                 "expected_scope": result["scope"],
-            }))
-            .await
-            .is_err());
-        let output = read
-            .execute(json!({
+            }),
+        )
+        .await;
+        assert_eq!(outcome, ToolCallOutcome::Failed);
+        let (outcome, output) = call(
+            &mut registry,
+            "read_conversation",
+            json!({
                 "id": result["id"],
                 "scope": "current",
                 "expected_scope": result["scope"],
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
+        assert_eq!(outcome, ToolCallOutcome::Success);
         assert!(output.contains("find this archive"));
         assert!(output.contains("[prospective goal; not a past event]"));
         assert!(output.contains("archived objective"));
@@ -555,28 +702,39 @@ mod tests {
             .push(Message::user_text(long_text));
         history.save(&state, "saved").unwrap();
 
-        let search = SearchConversationsTool::new(history.clone());
-        let output = search
-            .execute(json!({"query": "start", "scope": "global"}))
-            .await
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(SearchConversationsTool::new(history.clone())))
             .unwrap();
+        registry
+            .register(Arc::new(ReadConversationTool::new(history)))
+            .unwrap();
+        let (outcome, output) = call(
+            &mut registry,
+            "search_conversations",
+            json!({"query": "start", "scope": "global"}),
+        )
+        .await;
+        assert_eq!(outcome, ToolCallOutcome::Success);
         let search_value: Value = serde_json::from_str(&output).unwrap();
         let id = search_value["matches"][0]["id"].clone();
         let expected_scope = search_value["matches"][0]["scope"].clone();
-        let read = ReadConversationTool::new(history);
 
         let mut offset = 0_u64;
         let mut transcript = String::new();
         loop {
-            let output = read
-                .execute(json!({
+            let (outcome, output) = call(
+                &mut registry,
+                "read_conversation",
+                json!({
                     "id": id,
                     "scope": "global",
                     "expected_scope": expected_scope,
                     "offset": offset,
-                }))
-                .await
-                .unwrap();
+                }),
+            )
+            .await;
+            assert_eq!(outcome, ToolCallOutcome::Success);
             assert!(output.chars().count() < 30_000);
             let page: Value = serde_json::from_str(&output).unwrap();
             transcript.push_str(page["transcript"].as_str().unwrap());

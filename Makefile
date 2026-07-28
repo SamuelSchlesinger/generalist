@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: check lint test fmt format-staged clippy shellcheck traceability memory-research hooks-check tla setup hooks tla-tools doctor
+.PHONY: check lint test fmt format-staged clippy shellcheck traceability memory-research hooks-check tla conformance setup hooks tla-tools doctor
 
 check: lint test
 
@@ -40,6 +40,10 @@ hooks-check:
 
 tla:
 	./scripts/check-tla.sh
+	./scripts/check-model-conformance.sh
+
+conformance:
+	./scripts/check-model-conformance.sh
 
 setup: tla-tools hooks
 

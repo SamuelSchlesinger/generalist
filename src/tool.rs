@@ -2,10 +2,13 @@
 
 use crate::error::Result;
 use crate::execution::{ExecutionState, ToolExecution};
+use crate::model_trace::{ArchiveModelAction, AsyncModelAction, MemoryModelAction, ModelTrace};
 use crate::permissions::{
     AlwaysAllowPermissions, PermissionDecision, ToolExecutionRequest, ToolPermissionHandler,
 };
+use crate::scope::ScopeFilter;
 use crate::types::{ContentBlock, ToolDef};
+use crate::Error;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -26,6 +29,20 @@ pub trait Tool: Send + Sync {
 
     /// Execute with validated-by-the-model input; return output text.
     async fn execute(&self, input: Value) -> Result<String>;
+
+    /// Execute after the registry has authorized this exact tool call.
+    ///
+    /// Ordinary tools inherit the adapter to [`Self::execute`]. Sensitive
+    /// tools can reject direct execution and override this method so their
+    /// backend receives an unforgeable authorization capability.
+    async fn execute_authorized(
+        &self,
+        input: Value,
+        authorization: &ToolAuthorization,
+    ) -> Result<String> {
+        authorization.require_exact(self.name(), &input)?;
+        self.execute(input).await
+    }
 
     /// Progressive-disclosure tools are excluded from the direct tool list
     /// but remain callable from code-mode scripts. In built-in code mode all
@@ -81,6 +98,136 @@ impl ToolCallResult {
     }
 }
 
+/// Cross-scope disclosure operation authorized by one exact tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisclosureCapability {
+    SearchMemories,
+    ReadMemory,
+    SearchConversations,
+    ReadConversation,
+}
+
+impl DisclosureCapability {
+    fn tool_name(self) -> &'static str {
+        match self {
+            Self::SearchMemories => "search_memories",
+            Self::ReadMemory => "read_memory",
+            Self::SearchConversations => "search_conversations",
+            Self::ReadConversation => "read_conversation",
+        }
+    }
+
+    fn archive_kind(self) -> &'static str {
+        match self {
+            Self::SearchMemories | Self::ReadMemory => "memory",
+            Self::SearchConversations | Self::ReadConversation => "history",
+        }
+    }
+}
+
+/// Proof that the registry's permission handler allowed one exact request.
+///
+/// Construction is private to [`ToolRegistry`]. A sensitive tool may derive a
+/// narrower [`DisclosureGrant`] only when its name and complete JSON input
+/// still match the authorized request.
+#[derive(Debug)]
+pub struct ToolAuthorization {
+    request: ToolExecutionRequest,
+}
+
+impl ToolAuthorization {
+    fn new(request: ToolExecutionRequest) -> Self {
+        Self { request }
+    }
+
+    fn require_exact(&self, tool_name: &str, input: &Value) -> Result<()> {
+        if self.request.tool_name != tool_name || self.request.input != *input {
+            return Err(Error::Other(
+                "Tool execution no longer matches the authorized request".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn disclosure_grant(
+        &self,
+        capability: DisclosureCapability,
+        input: &Value,
+    ) -> Result<DisclosureGrant> {
+        self.require_exact(capability.tool_name(), input)?;
+        let scope = input
+            .get("scope")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Other("Authorized archive request has no scope".to_string()))
+            .and_then(ScopeFilter::parse)?;
+        Ok(DisclosureGrant {
+            capability,
+            scope,
+            input: input.clone(),
+        })
+    }
+}
+
+/// Narrow capability required by cross-scope storage APIs.
+///
+/// It carries the exact authorized input as well as the parsed categorical
+/// scope, preventing a tool from substituting a different query, ID, or
+/// expected scope after permission was granted.
+#[derive(Debug)]
+pub struct DisclosureGrant {
+    capability: DisclosureCapability,
+    scope: ScopeFilter,
+    input: Value,
+}
+
+impl DisclosureGrant {
+    pub fn ensure_search(
+        &self,
+        capability: DisclosureCapability,
+        query: &str,
+        scope: ScopeFilter,
+    ) -> Result<()> {
+        self.ensure_capability(capability, scope)?;
+        if self.input.get("query").and_then(Value::as_str) != Some(query) {
+            return Err(Error::Other(
+                "Archive search query differs from the authorized request".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn ensure_read(
+        &self,
+        capability: DisclosureCapability,
+        id: &str,
+        scope: ScopeFilter,
+        expected_scope: &str,
+    ) -> Result<()> {
+        self.ensure_capability(capability, scope)?;
+        if self.input.get("id").and_then(Value::as_str) != Some(id)
+            || self.input.get("expected_scope").and_then(Value::as_str) != Some(expected_scope)
+        {
+            return Err(Error::Other(
+                "Archive read target differs from the authorized request".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_capability(
+        &self,
+        capability: DisclosureCapability,
+        scope: ScopeFilter,
+    ) -> Result<()> {
+        if self.capability != capability || self.scope != scope {
+            return Err(Error::Other(
+                "Archive disclosure capability does not match this operation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Holds the available tools, runs them behind a permission handler, and
 /// records execution history.
 pub struct ToolRegistry {
@@ -88,6 +235,7 @@ pub struct ToolRegistry {
     order: Vec<String>,
     executions: Vec<ToolExecution>,
     permission_handler: Box<dyn ToolPermissionHandler>,
+    model_trace: Option<ModelTrace>,
 }
 
 impl Default for ToolRegistry {
@@ -107,11 +255,17 @@ impl ToolRegistry {
             order: Vec::new(),
             executions: Vec::new(),
             permission_handler: handler,
+            model_trace: None,
         }
     }
 
     pub fn set_permission_handler(&mut self, handler: Box<dyn ToolPermissionHandler>) {
         self.permission_handler = handler;
+    }
+
+    #[doc(hidden)]
+    pub fn set_model_trace(&mut self, trace: ModelTrace) {
+        self.model_trace = Some(trace);
     }
 
     /// Run a request through this registry's permission handler without
@@ -214,11 +368,37 @@ impl ToolRegistry {
             input: input.clone(),
             tool_description: tool.description().to_string(),
         };
+        let archive_request = archive_request(&request);
+        let model_request_id = self.model_trace.as_ref().map(ModelTrace::next_request_id);
+        if let Some(trace) = &self.model_trace {
+            trace.record_async(AsyncModelAction::AskPermission {
+                request_id: model_request_id
+                    .clone()
+                    .expect("a model trace allocated no permission ID"),
+            });
+            if let Some((kind, filter)) = archive_request {
+                trace.record_archive(ArchiveModelAction::RequestSearch {
+                    kind: kind.to_string(),
+                    filter,
+                });
+                if kind == "memory" {
+                    trace.record_memory(MemoryModelAction::RequestSearch { filter });
+                }
+            }
+        }
 
         match self.permission_handler.check_permission(&request).await {
             PermissionDecision::Allow => {
+                if let Some(trace) = &self.model_trace {
+                    trace.record_async(AsyncModelAction::AllowPermission {
+                        request_id: model_request_id
+                            .clone()
+                            .expect("a model trace allocated no permission ID"),
+                    });
+                }
                 execution.state = ExecutionState::Executing;
-                let result = tool.execute(input).await;
+                let authorization = ToolAuthorization::new(request);
+                let result = tool.execute_authorized(input, &authorization).await;
                 let call_result = match result {
                     Ok(output) => {
                         execution.complete(Ok(output.clone()));
@@ -238,6 +418,7 @@ impl ToolRegistry {
                 call_result
             }
             PermissionDecision::Deny => {
+                self.record_denial(model_request_id.as_deref(), archive_request);
                 execution.deny("Permission denied");
                 self.executions.push(execution);
                 ToolCallResult::new(
@@ -247,6 +428,7 @@ impl ToolRegistry {
                 )
             }
             PermissionDecision::DenyWithReason(reason) => {
+                self.record_denial(model_request_id.as_deref(), archive_request);
                 execution.deny(&reason);
                 self.executions.push(execution);
                 ToolCallResult::new(
@@ -265,6 +447,43 @@ impl ToolRegistry {
     pub fn clear_history(&mut self) {
         self.executions.clear();
     }
+
+    fn record_denial(
+        &self,
+        request_id: Option<&str>,
+        archive_request: Option<(&'static str, ScopeFilter)>,
+    ) {
+        let Some(trace) = &self.model_trace else {
+            return;
+        };
+        trace.record_async(AsyncModelAction::DenyPermission {
+            request_id: request_id
+                .expect("a model trace allocated no permission ID")
+                .to_string(),
+        });
+        if let Some((kind, _)) = archive_request {
+            trace.record_archive(ArchiveModelAction::DenySearch);
+            if kind == "memory" {
+                trace.record_memory(MemoryModelAction::DenySearch);
+            }
+        }
+    }
+}
+
+fn archive_request(request: &ToolExecutionRequest) -> Option<(&'static str, ScopeFilter)> {
+    let capability = match request.tool_name.as_str() {
+        "search_memories" => DisclosureCapability::SearchMemories,
+        "read_memory" => DisclosureCapability::ReadMemory,
+        "search_conversations" => DisclosureCapability::SearchConversations,
+        "read_conversation" => DisclosureCapability::ReadConversation,
+        _ => return None,
+    };
+    let filter = request
+        .input
+        .get("scope")
+        .and_then(Value::as_str)
+        .and_then(|scope| ScopeFilter::parse(scope).ok())?;
+    Some((capability.archive_kind(), filter))
 }
 
 #[cfg(test)]
@@ -335,6 +554,129 @@ mod tests {
         denying.register(Arc::new(Echo)).unwrap();
         let denied = denying.execute_tool("echo", json!({}), "id4".into()).await;
         assert_eq!(denied.outcome, ToolCallOutcome::Denied);
+    }
+
+    #[test]
+    fn disclosure_grants_are_bound_to_the_exact_authorized_call() {
+        let input = json!({
+            "query": "needle",
+            "scope": "other_projects",
+        });
+        let authorization = ToolAuthorization::new(ToolExecutionRequest {
+            tool_use_id: "request-1".to_string(),
+            tool_name: "search_memories".to_string(),
+            input: input.clone(),
+            tool_description: "search".to_string(),
+        });
+        let grant = authorization
+            .disclosure_grant(DisclosureCapability::SearchMemories, &input)
+            .unwrap();
+
+        grant
+            .ensure_search(
+                DisclosureCapability::SearchMemories,
+                "needle",
+                ScopeFilter::OtherProjects,
+            )
+            .unwrap();
+        assert!(grant
+            .ensure_search(
+                DisclosureCapability::SearchMemories,
+                "substituted",
+                ScopeFilter::OtherProjects,
+            )
+            .is_err());
+        assert!(grant
+            .ensure_search(
+                DisclosureCapability::SearchMemories,
+                "needle",
+                ScopeFilter::All,
+            )
+            .is_err());
+        assert!(authorization
+            .disclosure_grant(
+                DisclosureCapability::SearchMemories,
+                &json!({"query": "needle", "scope": "all"}),
+            )
+            .is_err());
+
+        let read_input = json!({
+            "id": "episode-1",
+            "scope": "all",
+            "expected_scope": "/project",
+            "offset": 0,
+        });
+        let read_authorization = ToolAuthorization::new(ToolExecutionRequest {
+            tool_use_id: "request-2".to_string(),
+            tool_name: "read_memory".to_string(),
+            input: read_input.clone(),
+            tool_description: "read".to_string(),
+        });
+        let read_grant = read_authorization
+            .disclosure_grant(DisclosureCapability::ReadMemory, &read_input)
+            .unwrap();
+        read_grant
+            .ensure_read(
+                DisclosureCapability::ReadMemory,
+                "episode-1",
+                ScopeFilter::All,
+                "/project",
+            )
+            .unwrap();
+        assert!(read_grant
+            .ensure_read(
+                DisclosureCapability::ReadMemory,
+                "episode-2",
+                ScopeFilter::All,
+                "/project",
+            )
+            .is_err());
+        assert!(read_grant
+            .ensure_read(
+                DisclosureCapability::ReadMemory,
+                "episode-1",
+                ScopeFilter::All,
+                "/other-project",
+            )
+            .is_err());
+        assert!(read_authorization
+            .disclosure_grant(
+                DisclosureCapability::ReadMemory,
+                &json!({
+                    "id": "episode-1",
+                    "scope": "all",
+                    "expected_scope": "/project",
+                    "offset": 1,
+                }),
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn model_permissions_use_fresh_trace_local_request_ids() {
+        let trace = ModelTrace::for_models(&[crate::ModelKind::AsyncRuntime]);
+        let mut registry = ToolRegistry::new();
+        registry.set_model_trace(trace.clone());
+        registry.register(Arc::new(Echo)).unwrap();
+
+        for _ in 0..2 {
+            let result = registry
+                .execute_tool("echo", json!({}), "reused-provider-id".to_string())
+                .await;
+            assert_eq!(result.outcome, ToolCallOutcome::Success);
+        }
+
+        let requests = trace
+            .snapshot()
+            .async_runtime
+            .into_iter()
+            .filter_map(|action| match action {
+                AsyncModelAction::AskPermission { request_id } => Some(request_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0], requests[1]);
     }
 
     #[test]

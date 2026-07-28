@@ -4,6 +4,7 @@ set -eu
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 trace="$repo_root/docs/runtime-traceability.md"
 contributing="$repo_root/CONTRIBUTING.md"
+makefile="$repo_root/Makefile"
 
 fail=0
 
@@ -145,6 +146,25 @@ if ! grep -Fq 'spec/MemoryRuntime.tla' "$contributing"; then
 fi
 if ! grep -Fq 'spec/ArchiveScopeRuntime.tla' "$contributing"; then
     printf 'CONTRIBUTING.md must require the archive-scope traceability review.\n' >&2
+    fail=1
+fi
+for artifact in \
+    'src/model_trace.rs' \
+    'examples/model_conformance.rs' \
+    'scripts/check-model-conformance.sh' \
+    'DisclosureGrant'
+do
+    if ! grep -Fq "$artifact" "$trace" && ! grep -Fq "$artifact" "$contributing"; then
+        printf 'Live traceability guidance must name conformance artifact: %s\n' "$artifact" >&2
+        fail=1
+    fi
+done
+if ! grep -Fq './scripts/check-model-conformance.sh' "$makefile"; then
+    printf 'Makefile must run the implementation-trace conformance check.\n' >&2
+    fail=1
+fi
+if ! grep -Fq 'make conformance' "$contributing"; then
+    printf 'CONTRIBUTING.md must require sampled implementation conformance.\n' >&2
     fail=1
 fi
 

@@ -18,6 +18,7 @@
 
 use crate::error::Result;
 use crate::goal::{update_goal_tool_def, UPDATE_GOAL_TOOL_NAME};
+use crate::model_trace::{AsyncModelAction, ModelTrace};
 use crate::provider::Provider;
 use crate::runtime::{PromptSource, QueuedPrompt, TurnControl};
 use crate::tool::{ToolCallOutcome, ToolCallResult, ToolRegistry};
@@ -172,6 +173,8 @@ pub struct Agent {
     /// same revision and length. Appends change the length; the one internal
     /// index-preserving mutation explicitly clears this cache.
     estimated_tokens_cache: std::cell::Cell<Option<(u64, usize, u64)>>,
+    model_trace: Option<ModelTrace>,
+    model_cancel_recorded: std::cell::Cell<bool>,
 }
 
 impl Agent {
@@ -196,7 +199,15 @@ impl Agent {
             last_context_tokens: None,
             history_revision: 0,
             estimated_tokens_cache: std::cell::Cell::new(None),
+            model_trace: None,
+            model_cancel_recorded: std::cell::Cell::new(false),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_model_trace(&mut self, model_trace: ModelTrace) {
+        self.registry.set_model_trace(model_trace.clone());
+        self.model_trace = Some(model_trace);
     }
 
     /// Rough context estimate: provider-measured when available, chars/4
@@ -219,6 +230,28 @@ impl Agent {
 
     fn invalidate_estimated_tokens_cache(&self) {
         self.estimated_tokens_cache.set(None);
+    }
+
+    fn trace_async(&self, action: AsyncModelAction) {
+        if let Some(trace) = &self.model_trace {
+            trace.record_async(action);
+        }
+    }
+
+    fn traced_outcome(&self, outcome: TurnOutcome) -> TurnOutcome {
+        if outcome == TurnOutcome::Interrupted {
+            self.trace_cancel_request();
+            self.trace_async(AsyncModelAction::FinishCancellation);
+        } else {
+            self.trace_async(AsyncModelAction::SettleTurn);
+        }
+        outcome
+    }
+
+    fn trace_cancel_request(&self) {
+        if !self.model_cancel_recorded.replace(true) {
+            self.trace_async(AsyncModelAction::RequestCancel);
+        }
     }
 
     /// Whether the built-in code-mode runner owns the model-facing tool
@@ -370,9 +403,10 @@ impl Agent {
         on_event: &mut dyn FnMut(AgentEvent),
         control: &mut TurnControl,
     ) -> Result<TurnOutcome> {
+        self.model_cancel_recorded.set(false);
         for iteration in 0..self.max_iterations {
             if control.is_cancelled() {
-                return Ok(TurnOutcome::Interrupted);
+                return Ok(self.traced_outcome(TurnOutcome::Interrupted));
             }
 
             if self.context_tokens() > self.compaction_threshold_tokens {
@@ -389,13 +423,20 @@ impl Agent {
                     Some(Err(error)) => {
                         on_event(AgentEvent::Notice(format!("Compaction failed: {error}")));
                     }
-                    None => return Ok(TurnOutcome::Interrupted),
+                    None => return Ok(self.traced_outcome(TurnOutcome::Interrupted)),
                 }
             }
 
-            let Some((response, streamed)) = self.complete_with_retry(on_event, control).await?
-            else {
-                return Ok(TurnOutcome::Interrupted);
+            let completion = self.complete_with_retry(on_event, control).await;
+            let Some((response, streamed)) = (match completion {
+                Ok(completion) => completion,
+                Err(error) => {
+                    self.trace_async(AsyncModelAction::ProviderFailure);
+                    self.trace_async(AsyncModelAction::SettleTurn);
+                    return Err(error);
+                }
+            }) else {
+                return Ok(self.traced_outcome(TurnOutcome::Interrupted));
             };
             if let Some(usage) = &response.usage {
                 self.last_context_tokens = Some(
@@ -441,6 +482,7 @@ impl Agent {
                 .collect();
 
             if response.stop_reason == StopReason::Refusal {
+                self.trace_async(AsyncModelAction::ProviderRefusal);
                 if !tool_uses.is_empty() {
                     let results = tool_uses
                         .iter()
@@ -458,13 +500,14 @@ impl Agent {
                     "The model declined to continue with this request.".to_string(),
                 ));
                 self.emit_checkpoint(on_event);
-                return Ok(TurnOutcome::Refused);
+                return Ok(self.traced_outcome(TurnOutcome::Refused));
             }
 
             if tool_uses.is_empty() {
+                self.trace_async(AsyncModelAction::ProviderAnswer);
                 if control.is_cancelled() {
                     self.emit_checkpoint(on_event);
-                    return Ok(TurnOutcome::Interrupted);
+                    return Ok(self.traced_outcome(TurnOutcome::Interrupted));
                 }
                 if iteration + 1 < self.max_iterations && self.commit_steering(control, on_event) {
                     continue;
@@ -476,8 +519,12 @@ impl Agent {
                     ));
                 }
                 self.emit_checkpoint(on_event);
-                return Ok(TurnOutcome::Completed);
+                return Ok(self.traced_outcome(TurnOutcome::Completed));
             }
+
+            self.trace_async(AsyncModelAction::ProviderToolBatch {
+                count: tool_uses.len(),
+            });
 
             // A truncated response can contain tool calls whose JSON arguments
             // parsed but are silently incomplete. Executing them risks acting
@@ -498,11 +545,17 @@ impl Agent {
                         tool_use_id: id,
                         is_error: Some(true),
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                for _ in &results {
+                    self.trace_async(AsyncModelAction::CompleteTool);
+                }
                 self.history.push(Message::user(results));
                 let steered =
                     iteration + 1 < self.max_iterations && self.commit_steering(control, on_event);
                 if !steered {
+                    if iteration + 1 < self.max_iterations {
+                        self.trace_async(AsyncModelAction::ContinueAfterTools);
+                    }
                     self.emit_checkpoint(on_event);
                 }
                 continue;
@@ -514,8 +567,10 @@ impl Agent {
             let mut index = 0;
             while index < tool_uses.len() {
                 if control.is_cancelled() {
+                    self.trace_cancel_request();
                     for (_, _, id) in &tool_uses[index..] {
                         results.push(cancelled_tool_result(id.clone()));
+                        self.trace_async(AsyncModelAction::RepairCancelledTool);
                     }
                     cancelled = true;
                     break;
@@ -577,6 +632,7 @@ impl Agent {
                 };
 
                 let Some(mut result) = maybe_result else {
+                    self.trace_cancel_request();
                     let content =
                         "Tool execution was interrupted; its completion is unknown.".to_string();
                     on_event(AgentEvent::ToolCallFinished {
@@ -585,8 +641,10 @@ impl Agent {
                         content,
                     });
                     results.push(cancelled_tool_result(cancellation_id));
+                    self.trace_async(AsyncModelAction::RepairCancelledTool);
                     for (_, _, id) in &tool_uses[index + 1..] {
                         results.push(cancelled_tool_result(id.clone()));
+                        self.trace_async(AsyncModelAction::RepairCancelledTool);
                     }
                     cancelled = true;
                     break;
@@ -606,6 +664,8 @@ impl Agent {
 
                 if result.outcome == ToolCallOutcome::Denied {
                     denied = true;
+                } else {
+                    self.trace_async(AsyncModelAction::CompleteTool);
                 }
                 results.push(result.block);
                 index += 1;
@@ -625,7 +685,7 @@ impl Agent {
                         .to_string(),
                 ));
                 self.emit_checkpoint(on_event);
-                return Ok(TurnOutcome::Interrupted);
+                return Ok(self.traced_outcome(TurnOutcome::Interrupted));
             }
 
             if iteration + 1 < self.max_iterations && self.commit_steering(control, on_event) {
@@ -637,7 +697,10 @@ impl Agent {
                     "Tool call denied — pausing so you can redirect.".to_string(),
                 ));
                 self.emit_checkpoint(on_event);
-                return Ok(TurnOutcome::PausedOnDenial);
+                return Ok(self.traced_outcome(TurnOutcome::PausedOnDenial));
+            }
+            if iteration + 1 < self.max_iterations {
+                self.trace_async(AsyncModelAction::ContinueAfterTools);
             }
             self.emit_checkpoint(on_event);
         }
@@ -646,7 +709,7 @@ impl Agent {
             "Stopped after {} tool-execution rounds without completing.",
             self.max_iterations
         )));
-        Ok(TurnOutcome::MaxIterationsReached)
+        Ok(self.traced_outcome(TurnOutcome::MaxIterationsReached))
     }
 
     /// Commit every queued steer at a history-valid boundary. There is no

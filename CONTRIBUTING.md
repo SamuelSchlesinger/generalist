@@ -47,10 +47,18 @@ persistence in `src/state.rs`, plus every change to `src/memory.rs`,
    duplicate text, claim rollback, FIFO order, safe steering, correlated
    permissions, cancellation repair, iteration limits, and history-valid
    checkpoints as applicable.
-6. Re-run every TLC model with `make tla`. A green finite model check
-   establishes the configured model properties; it does not prove that Rust
-   refines the model.
-7. For interaction changes, build the exact source under review with
+6. If the changed transition is represented by the opt-in trace vocabulary,
+   update `src/model_trace.rs` and
+   `examples/model_conformance.rs` at the same time. Run `make conformance`;
+   `scripts/check-model-conformance.sh` must accept the real implementation
+   traces and reject all deliberate mutations. The renderer invokes the
+   original TLA+ actions, so do not replace a missing action with a look-alike
+   predicate in the wrapper.
+7. Re-run every TLC model and the implementation traces with `make tla`. A
+   green finite model check plus green sampled traces establishes neither
+   exhaustive Rust refinement nor concrete liveness. Record untraced paths in
+   `docs/runtime-traceability.md` rather than implying coverage.
+8. For interaction changes, build the exact source under review with
    `cargo build --bin generalist --locked`, then run that binary in a PTY
    against a deliberately stalled fake provider. While it is stalled, type in
    the composer, enqueue both delivery modes, edit/reorder/delete the queue,
@@ -70,7 +78,7 @@ persistence in `src/state.rs`, plus every change to `src/memory.rs`,
    provider reasoning and with no reasoning field; answer text must stay out of
    the inspector, reasoning must stay out of conversation text, and provider
    signatures/redacted payloads must never render.
-8. Run `make check`, inspect the complete diff, and repeat the trace for any
+9. Run `make check`, inspect the complete diff, and repeat the trace for any
    fix made during validation.
 
 Pay particular attention to the races that have found real defects before:
@@ -136,6 +144,10 @@ Review memory changes against these boundaries:
   scoped, sanitized, and separate from automatic prompt construction; no
   model-authored memory write or automatic retrieval may reappear without a
   new design/evaluation milestone;
+- only `ToolRegistry` may mint authorization after a policy allow, and every
+  public cross-scope storage operation must continue requiring an exact-input
+  `DisclosureGrant`; a remembered allow-always decision creates a fresh grant
+  per call rather than a scope-free storage handle;
 - same-UID file modes are not worker isolation;
 - every SQLite request remains off the current-thread reactor while its command
   driver continues polling terminal, queue, permission, and frame events;

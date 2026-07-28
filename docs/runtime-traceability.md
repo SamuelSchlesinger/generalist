@@ -31,6 +31,54 @@ Copy-mode ownership itself is modeled because it gates all concrete terminal
 actions: while `copyMode` is true, provider/tool progress remains enabled but
 queue, cancel, and permission-choice input is disabled.
 
+## Machine-checked implementation traces
+
+`src/model_trace.rs` adds an opt-in, payload-free event sink at existing Rust
+linearization points. Ordinary application construction installs no sink. The
+events carry only abstract action data: stable IDs, counts, categorical scope
+filters, and trace-local opaque scope labels. Prompt text, archive content,
+tool input, provider payloads, and project paths never enter the trace.
+
+`examples/model_conformance.rs` executes deterministic paths through the real
+`PromptQueue`, `Agent`, `ToolRegistry`, `HistoryStore`, and `EpisodicMemory`
+implementations. `scripts/render-model-traces.py` normalizes their opaque IDs
+into each checked model's finite domain and generates a temporary wrapper for
+each original TLA+ module. Every wrapper step requires both the original
+module's `Next` relation and the exact named source action with the observed
+arguments. Its `TraceCompletes` property requires TLC to consume the complete
+Rust-produced sequence; an unrelated model execution cannot satisfy the gate.
+
+`scripts/check-model-conformance.sh`, also available as `make conformance`,
+checks these three observed traces and then checks that TLC rejects three
+deliberately corrupted refinements:
+
+- async continuation moved before its tool result;
+- memory disclosure of an episode already forgotten from the live store; and
+- a project history result returned for a request mutated to global scope.
+
+This closes part of the previous manual-only refinement gap. It is sampled
+safety conformance, not an exhaustive proof that the Rust program refines TLA+
+and not a concrete liveness proof. The current deterministic traces exercise an
+allowed tool round followed by an answer, enabled memory capture, same-scope
+history and memory writes, and allowed current-scope archive searches. The
+event vocabulary also covers provider refusal/failure, steering rollback,
+permission denial, capture skip/failure, deletion, global startup, empty
+search, and cancellation repair, but those paths do not become checked merely
+because a variant exists. Queue editing, copy-mode input ownership, PTY
+behavior, persistence failures, batches beyond the representative archive
+result, providers, and external tool effects remain covered by the model
+checker, focused Rust/PTY tests, and the review tables to different degrees.
+
+The permission witness is also concrete now. `ToolRegistry` privately creates
+a `ToolAuthorization` only after the policy allows the exact tool name and full
+JSON input. An archive tool can narrow that to a `DisclosureGrant`, which binds
+the operation, scope filter, query or ID, and expected scope. Public cross-scope
+history and memory APIs require that grant and recheck it before opening the
+archive. A remembered allow-always policy still mints a new exact grant for
+each invocation; it does not create a scope-free storage handle. This is an
+in-process capability boundary, not protection from separately authorized
+same-UID Python, shell, file access, or direct filesystem access.
+
 ## State mapping
 
 | TLA+ state | Authoritative Rust representation | Review note |
@@ -128,7 +176,7 @@ alter conversation history.
 | `failedEpisodes` | A failed atomic insert plus `MemoryEvent::CaptureFailed` | No row is made live. The set is proof-history state, not a retry queue. |
 | `forgottenEpisodes` | Successful live-row deletion observed during the current model execution | This is ghost state only. The implementation explicitly makes no non-resurrection claim across prior exports, restored backups, or filesystem snapshots. |
 | `pendingSearch` | One `search_memories` or `read_memory` registry call awaiting a permission-policy decision | An interactive decision uses the correlated broker; a remembered allow/deny is automatic but still a registry policy decision. Denial returns a structured result and discloses no archive row. |
-| `authorizedByFilter`, `disclosedEpisodes` | Sanitized results returned after the registry grants the exact tool call | Results can enter code-mode computation/conversation only after an allow-once, allow-always, or remembered allow-always transition. They are never appended to the system prompt or used as instruction state automatically. |
+| `authorizedByFilter`, `disclosedEpisodes` | Sanitized results returned through a registry-minted `DisclosureGrant` for the exact tool call | The grant binds the operation, complete input, and parsed filter. Results can enter code-mode computation/conversation only after an allow-once, allow-always, or remembered allow-always transition. They are never appended to the system prompt or used as instruction state automatically. |
 
 `Agent::history_revision` is a hidden payload-boundary guard, not modeled
 memory lifecycle state. Appends preserve the recorded turn-start index;
@@ -148,9 +196,9 @@ coincidentally identical later user message.
 | `PauseCapture` | `/memory pause` queues a `SetCapture(false)` request and awaits its one-row settings update while the TUI keeps polling. | parser tests; `capture_and_setting_changes_observe_fifo_order` |
 | `ResumeCapture` | `/memory resume` queues `SetCapture(true)`; prior capture requests on the same channel complete first. | parser tests; `capture_is_paused_by_default`, `capture_and_setting_changes_observe_fifo_order` |
 | `ForgetEpisode` | `/memory forget <id>` resolves a unique current-scope prefix and deletes exactly that row. It then attempts a truncating WAL checkpoint and distinguishes completed from still-pending truncation without misreporting the committed delete as a failure. | `project_handles_cannot_search_or_delete_each_others_episodes`, `episodes_are_immutable_but_can_be_forgotten_from_the_live_store` |
-| `RequestSearch` | The model calls `search_memories`/`read_memory` with an explicit scope selector; `ToolRegistry` submits that exact input to the permission policy. | `archive_tools_run_through_the_registry_permission_gate` |
+| `RequestSearch` | The model calls `search_memories`/`read_memory` with an explicit scope selector; `ToolRegistry` submits that exact input to the permission policy. Only an allow decision creates the exact `ToolAuthorization` from which the tool derives its `DisclosureGrant`. | `archive_tools_run_through_the_registry_permission_gate`, `disclosure_grants_are_bound_to_the_exact_authorized_call` |
 | `DenySearch` | `MemoryPermissionHandler` returns deny and `ToolRegistry` does not call the SQLite-backed tool. | `archive_tools_run_through_the_registry_permission_gate` |
-| `ApproveSearch` | After an interactive or remembered allow, `search_scoped` or `show_scoped` runs on the sole memory worker. SQL applies the selected scope predicate before content/ID matching and rechecks it on the final row read; the read tool also checks the expected returned scope label. Long text is exposed in bounded, resumable pages. | `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter`, `tools_require_explicit_scope_and_return_scope_labels`, `conversation_reads_are_bounded_and_resumably_paginated` |
+| `ApproveSearch` | After an interactive or remembered allow, `search_scoped` or `show_scoped` requires and rechecks the exact `DisclosureGrant`, then runs on the sole memory worker. SQL applies the selected scope predicate before content/ID matching and rechecks it on the final row read; the read tool also checks the expected returned scope label. Long text is exposed in bounded, resumable pages. | `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter`, `tools_require_explicit_scope_and_return_scope_labels`, `disclosure_grants_are_bound_to_the_exact_authorized_call`, `conversation_reads_are_bounded_and_resumably_paginated` |
 
 Local status, search, show, and export are read-only TLA+ stutter steps. Their
 concrete operations still run on the worker; `drive_memory_command` continues
@@ -193,9 +241,9 @@ Rust SQL and catalog tests separately check every returned member.
 | `writtenHistories`, `capturedMemories` | Files/rows created through the current `HistoryStore` and `MemoryWorker` | Both clients own an immutable scope and reject mismatched payload labels. |
 | `pendingKind`, `pendingFilter` | The archive tool name plus required `scope` input owned by one `ToolRegistry::execute_tool` invocation | Interactive policy checks additionally have a monotonic broker request ID and one-shot; remembered policy decisions do not open a modal. |
 | `disclosedHistory`, `historyDisclosureFilter` | The representative conversation result and categorical filter returned from an allowed search/read | Conversation manifests are filtered before any state file in an unselected scope is opened. Reads repeat both the filter and exact returned scope label. |
-| `authorizedHistoryDisclosure` | Ghost witness for the registry allow decision that produced the last representative history disclosure | It records only the last witness to keep finite CI practical; it is not a persistent permission set. |
+| `authorizedHistoryDisclosure` | Ghost witness refined by the registry-minted `DisclosureGrant` that produced the last representative history disclosure | The concrete grant binds operation, filter, and complete input. The model records only the last witness to keep finite CI practical; it is not a persistent permission set. |
 | `disclosedMemory`, `memoryDisclosureFilter` | The representative episode result and categorical filter returned from an allowed search/read | SQL applies the filter before text/ID matching and on the final row fetch. |
-| `authorizedMemoryDisclosure` | Ghost witness for the registry allow decision that produced the last representative memory disclosure | Allow-always state remains concrete Rust policy state outside this model; each automatic allow refines another approve transition. |
+| `authorizedMemoryDisclosure` | Ghost witness refined by the registry-minted `DisclosureGrant` that produced the last representative memory disclosure | Allow-always state remains concrete Rust policy state outside this model; each automatic allow still mints a new exact grant and refines another approve transition. |
 
 ### Archive-scope action mapping
 
@@ -205,11 +253,11 @@ Rust SQL and catalog tests separately check every returned member.
 | `SelectGlobalScope` | Only CLI `--global` or the explicitly named library constructor creates `WorkspaceScope::Global`; there is no `Default` implementation and unscoped state is rejected. Global startup also omits project-local `AGENTS.md`/`CLAUDE.md`. Pre-scope flat files are not searched. | `unscoped_state_is_rejected_instead_of_becoming_global` plus source-order review in `main` |
 | `SaveHistory` | Every autosave, checkpoint, queue edit, `/save`, and compaction routes through the active `HistoryStore::save`, which rejects a state claiming another scope and writes beneath the deterministic scope directory. | `project_autosaves_are_isolated_and_global_does_not_fallback`, `save_rejects_scope_mismatch_and_path_traversal`, `persistence_rejects_an_invalid_tool_protocol_boundary` |
 | `CaptureMemory` | `EpisodicMemory::build_episode` stamps the handle's immutable scope label; `MemoryWorker::record` rejects another label and inserts with the worker-owned scope key. | `project_handles_cannot_search_or_delete_each_others_episodes`, `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter` |
-| `RequestSearch` | Each archive tool requires a non-empty query/ID and categorical scope selector; each read also repeats the exact scope label from search. `ToolRegistry` submits that input to the ordinary permission policy before calling the tool. | `archive_tools_run_through_the_registry_permission_gate`, `tools_require_explicit_scope_and_return_scope_labels` |
+| `RequestSearch` | Each archive tool requires a non-empty query/ID and categorical scope selector; each read also repeats the exact scope label from search. `ToolRegistry` submits that input to the ordinary permission policy and privately constructs `ToolAuthorization` only after allow. | `archive_tools_run_through_the_registry_permission_gate`, `tools_require_explicit_scope_and_return_scope_labels`, `disclosure_grants_are_bound_to_the_exact_authorized_call` |
 | `DenySearch` | A denied registry decision returns a structured denied tool result without calling the history catalog or SQLite worker. | `archive_tools_run_through_the_registry_permission_gate` |
 | `ApproveEmptySearch` | An allowed search with no match returns an empty JSON result without inventing a record or falling back to another scope. | project/global isolation tests in `history` and `memory` |
-| `ApproveHistorySearch` | After an interactive or remembered allow, `HistoryStore` filters scope manifests before opening conversation files, then matches content. `read_archive` resolves only an opaque ID inside that same filter and requires the exact expected scope label; outputs omit reasoning/tool payloads and paginate long text. | `archive_search_requires_an_explicit_scope_filter_and_reads_by_opaque_id`, `archived_conversations_omit_reasoning_and_tool_payloads`, `conversation_search_and_read_are_sanitized`, `conversation_reads_are_bounded_and_resumably_paginated` |
-| `ApproveMemorySearch` | After an interactive or remembered allow, worker SQL applies the selected scope predicate before text/ID matching and on the final fetch; `ReadMemoryTool` requires a full returned UUID and exact expected scope label. | `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter`, `tools_require_explicit_scope_and_return_scope_labels` |
+| `ApproveHistorySearch` | After an interactive or remembered allow, the archive tool derives a `DisclosureGrant`; `HistoryStore` requires and rechecks it before filtering scope manifests and opening conversation files. `read_archive` resolves only an opaque ID inside that same filter and requires the exact expected scope label; outputs omit reasoning/tool payloads and paginate long text. | `archive_search_requires_an_explicit_scope_filter_and_reads_by_opaque_id`, `archived_conversations_omit_reasoning_and_tool_payloads`, `conversation_search_and_read_are_sanitized`, `disclosure_grants_are_bound_to_the_exact_authorized_call`, `conversation_reads_are_bounded_and_resumably_paginated` |
+| `ApproveMemorySearch` | After an interactive or remembered allow, the archive tool derives a `DisclosureGrant`; the worker API requires and rechecks it before SQL applies the selected scope predicate to text/ID matching and the final fetch. `ReadMemoryTool` requires a full returned UUID and exact expected scope label. | `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter`, `tools_require_explicit_scope_and_return_scope_labels`, `disclosure_grants_are_bound_to_the_exact_authorized_call` |
 
 ### Archive-scope property mapping
 
@@ -218,7 +266,7 @@ Rust SQL and catalog tests separately check every returned member.
 | `TypeOK` | Rust enums constrain scope/filter values, typed store clients own their scope, and TLC checks every modeled routing/authorization witness value in the finite configuration. |
 | `GlobalScopeIsExplicit` | `WorkspaceScope::discover` returns only `Project`; `WorkspaceScope` has no default; unscoped persisted state is rejected; `Global` is constructed from parsed `--global` or an explicitly named library API. |
 | `WritesStayInActiveScope` | Both storage clients own immutable scope values. History rejects mismatched `SavedState.scope`; memory rejects mismatched episode labels and binds inserts to its key. |
-| `PermissionGatesDisclosure` | Archive capabilities are ordinary registered tools under `MemoryPermissionHandler`; the model keeps a last-disclosure authorization witness. Allow-always can approve later calls without another modal, but every call still passes the policy. Direct host `/memory` commands are explicit user actions, not model-initiated retrieval. |
+| `PermissionGatesDisclosure` | Archive capabilities are ordinary registered tools under `MemoryPermissionHandler`; only the registry can mint `ToolAuthorization`, and public cross-scope store APIs require the narrower exact-input `DisclosureGrant`. The model keeps a last-disclosure authorization witness. Allow-always can approve later calls without another modal, but every call still passes the policy and receives a new exact grant. Direct host `/memory` commands are explicit user actions, not model-initiated retrieval. |
 | `DisclosureMatchesRequestedScope` | One shared `ScopeFilter` defines current/global/other/all semantics. History filters before content matching; memory embeds the same logic in SQL before content/ID matching; reads check returned scope labels. |
 | `PendingSearchIsCorrelated` | One registry invocation owns one kind/filter pair. For interactive decisions, the broker additionally correlates a monotonic ID and one-shot response; stale/mismatched replies cannot authorize a different archive call. |
 
@@ -301,8 +349,9 @@ execution. Display-only actions are covered by
   `redacted_reasoning_payload_never_reaches_the_inspector` and provider parser
   tests cover that boundary. This adds no TLA+ action or invariant.
 - TLC's state space is finite and its fingerprint collision probability is
-  nonzero. A green run is model evidence, not a proof of Rust refinement or
-  external tool termination.
+  nonzero. A green model run plus green sampled implementation traces is
+  stronger evidence than either alone, not a proof of complete Rust refinement
+  or external tool termination.
 
 ## 2026-07-27 scoped-archive and full refinement audit
 
@@ -352,13 +401,16 @@ all example targets, and 2 documentation tests. Formatting, Clippy with
 warnings denied, ShellCheck, the strengthened traceability lint, research
 corpus validators, hook tests, and `git diff --check` also passed.
 
-The remaining boundary is explicit: this is finite model checking plus a
-human-reviewed refinement map and deterministic Rust evidence, not a
-machine-checked proof that the Rust program refines TLA+. Archive batches use a
-representative-record abstraction, external provider/tool termination is an
-environmental assumption, and same-UID `python`/`bash`/file capabilities can
+That audit still left a manual-only connection between Rust executions and TLA+
+actions. The machine-checked trace bridge described above now validates
+representative real executions and rejects targeted invalid mutations. The
+remaining boundary is still explicit: this is finite model checking, sampled
+trace conformance, a human-reviewed refinement map, and deterministic Rust
+evidence, not a proof that every Rust execution refines TLA+. Archive batches
+use a representative-record abstraction, external provider/tool termination is
+an environmental assumption, and same-UID `python`/`bash`/file capabilities can
 read local archive files if separately authorized. Those are residual limits,
-not claims discharged by the green TLC runs.
+not claims discharged by the green checks.
 
 ## 2026-07-26 refinement audit
 
