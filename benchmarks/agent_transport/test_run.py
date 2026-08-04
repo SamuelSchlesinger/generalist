@@ -131,6 +131,17 @@ class WireFormatTests(unittest.TestCase):
         self.assertEqual(body["temperature"], 0.0)
         self.assertEqual(body["seed"], 1)
 
+    def test_legacy_json_control_restores_raw_schema_and_required_import(self):
+        path, body = benchmark.build_request(
+            self.corpus, self.task, "model", "json_tool_legacy", 800, None
+        )
+        self.assertEqual(path, "/chat/completions")
+        self.assertIn("Start with `import tools`", body["messages"][0]["content"])
+        self.assertIn("Input schema:", body["tools"][0]["function"]["description"])
+        self.assertNotIn(
+            "already bound to `tools`", body["tools"][0]["function"]["description"]
+        )
+
     def test_custom_request_uses_freeform_tool(self):
         path, body = benchmark.build_request(
             self.corpus, self.task, "model", "responses_custom", 800, "low"

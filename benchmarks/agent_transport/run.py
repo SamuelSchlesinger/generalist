@@ -26,7 +26,7 @@ DEFAULT_CORPUS = HERE / "tasks.json"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
-TRANSPORTS = ("json_tool", "plain_text", "responses_custom")
+TRANSPORTS = ("json_tool", "json_tool_legacy", "plain_text", "responses_custom")
 UNRESOLVED_KEY = "$unresolved"
 
 
@@ -97,14 +97,25 @@ def selected_tasks(
     return tasks[:max_tasks] if max_tasks is not None else tasks
 
 
-def bridge_docs(corpus: dict[str, Any], task: dict[str, Any]) -> str:
+def bridge_docs(
+    corpus: dict[str, Any], task: dict[str, Any], compact: bool = True
+) -> str:
     rows = []
     for name in task["available_tools"]:
         definition = corpus["tool_catalog"][name]
-        rows.append(
-            f"- {python_call_signature(name, definition['input_schema'])}\n"
-            f"  {definition['description']}"
-        )
+        if compact:
+            rows.append(
+                f"- {python_call_signature(name, definition['input_schema'])}\n"
+                f"  {definition['description']}"
+            )
+        else:
+            schema = json.dumps(
+                definition["input_schema"], ensure_ascii=False, separators=(",", ":")
+            )
+            rows.append(
+                f"- tools.{name}(**kwargs): {definition['description']}\n"
+                f"  Input schema: {schema}"
+            )
     return "\n".join(rows)
 
 
@@ -171,9 +182,17 @@ def task_prompt(task: dict[str, Any]) -> str:
 def system_prompt(transport: str) -> str:
     output_rule = {
         "json_tool": "Call the advertised python function tool exactly once.",
+        "json_tool_legacy": "Call the advertised python function tool exactly once.",
         "plain_text": "Return only raw Python source, with no Markdown fence or prose.",
         "responses_custom": "Call the advertised custom python tool exactly once.",
     }[transport]
+    if transport == "json_tool_legacy":
+        return (
+            "You are generating one self-contained Python 3 agent script for a transport "
+            "benchmark. Start with `import tools`. Call bridge functions only with keyword "
+            "arguments. Do not invent tools, perform the work in prose, or print payloads. "
+            + output_rule
+        )
     return (
         "You are generating one self-contained Python 3 agent script for a transport benchmark. "
         "The generated bridge is already bound to `tools`; `import tools` is valid but optional. "
@@ -183,7 +202,16 @@ def system_prompt(transport: str) -> str:
     )
 
 
-def python_tool_description(corpus: dict[str, Any], task: dict[str, Any]) -> str:
+def python_tool_description(
+    corpus: dict[str, Any], task: dict[str, Any], legacy: bool = False
+) -> str:
+    if legacy:
+        return (
+            "Execute one self-contained Python 3 script. Start with `import tools`; bridge "
+            "functions return str and may raise RuntimeError. Complete all requested calls in "
+            "one script.\n\nAvailable bridge tools:\n"
+            + bridge_docs(corpus, task, compact=False)
+        )
     return (
         "Execute one self-contained Python 3 script. The bridge is already bound to `tools`; "
         "bridge functions return str and may raise RuntimeError. Their `__doc__` values retain "
@@ -205,8 +233,10 @@ def build_request(
 ) -> tuple[str, dict[str, Any]]:
     system = system_prompt(transport)
     prompt = task_prompt(task)
-    description = python_tool_description(corpus, task)
-    if transport in {"json_tool", "plain_text"}:
+    description = python_tool_description(
+        corpus, task, legacy=transport == "json_tool_legacy"
+    )
+    if transport in {"json_tool", "json_tool_legacy", "plain_text"}:
         body: dict[str, Any] = {
             "model": model,
             "messages": [
@@ -219,7 +249,7 @@ def build_request(
         }
         if seed is not None:
             body["seed"] = seed
-        if transport == "json_tool":
+        if transport in {"json_tool", "json_tool_legacy"}:
             body["tools"] = [
                 {
                     "type": "function",
@@ -664,7 +694,8 @@ def run_attempt(
             check_source(
                 code,
                 task["expected_calls"],
-                bridge_preloaded=bool(corpus.get("bridge_preloaded")),
+                bridge_preloaded=bool(corpus.get("bridge_preloaded"))
+                and transport != "json_tool_legacy",
             )
             if code is not None
             else None

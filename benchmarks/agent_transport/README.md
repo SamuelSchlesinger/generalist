@@ -10,6 +10,8 @@ to represent Python inside a JSON string. The benchmark compares that boundary
 with two controls:
 
 - `json_tool`: the current JSON object wrapper on `/chat/completions`;
+- `json_tool_legacy`: the same wrapper with the former mandatory import and
+  verbose raw-schema prompt, retained as a pinned before/after control;
 - `plain_text`: raw Python in assistant text, which isolates code generation
   from tool-call serialization but is not a suitable production capability
   boundary; and

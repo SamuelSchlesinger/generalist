@@ -65,3 +65,13 @@ after bridge preloading and compact signatures but before the harness pinned
 temperature and seed. Their JSON repetitions varied from 5/10 to 9/10. They
 are retained as evidence of that protocol flaw and must not be presented as a
 deterministic post-change score.
+
+## Pinned post-change sample
+
+`20260804T231154Z-...jsonl` contains one paired run at `temperature=0`,
+`seed=1`; `20260804T231243Z-...jsonl` contains two more JSON repetitions with
+the same controls. JSON passed 21/30 (70%) and raw text passed 8/10 (80%). All
+three JSON repetitions produced the identical ordered task/classification/code
+digest
+`16443d8fa3e9d8a4145eecd5ad78fd1ea727fe02e786aa82409b797c827005ea`,
+confirming that this Ollama route honored the pinned controls for this corpus.
