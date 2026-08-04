@@ -200,6 +200,8 @@ def build_request(
     transport: str,
     max_output_tokens: int,
     reasoning_effort: str | None,
+    temperature: float = 0.0,
+    seed: int | None = 1,
 ) -> tuple[str, dict[str, Any]]:
     system = system_prompt(transport)
     prompt = task_prompt(task)
@@ -213,7 +215,10 @@ def build_request(
             ],
             "stream": False,
             "max_tokens": max_output_tokens,
+            "temperature": temperature,
         }
+        if seed is not None:
+            body["seed"] = seed
         if transport == "json_tool":
             body["tools"] = [
                 {
@@ -249,6 +254,7 @@ def build_request(
         "tool_choice": {"type": "custom", "name": "python"},
         "parallel_tool_calls": False,
         "max_output_tokens": max_output_tokens,
+        "temperature": temperature,
         "store": False,
     }
     if reasoning_effort:
@@ -632,10 +638,19 @@ def run_attempt(
     timeout_seconds: float,
     max_output_tokens: int,
     reasoning_effort: str | None,
+    temperature: float,
+    seed: int | None,
     run_id: str,
 ) -> dict[str, Any]:
     path, body = build_request(
-        corpus, task, model, transport, max_output_tokens, reasoning_effort
+        corpus,
+        task,
+        model,
+        transport,
+        max_output_tokens,
+        reasoning_effort,
+        temperature,
+        seed,
     )
     endpoint = base_url.rstrip("/") + path
     started_at = utc_now()
@@ -737,6 +752,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-tasks", type=int)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--max-output-tokens", type=int, default=1200)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--no-seed",
+        action="store_const",
+        const=None,
+        dest="seed",
+        help="omit the chat-completions seed for a provider that rejects it",
+    )
     parser.add_argument(
         "--reasoning-effort",
         choices=("none", "minimal", "low", "medium", "high", "xhigh"),
@@ -749,6 +773,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.repeat < 1 or args.max_output_tokens < 1 or args.timeout_seconds <= 0:
         parser.error("repeat, max-output-tokens, and timeout-seconds must be positive")
+    if not 0 <= args.temperature <= 2:
+        parser.error("temperature must be between 0 and 2")
     if args.max_tasks is not None and args.max_tasks < 1:
         parser.error("max-tasks must be positive")
     default_url, default_key_env = provider_defaults(args.provider)
@@ -794,6 +820,8 @@ def main(argv: list[str] | None = None) -> int:
             "repeat": args.repeat,
             "max_output_tokens": args.max_output_tokens,
             "reasoning_effort": args.reasoning_effort,
+            "temperature": args.temperature,
+            "seed": args.seed,
             "corpus": str(args.corpus.resolve()),
             "artifacts": {
                 "runner_sha256": sha256_file(pathlib.Path(__file__).resolve()),
@@ -818,6 +846,8 @@ def main(argv: list[str] | None = None) -> int:
                         timeout_seconds=args.timeout_seconds,
                         max_output_tokens=args.max_output_tokens,
                         reasoning_effort=args.reasoning_effort,
+                        temperature=args.temperature,
+                        seed=args.seed,
                         run_id=run_id,
                     )
                     writer.write(record)

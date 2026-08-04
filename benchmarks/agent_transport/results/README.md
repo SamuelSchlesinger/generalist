@@ -57,3 +57,11 @@ files, the corpus, runner, and rechecker. Its corpus hash is
 `aa65127334954d65b9c0ccbbbac50becc4dc97b34e9443eed8781e03986b4225`.
 The original files remain authoritative for provider responses; derived files
 exist only to apply a newer checker without rewriting history.
+
+## Unpinned post-change sample
+
+`20260804T230710Z-...jsonl` and `20260804T230836Z-...jsonl` were generated
+after bridge preloading and compact signatures but before the harness pinned
+temperature and seed. Their JSON repetitions varied from 5/10 to 9/10. They
+are retained as evidence of that protocol flaw and must not be presented as a
+deterministic post-change score.

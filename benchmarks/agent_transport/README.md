@@ -42,6 +42,12 @@ Treat result files as append-only evidence: start a new file for a changed
 corpus, prompt, provider route, or implementation rather than rewriting an old
 run.
 
+Chat-completions runs default to `temperature=0` and `seed=1`; Responses runs
+use the same temperature but omit the unsupported seed field. The exact values
+are recorded in both the run manifest and request. Use `--no-seed` only when a
+provider rejects that optional control; a seed is advisory and some upstreams
+can remain nondeterministic.
+
 ## Reproducible first pass
 
 Run the static tests first:

@@ -128,6 +128,8 @@ class WireFormatTests(unittest.TestCase):
         self.assertEqual(
             body["tool_choice"], {"type": "function", "function": {"name": "python"}}
         )
+        self.assertEqual(body["temperature"], 0.0)
+        self.assertEqual(body["seed"], 1)
 
     def test_custom_request_uses_freeform_tool(self):
         path, body = benchmark.build_request(
@@ -137,6 +139,8 @@ class WireFormatTests(unittest.TestCase):
         self.assertEqual(body["tools"][0]["type"], "custom")
         self.assertNotIn("parameters", body["tools"][0])
         self.assertEqual(body["reasoning"], {"effort": "low"})
+        self.assertEqual(body["temperature"], 0.0)
+        self.assertNotIn("seed", body)
 
     def test_compact_signature_preserves_required_and_optional_types(self):
         schema = {
