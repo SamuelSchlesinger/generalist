@@ -93,3 +93,25 @@ call. The legacy route ignored the tool call three times. This distinction is
 still operationally useful: bridge preloading removes a real missing-import
 runtime failure mode, while the benchmark shows that generation correctness
 remains a separate problem.
+
+## OpenRouter remote baseline
+
+The one-call `responses_custom` probes in `20260804T232940Z-...jsonl` and
+`20260804T232956Z-...jsonl` were rejected by OpenRouter with HTTP 400
+`invalid_prompt` for Kimi K3 and Qwen 3.8 Max, respectively. Neither request
+reached code extraction, so freeform custom tools are not a viable route for
+these model/provider combinations.
+
+`20260804T233101Z-...jsonl` is the pinned ten-task Kimi K3 matrix. Current JSON
+and legacy JSON each passed 9/10; raw text passed 10/10. Current JSON exhausted
+the 1,200-token output limit on `unified_diff`, while legacy JSON changed one
+`regex_and_sql` argument. Provider-reported successful-call costs were
+$0.058977, $0.057016, and $0.068213 for current JSON, legacy JSON, and raw text.
+
+`20260804T233059Z-...jsonl` is the corresponding Qwen 3.8 Max matrix. Raw text
+passed 10/10 at a provider-reported cost of $0.035896. Both JSON profiles were
+rejected on all ten tasks because this benchmark forced the Python function
+with an object-valued `tool_choice`, which Alibaba does not support in thinking
+mode. This is an API-profile incompatibility, not a 0/10 code-generation
+result: Generalist's OpenAI-compatible adapter omits `tool_choice`, and an
+unforced JSON control is required before drawing a production conclusion.
