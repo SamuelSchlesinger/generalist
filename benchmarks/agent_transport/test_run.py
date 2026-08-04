@@ -102,6 +102,14 @@ bridge.publish(body=value + "\\nnext", source_count=1)
         self.assertFalse(result["passed"])
         self.assertEqual(result["failure_kind"], "missing_tools_import")
 
+    def test_preloaded_bridge_accepts_tools_without_import(self):
+        result = benchmark.check_source(
+            "tools.record_text(text='x')",
+            [{"name": "record_text", "arguments": {"text": "x"}}],
+            bridge_preloaded=True,
+        )
+        self.assertTrue(result["passed"], result)
+
 
 class WireFormatTests(unittest.TestCase):
     @classmethod
@@ -129,6 +137,21 @@ class WireFormatTests(unittest.TestCase):
         self.assertEqual(body["tools"][0]["type"], "custom")
         self.assertNotIn("parameters", body["tools"][0])
         self.assertEqual(body["reasoning"], {"effort": "low"})
+
+    def test_compact_signature_preserves_required_and_optional_types(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "query": {"type": "string"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+        self.assertEqual(
+            benchmark.python_call_signature("search", schema),
+            "tools.search(*, query: str, limit: int | None = None) -> str",
+        )
 
     def test_extracts_json_wrapped_code(self):
         code = "import tools\ntools.record_text(text='x')"

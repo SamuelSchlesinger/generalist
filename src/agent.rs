@@ -1740,7 +1740,8 @@ print("script continued")
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "python");
         assert!(defs[0].description.contains("tools.mirror"));
-        assert!(defs[0].description.contains("Input schema"));
+        assert!(defs[0].description.contains("__doc__"));
+        assert!(defs[0].description.contains("already bound to `tools`"));
         assert!(defs[0]
             .description
             .contains("never emit `<name>` or `tools.<name>` as a native tool call"));
@@ -2007,7 +2008,7 @@ print("script continued")
     #[tokio::test]
     async fn code_mode_bridges_tool_calls_into_scripts() {
         let code = r#"
-import tools
+# The runner preloads `tools`; an explicit import is optional.
 results = [tools.mirror(marker=f"xyzzy-{i}") for i in range(3)]
 print("BRIDGED:", "|".join(results))
 try:

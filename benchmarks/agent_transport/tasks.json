@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "description": "Deterministic code-transport tasks for the Generalist model-facing Python boundary.",
+  "bridge_preloaded": true,
   "tool_catalog": {
     "record_text": {
       "description": "Record text exactly as supplied and return a short receipt.",

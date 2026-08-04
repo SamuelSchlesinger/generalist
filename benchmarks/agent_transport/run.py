@@ -8,6 +8,7 @@ import ast
 import datetime as dt
 import hashlib
 import json
+import keyword
 import os
 import pathlib
 import platform
@@ -100,9 +101,58 @@ def bridge_docs(corpus: dict[str, Any], task: dict[str, Any]) -> str:
     rows = []
     for name in task["available_tools"]:
         definition = corpus["tool_catalog"][name]
-        schema = json.dumps(definition["input_schema"], ensure_ascii=False, separators=(",", ":"))
-        rows.append(f"- tools.{name}(**kwargs): {definition['description']}\n  Input schema: {schema}")
+        rows.append(
+            f"- {python_call_signature(name, definition['input_schema'])}\n"
+            f"  {definition['description']}"
+        )
     return "\n".join(rows)
+
+
+def schema_type_hint(schema: dict[str, Any]) -> str:
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        return " | ".join(schema_type_hint({"type": item}) for item in kind)
+    if kind == "string":
+        return "str"
+    if kind == "integer":
+        return "int"
+    if kind == "number":
+        return "float"
+    if kind == "boolean":
+        return "bool"
+    if kind == "array":
+        return f"list[{schema_type_hint(schema.get('items', {}))}]"
+    if kind == "object":
+        return "dict[str, object]"
+    if kind == "null":
+        return "None"
+    return "object"
+
+
+def python_call_signature(name: str, schema: dict[str, Any]) -> str:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return f"tools.{name}(**kwargs) -> str"
+    required = schema.get("required", [])
+    if (
+        any(not key.isidentifier() or keyword.iskeyword(key) for key in properties)
+        or any(key not in properties for key in required)
+    ):
+        return f"tools.{name}(**kwargs) -> str"
+    parameters = []
+    for required_pass in (True, False):
+        for key, value in properties.items():
+            if (key in required) != required_pass:
+                continue
+            hint = schema_type_hint(value)
+            parameters.append(
+                f"{key}: {hint}" if required_pass else f"{key}: {hint} | None = None"
+            )
+    if schema.get("additionalProperties") is not False:
+        parameters.append("**extra")
+    if not parameters:
+        return f"tools.{name}() -> str"
+    return f"tools.{name}(*, {', '.join(parameters)}) -> str"
 
 
 def task_prompt(task: dict[str, Any]) -> str:
@@ -126,16 +176,18 @@ def system_prompt(transport: str) -> str:
     }[transport]
     return (
         "You are generating one self-contained Python 3 agent script for a transport benchmark. "
-        "Start with `import tools`. Call bridge functions only with keyword arguments. Do not "
-        "invent tools, perform the work in prose, or print payloads. "
+        "The generated bridge is already bound to `tools`; `import tools` is valid but optional. "
+        "Call bridge functions only with keyword arguments. Do not invent tools, perform the work "
+        "in prose, or print payloads. "
         + output_rule
     )
 
 
 def python_tool_description(corpus: dict[str, Any], task: dict[str, Any]) -> str:
     return (
-        "Execute one self-contained Python 3 script. Start with `import tools`; bridge functions "
-        "return str and may raise RuntimeError. Complete all requested calls in one script.\n\n"
+        "Execute one self-contained Python 3 script. The bridge is already bound to `tools`; "
+        "bridge functions return str and may raise RuntimeError. Their `__doc__` values retain "
+        "the full JSON Schemas. Complete all requested calls in one script.\n\n"
         "Available bridge tools:\n"
         + bridge_docs(corpus, task)
     )
@@ -412,8 +464,10 @@ def constant_bindings(tree: ast.AST) -> dict[str, Any]:
     return constants
 
 
-def tool_aliases(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
-    module_aliases: set[str] = set()
+def tool_aliases(
+    tree: ast.AST, bridge_preloaded: bool = False
+) -> tuple[set[str], dict[str, str]]:
+    module_aliases: set[str] = {"tools"} if bridge_preloaded else set()
     function_aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -440,13 +494,15 @@ def tool_call_name(
     return None
 
 
-def extract_source_calls(source: str) -> tuple[list[dict[str, Any]], str | None, bool]:
+def extract_source_calls(
+    source: str, bridge_preloaded: bool = False
+) -> tuple[list[dict[str, Any]], str | None, bool]:
     try:
         tree = ast.parse(source)
     except SyntaxError as error:
         return [], f"{error.msg} at line {error.lineno}, column {error.offset}", False
     constants = constant_bindings(tree)
-    module_aliases, function_aliases = tool_aliases(tree)
+    module_aliases, function_aliases = tool_aliases(tree, bridge_preloaded)
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
     calls.sort(key=lambda node: (node.lineno, node.col_offset))
     extracted = []
@@ -477,8 +533,14 @@ def value_matches(expected: Any, actual: Any) -> bool:
     return expected == actual
 
 
-def check_source(source: str, expected_calls: list[dict[str, Any]]) -> dict[str, Any]:
-    actual_calls, syntax_error, has_tools_import = extract_source_calls(source)
+def check_source(
+    source: str,
+    expected_calls: list[dict[str, Any]],
+    bridge_preloaded: bool = False,
+) -> dict[str, Any]:
+    actual_calls, syntax_error, has_tools_import = extract_source_calls(
+        source, bridge_preloaded
+    )
     comparable_calls = [
         {"name": call["name"], "arguments": call["arguments"]} for call in actual_calls
     ]
@@ -583,7 +645,15 @@ def run_attempt(
             code, extraction = extract_responses_code(response)
         else:
             code, extraction = extract_chat_code(response, transport)
-        checker = check_source(code, task["expected_calls"]) if code is not None else None
+        checker = (
+            check_source(
+                code,
+                task["expected_calls"],
+                bridge_preloaded=bool(corpus.get("bridge_preloaded")),
+            )
+            if code is not None
+            else None
+        )
         metrics: dict[str, Any] = {
             "latency_ms": round(elapsed_ms, 3),
             "request_bytes": len(json_bytes(body)),

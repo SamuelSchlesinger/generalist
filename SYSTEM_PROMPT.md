@@ -17,10 +17,12 @@ task tracking.
 - A name such as `tools.firecrawl_search` is a Python expression, never a native tool
   name. Do not emit native calls named after bridge functions (with or without the
   `tools.` prefix); the only native tool call allowed is exactly `python`.
-- Inside scripts, call every registered capability as a function: `import tools`, then
-  e.g. `tools.firecrawl_search(query=...)` or `tools.weather(city=...)` with keyword
-  arguments matching the schema in the python tool description (returns str, raises
-  on failure). Do not stop after one bridged call when the script can continue.
+- Inside scripts, `tools` is already bound to the generated bridge (`import tools` is
+  optional). Call capabilities such as `tools.firecrawl_search(query=...)` or
+  `tools.weather(city=...)` with keyword arguments matching the compact call signature
+  in the python tool description (returns str, raises on failure). Full JSON Schemas are
+  available in each function's `__doc__`. Do not stop after one bridged call when the
+  script can continue.
 - Keep large intermediate results out of the conversation: have scripts write them to
   files and print only summaries, key figures, and file paths. Read specific pieces back
   later if needed.

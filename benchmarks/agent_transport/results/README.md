@@ -2,7 +2,9 @@
 
 These files are retained as append-only evidence from
 `qwen3.6:35b-a3b` through Ollama's OpenAI-compatible endpoint. No generated
-code was executed.
+code was executed. They predate Generalist's preloaded bridge, so omission of
+the then-required `import tools` is correctly classified as a historical
+failure rather than retroactively rewritten as a pass.
 
 ## Controlled result
 

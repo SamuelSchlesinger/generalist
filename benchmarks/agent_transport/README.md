@@ -22,6 +22,11 @@ names, order, and runtime literal values with the corpus. It deliberately does
 transport and static script correctness, not tool semantics, sandbox safety, or
 successful end-to-end execution.
 
+The corpus declares whether Generalist preloads its generated bridge. Current
+runs accept either direct `tools.<name>(...)` use or an explicit `import tools`,
+and advertise compact Python-like call signatures; full JSON Schemas remain a
+runtime `__doc__` fallback.
+
 ## Corpus
 
 [`tasks.json`](tasks.json) includes a simple control plus quote, backslash,

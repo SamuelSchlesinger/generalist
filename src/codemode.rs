@@ -11,7 +11,8 @@
 //!   model's context unless printed — state offloading for free
 //!
 //! Mechanics: the agent writes `tools.py` + `main.py` to a scratch dir, runs
-//! `python3 main.py`, and serves tool calls over a Unix socket. Every
+//! `main.py` through a small wrapper that preloads `tools`, and serves tool
+//! calls over a Unix socket. Every
 //! bridged call goes through the same `ToolRegistry` permission gate as a
 //! direct call, so interactive approval still applies.
 
@@ -32,9 +33,145 @@ pub(crate) const PY_TOOL_NAME: &str = "python";
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub(crate) const MAX_TIMEOUT_SECS: u64 = 600;
 
+const RUNNER_MODULE: &str = r#""""Generalist code-mode bootstrap."""
+import runpy as _runpy
+import sys as _sys
+import tools as _tools
+
+_runpy.run_path(_sys.argv[1], init_globals={"tools": _tools}, run_name="__main__")
+"#;
+
+fn is_python_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && !matches!(
+            value,
+            "False"
+                | "None"
+                | "True"
+                | "and"
+                | "as"
+                | "assert"
+                | "async"
+                | "await"
+                | "break"
+                | "class"
+                | "continue"
+                | "def"
+                | "del"
+                | "elif"
+                | "else"
+                | "except"
+                | "finally"
+                | "for"
+                | "from"
+                | "global"
+                | "if"
+                | "import"
+                | "in"
+                | "is"
+                | "lambda"
+                | "nonlocal"
+                | "not"
+                | "or"
+                | "pass"
+                | "raise"
+                | "return"
+                | "try"
+                | "while"
+                | "with"
+                | "yield"
+        )
+}
+
+fn schema_type_hint(schema: &Value) -> String {
+    match schema.get("type") {
+        Some(Value::String(kind)) => match kind.as_str() {
+            "string" => "str".to_string(),
+            "integer" => "int".to_string(),
+            "number" => "float".to_string(),
+            "boolean" => "bool".to_string(),
+            "array" => format!(
+                "list[{}]",
+                schema
+                    .get("items")
+                    .map(schema_type_hint)
+                    .unwrap_or_else(|| "object".to_string())
+            ),
+            "object" => "dict[str, object]".to_string(),
+            "null" => "None".to_string(),
+            _ => "object".to_string(),
+        },
+        Some(Value::Array(kinds)) => kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|kind| schema_type_hint(&json!({"type": kind})))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        _ => "object".to_string(),
+    }
+}
+
+fn python_call_signature(tool: &ToolDef) -> String {
+    let Some(properties) = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+    else {
+        return format!("tools.{}(**kwargs) -> str", tool.name);
+    };
+    let required = tool
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let is_required = |name: &str| required.iter().any(|value| value.as_str() == Some(name));
+    if properties.keys().any(|name| !is_python_identifier(name))
+        || required
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|name| !properties.contains_key(name))
+    {
+        return format!("tools.{}(**kwargs) -> str", tool.name);
+    }
+
+    let mut parameters = Vec::new();
+    for required_pass in [true, false] {
+        for (name, schema) in properties {
+            if is_required(name) != required_pass {
+                continue;
+            }
+            let hint = schema_type_hint(schema);
+            parameters.push(if required_pass {
+                format!("{name}: {hint}")
+            } else {
+                format!("{name}: {hint} | None = None")
+            });
+        }
+    }
+    if tool
+        .input_schema
+        .get("additionalProperties")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        parameters.push("**extra".to_string());
+    }
+    if parameters.is_empty() {
+        format!("tools.{}() -> str", tool.name)
+    } else {
+        format!("tools.{}(*, {}) -> str", tool.name, parameters.join(", "))
+    }
+}
+
 /// The sole tool definition advertised to the model when code mode is on.
 ///
-/// Ordinary registered tools include their descriptions and schemas here so
+/// Ordinary registered tools include compact call signatures and descriptions here so
 /// the model can use them in its first script without a discovery round-trip.
 /// `code_only_tools` are listed by name only — their full schemas live in the
 /// generated module's docstrings (progressive disclosure), so heavy (e.g.
@@ -48,10 +185,9 @@ pub(crate) fn python_tool_def(available_tools: &[ToolDef], code_only_tools: &[To
             .iter()
             .map(|tool| {
                 format!(
-                    "- tools.{name}(**kwargs): {description}\n  Input schema: {schema}",
-                    name = tool.name,
+                    "- {signature}\n  {description}",
+                    signature = python_call_signature(tool),
                     description = tool.description,
-                    schema = serde_json::to_string(&tool.input_schema).unwrap_or_default(),
                 )
             })
             .collect::<Vec<_>>()
@@ -79,9 +215,11 @@ pub(crate) fn python_tool_def(available_tools: &[ToolDef], code_only_tools: &[To
              work inside the script via the pre-generated `tools` module. Host-owned control \
              tools such as `update_goal` may also be advertised separately and must be called \
              natively. A `tools.<name>` expression belongs inside the `code` string; never emit \
-             `<name>` or `tools.<name>` as a native tool call. Start with `import tools`, then \
-             call bridge functions with keyword arguments; they return str and raise \
-             RuntimeError on failure. Complete the largest coherent work phase in one script \
+             `<name>` or `tools.<name>` as a native tool call. The generated module is already \
+             bound to `tools` (`import tools` remains valid but is optional). Call bridge \
+             functions with keyword arguments; they return str and raise RuntimeError on \
+             failure. Every function's `__doc__` retains its full JSON Schema for runtime \
+             inspection. Complete the largest coherent work phase in one script \
              instead of returning after one bridged call: loop, branch, retry, validate, and \
              combine results in code. Tool results stay inside the script unless printed. Print \
              only conclusions, compact evidence, and paths; write large intermediate results to \
@@ -116,7 +254,8 @@ pub(crate) fn generate_tools_module(defs: &[ToolDef]) -> String {
     let mut module = String::from(
         r#""""Auto-generated bridge to the agent's tools.
 
-Usage: import tools; tools.<name>(**kwargs) -> str. Raises RuntimeError on failure."""
+Generalist preloads this module as `tools`; `import tools` also works.
+Call tools.<name>(**kwargs) -> str. Raises RuntimeError on failure."""
 import json as _json
 import os as _os
 import socket as _socket
@@ -144,8 +283,9 @@ def _call(_tool, **kwargs):
     );
     for def in defs {
         let doc = format!(
-            "{}\n\nInput schema: {}",
+            "{}\n\nCall: {}\nInput schema: {}",
             def.description,
+            python_call_signature(def),
             serde_json::to_string(&def.input_schema).unwrap_or_default()
         );
         module.push_str(&format!(
@@ -222,6 +362,9 @@ async fn run_script_inner(
     .map_err(|e| format!("Failed to write tools.py: {}", e))?;
     let main_py = script_dir.join("main.py");
     std::fs::write(&main_py, code).map_err(|e| format!("Failed to write main.py: {}", e))?;
+    let runner_py = script_dir.join("runner.py");
+    std::fs::write(&runner_py, RUNNER_MODULE)
+        .map_err(|e| format!("Failed to write runner.py: {}", e))?;
 
     // Unix socket paths are limited to ~104 bytes (SUN_LEN); macOS
     // per-user temp dirs under /var/folders are long enough to overflow it,
@@ -235,10 +378,11 @@ async fn run_script_inner(
     // Best-effort cleanup of the socket file when the run ends.
     let _socket_guard = scopeguard(socket_path.clone());
 
-    // Run in the agent's cwd so the script reads/writes project files
-    // naturally; `import tools` works because Python puts main.py's
-    // directory first on sys.path.
+    // Inherit the agent's cwd so the model script reads/writes project files
+    // naturally. runner.py's directory is first on sys.path, and run_path
+    // gives main.py its normal file identity while preloading the bridge.
     let mut child = Command::new("python3")
+        .arg(&runner_py)
         .arg(&main_py)
         .env("GENERALIST_TOOL_SOCKET", &socket_path)
         .stdin(Stdio::null())
@@ -410,6 +554,7 @@ mod tests {
         }];
         let module = generate_tools_module(&defs);
         assert!(module.contains("def tricky(**kwargs):"));
+        assert!(module.contains("Call: tools.tricky(*, x: str | None = None, **extra) -> str"));
 
         // Ask Python itself whether the module compiles.
         let dir = std::env::temp_dir().join(format!("gm-test-{}", uuid::Uuid::new_v4().simple()));
@@ -423,5 +568,33 @@ mod tests {
             .status()
             .expect("python3 available");
         assert!(status.success(), "generated tools.py does not compile");
+    }
+
+    #[test]
+    fn compact_signatures_put_required_parameters_first() {
+        let tool = ToolDef {
+            name: "search".into(),
+            description: "Search records".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "query": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        };
+        assert_eq!(
+            python_call_signature(&tool),
+            "tools.search(*, query: str, limit: int | None = None, tags: list[str] | None = None) -> str"
+        );
+        let definition = python_tool_def(&[tool], &[]);
+        assert!(definition
+            .description
+            .contains("tools.search(*, query: str"));
+        assert!(!definition.description.contains("Input schema:"));
+        assert!(definition.description.contains("__doc__"));
     }
 }

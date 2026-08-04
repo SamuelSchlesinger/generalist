@@ -27,6 +27,7 @@ def recheck_attempt(
     tasks: dict[str, dict[str, Any]],
     source_path: pathlib.Path,
     run_id: str,
+    bridge_preloaded: bool = False,
 ) -> dict[str, Any]:
     derived = copy.deepcopy(record)
     original_run_id = record.get("run_id")
@@ -52,7 +53,15 @@ def recheck_attempt(
     else:
         derived["recheck_note"] = f"unknown transport: {transport}"
         return derived
-    checker = benchmark.check_source(code, task["expected_calls"]) if code is not None else None
+    checker = (
+        benchmark.check_source(
+            code,
+            task["expected_calls"],
+            bridge_preloaded=bridge_preloaded,
+        )
+        if code is not None
+        else None
+    )
     derived["code"] = code
     derived["extraction"] = extraction
     derived["checker"] = checker
@@ -113,7 +122,13 @@ def main(argv: list[str] | None = None) -> int:
                     record = json.loads(line)
                     if record.get("record_type") != "attempt":
                         continue
-                    derived = recheck_attempt(record, tasks, path, run_id)
+                    derived = recheck_attempt(
+                        record,
+                        tasks,
+                        path,
+                        run_id,
+                        bridge_preloaded=bool(corpus.get("bridge_preloaded")),
+                    )
                     writer.write(derived)
                     attempts += 1
                     if derived.get("classification") != record.get("classification"):
