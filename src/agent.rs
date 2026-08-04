@@ -808,8 +808,9 @@ impl Agent {
         )
     }
 
-    /// Execute a code-mode `python` call: permission-check it like any other
-    /// tool, then run the script with the tool bridge attached.
+    /// Execute a code-mode `python` call: validate its input, permission-check
+    /// it like any other tool, then run the script with the tool bridge
+    /// attached.
     async fn execute_code_mode(
         &mut self,
         input: serde_json::Value,
@@ -825,6 +826,22 @@ impl Agent {
             },
             outcome,
         };
+
+        let Some(code) = input.get("code").and_then(Value::as_str).map(str::to_owned) else {
+            return make_result(
+                "Invalid python tool input: expected an object with a string `code` field. \
+                 Retry the `python` tool call with JSON arguments like \
+                 {\"code\":\"<Python source>\"}."
+                    .to_string(),
+                ToolCallOutcome::Failed,
+                id,
+            );
+        };
+        let timeout_secs = input
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(crate::codemode::DEFAULT_TIMEOUT_SECS)
+            .clamp(1, crate::codemode::MAX_TIMEOUT_SECS);
 
         let request = ToolExecutionRequest {
             tool_use_id: id.clone(),
@@ -851,21 +868,8 @@ impl Agent {
             }
         }
 
-        let Some(code) = input.get("code").and_then(|v| v.as_str()) else {
-            return make_result(
-                "Missing 'code' field".to_string(),
-                ToolCallOutcome::Failed,
-                id,
-            );
-        };
-        let timeout_secs = input
-            .get("timeout_seconds")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(crate::codemode::DEFAULT_TIMEOUT_SECS)
-            .clamp(1, crate::codemode::MAX_TIMEOUT_SECS);
-
         let script =
-            crate::codemode::run_script(code, timeout_secs, &mut self.registry, on_event).await;
+            crate::codemode::run_script(&code, timeout_secs, &mut self.registry, on_event).await;
         let outcome = if script.denied {
             ToolCallOutcome::Denied
         } else if script.failed {
@@ -1437,6 +1441,18 @@ mod tests {
         }
     }
 
+    struct CountingDenyPermission {
+        checks: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolPermissionHandler for CountingDenyPermission {
+        async fn check_permission(&self, _request: &ToolExecutionRequest) -> PermissionDecision {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            PermissionDecision::Deny
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancellation_wins_over_a_ready_permission_before_steering() {
         LocalSet::new()
@@ -1819,6 +1835,62 @@ print("script continued")
                 assert!(content.contains("code mode permits only"));
                 assert!(content.contains("tools.mirror(...)"));
                 assert!(!content.contains("tools.tools.mirror"));
+            }
+            other => panic!("expected tool result, got {:?}", other),
+        }
+        assert!(history_tool_protocol_is_valid(&agent.history));
+    }
+
+    #[tokio::test]
+    async fn malformed_code_mode_input_fails_before_permission_check() {
+        let malformed_call = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                name: "python".into(),
+                input: json!({"_unparsed_arguments": "not json"}),
+                id: "malformed-python".into(),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        };
+        let checks = Arc::new(AtomicUsize::new(0));
+        let registry = ToolRegistry::with_permission_handler(Box::new(CountingDenyPermission {
+            checks: Arc::clone(&checks),
+        }));
+        let mut agent = Agent::new(
+            Box::new(Script::new(vec![
+                Ok(malformed_call),
+                Ok(text_response("recovered")),
+            ])),
+            registry,
+            "test",
+        );
+        let mut events = Vec::new();
+
+        let outcome = agent
+            .run_turn("go", &mut |event| events.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(checks.load(Ordering::SeqCst), 0);
+        assert!(agent.registry.execution_history().is_empty());
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolCallFinished {
+                    name,
+                    outcome: ToolCallOutcome::Failed,
+                    ..
+                } if name == "python"
+            )
+        }));
+        match &agent.history[2].content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(*is_error, Some(true));
+                assert!(content.contains("string `code` field"));
+                assert!(content.contains("Retry the `python` tool call"));
             }
             other => panic!("expected tool result, got {:?}", other),
         }
