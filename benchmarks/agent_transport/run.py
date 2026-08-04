@@ -26,7 +26,16 @@ DEFAULT_CORPUS = HERE / "tasks.json"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
-TRANSPORTS = ("json_tool", "json_tool_legacy", "plain_text", "responses_custom")
+TRANSPORTS = (
+    "json_tool",
+    "json_tool_implicit",
+    "json_tool_legacy",
+    "plain_text",
+    "responses_custom",
+)
+JSON_TOOL_TRANSPORTS = frozenset({"json_tool", "json_tool_implicit", "json_tool_legacy"})
+CHAT_TRANSPORTS = JSON_TOOL_TRANSPORTS | {"plain_text"}
+LEGACY_TRANSPORTS = frozenset({"json_tool_legacy"})
 UNRESOLVED_KEY = "$unresolved"
 
 
@@ -182,11 +191,12 @@ def task_prompt(task: dict[str, Any]) -> str:
 def system_prompt(transport: str) -> str:
     output_rule = {
         "json_tool": "Call the advertised python function tool exactly once.",
+        "json_tool_implicit": "Call the advertised python function tool exactly once.",
         "json_tool_legacy": "Call the advertised python function tool exactly once.",
         "plain_text": "Return only raw Python source, with no Markdown fence or prose.",
         "responses_custom": "Call the advertised custom python tool exactly once.",
     }[transport]
-    if transport == "json_tool_legacy":
+    if transport in LEGACY_TRANSPORTS:
         return (
             "You are generating one self-contained Python 3 agent script for a transport "
             "benchmark. Start with `import tools`. Call bridge functions only with keyword "
@@ -234,9 +244,9 @@ def build_request(
     system = system_prompt(transport)
     prompt = task_prompt(task)
     description = python_tool_description(
-        corpus, task, legacy=transport == "json_tool_legacy"
+        corpus, task, legacy=transport in LEGACY_TRANSPORTS
     )
-    if transport in {"json_tool", "json_tool_legacy", "plain_text"}:
+    if transport in CHAT_TRANSPORTS:
         body: dict[str, Any] = {
             "model": model,
             "messages": [
@@ -249,7 +259,7 @@ def build_request(
         }
         if seed is not None:
             body["seed"] = seed
-        if transport in {"json_tool", "json_tool_legacy"}:
+        if transport in JSON_TOOL_TRANSPORTS:
             body["tools"] = [
                 {
                     "type": "function",
@@ -270,8 +280,9 @@ def build_request(
                     },
                 }
             ]
-            body["tool_choice"] = {"type": "function", "function": {"name": "python"}}
-            body["parallel_tool_calls"] = False
+            if transport != "json_tool_implicit":
+                body["tool_choice"] = {"type": "function", "function": {"name": "python"}}
+                body["parallel_tool_calls"] = False
         if reasoning_effort:
             body["reasoning"] = {"effort": reasoning_effort}
         return "/chat/completions", body
@@ -695,7 +706,7 @@ def run_attempt(
                 code,
                 task["expected_calls"],
                 bridge_preloaded=bool(corpus.get("bridge_preloaded"))
-                and transport != "json_tool_legacy",
+                and transport not in LEGACY_TRANSPORTS,
             )
             if code is not None
             else None

@@ -117,7 +117,7 @@ class WireFormatTests(unittest.TestCase):
         cls.corpus = benchmark.load_corpus(benchmark.DEFAULT_CORPUS)
         cls.task = cls.corpus["tasks"][0]
 
-    def test_json_tool_request_uses_current_object_wrapper(self):
+    def test_forced_json_tool_request_uses_current_object_wrapper(self):
         path, body = benchmark.build_request(
             self.corpus, self.task, "model", "json_tool", 800, None
         )
@@ -130,6 +130,18 @@ class WireFormatTests(unittest.TestCase):
         )
         self.assertEqual(body["temperature"], 0.0)
         self.assertEqual(body["seed"], 1)
+
+    def test_implicit_json_tool_omits_tool_selection_like_generalist(self):
+        path, body = benchmark.build_request(
+            self.corpus, self.task, "model", "json_tool_implicit", 800, "low"
+        )
+        self.assertEqual(path, "/chat/completions")
+        function = body["tools"][0]["function"]
+        self.assertEqual(function["name"], "python")
+        self.assertEqual(function["parameters"]["required"], ["code"])
+        self.assertNotIn("tool_choice", body)
+        self.assertNotIn("parallel_tool_calls", body)
+        self.assertEqual(body["reasoning"], {"effort": "low"})
 
     def test_legacy_json_control_restores_raw_schema_and_required_import(self):
         path, body = benchmark.build_request(

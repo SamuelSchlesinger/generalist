@@ -48,7 +48,7 @@ def recheck_attempt(
         return derived
     if transport == "responses_custom":
         code, extraction = benchmark.extract_responses_code(response)
-    elif transport in {"json_tool", "json_tool_legacy", "plain_text"}:
+    elif transport in benchmark.CHAT_TRANSPORTS:
         code, extraction = benchmark.extract_chat_code(response, transport)
     else:
         derived["recheck_note"] = f"unknown transport: {transport}"
@@ -57,7 +57,7 @@ def recheck_attempt(
         benchmark.check_source(
             code,
             task["expected_calls"],
-            bridge_preloaded=bridge_preloaded and transport != "json_tool_legacy",
+            bridge_preloaded=bridge_preloaded and transport not in benchmark.LEGACY_TRANSPORTS,
         )
         if code is not None
         else None

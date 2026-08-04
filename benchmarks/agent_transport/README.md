@@ -6,17 +6,26 @@ the requested runtime values?
 
 Generalist currently exposes code mode as an OpenAI-style function with a JSON
 object argument, `{ "code": "..." }`. That forces the model's tool-call channel
-to represent Python inside a JSON string. The benchmark compares that boundary
-with two controls:
+to represent Python inside a JSON string. The benchmark compares several
+request profiles and controls:
 
-- `json_tool`: the current JSON object wrapper on `/chat/completions`;
-- `json_tool_legacy`: the same wrapper with the former mandatory import and
+- `json_tool`: the current JSON object wrapper on `/chat/completions`, with the
+  Python function forced as a transport stress profile;
+- `json_tool_implicit`: the same wrapper with tool selection omitted, matching
+  Generalist's production OpenAI-compatible request semantics;
+- `json_tool_legacy`: the forced wrapper with the former mandatory import and
   verbose raw-schema prompt, retained as a pinned before/after control;
 - `plain_text`: raw Python in assistant text, which isolates code generation
   from tool-call serialization but is not a suitable production capability
   boundary; and
 - `responses_custom`: an OpenAI Responses custom tool whose input is freeform
-  text. Provider support is probed, never assumed.
+text. Provider support is probed, never assumed.
+
+The forced profile isolates argument generation by ensuring the provider must
+return the Python tool. It is not byte-for-byte production traffic: Generalist
+advertises its tools without `tool_choice` or `parallel_tool_calls`. The
+implicit profile measures that additional model decision and may therefore
+fail because the model answers in text instead of calling Python.
 
 The checker parses generated source with Python's AST and compares bridge call
 names, order, and runtime literal values with the corpus. It deliberately does
@@ -80,6 +89,7 @@ python3 benchmarks/agent_transport/run.py \
   --model moonshotai/kimi-k3 \
   --tag smoke \
   --transport json_tool \
+  --transport json_tool_implicit \
   --transport plain_text \
   --reasoning-effort low
 
@@ -87,7 +97,7 @@ python3 benchmarks/agent_transport/run.py \
   --provider openrouter \
   --model qwen/qwen3.8-max \
   --tag smoke \
-  --transport json_tool \
+  --transport json_tool_implicit \
   --transport plain_text \
   --reasoning-effort low
 ```
