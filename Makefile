@@ -1,10 +1,10 @@
 SHELL := /bin/sh
 
-.PHONY: check lint test fmt format-staged clippy shellcheck traceability memory-research hooks-check tla conformance setup hooks tla-tools doctor
+.PHONY: check lint test fmt format-staged clippy shellcheck traceability memory-research agent-benchmarks hooks-check tla conformance setup hooks tla-tools doctor
 
 check: lint test
 
-lint: fmt clippy shellcheck traceability memory-research hooks-check tla
+lint: fmt clippy shellcheck traceability memory-research agent-benchmarks hooks-check tla
 
 test:
 	cargo test --all-targets --all-features --locked
@@ -32,6 +32,9 @@ memory-research:
 	PYTHONDONTWRITEBYTECODE=1 python3 docs/research/agent-memory/systems/data/check_corpus.py
 	PYTHONDONTWRITEBYTECODE=1 python3 docs/research/agent-memory/safety-evaluation/data/validate-branch.py
 	PYTHONDONTWRITEBYTECODE=1 python3 docs/research/agent-memory/data/validate_corpus.py
+
+agent-benchmarks:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks/agent_transport -p 'test_*.py'
 
 hooks-check:
 	test -x .githooks/pre-commit

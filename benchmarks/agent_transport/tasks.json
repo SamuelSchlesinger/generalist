@@ -1,0 +1,263 @@
+{
+  "schema_version": 1,
+  "description": "Deterministic code-transport tasks for the Generalist model-facing Python boundary.",
+  "tool_catalog": {
+    "record_text": {
+      "description": "Record text exactly as supplied and return a short receipt.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string" }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      }
+    },
+    "store_json": {
+      "description": "Store a JSON-compatible document exactly as supplied.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "document": { "type": "object" }
+        },
+        "required": ["document"],
+        "additionalProperties": false
+      }
+    },
+    "run_process": {
+      "description": "Run a process from an argv array without a shell.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "argv": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["argv"],
+        "additionalProperties": false
+      }
+    },
+    "apply_patch": {
+      "description": "Apply one patch supplied as literal patch text.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "patch": { "type": "string" }
+        },
+        "required": ["patch"],
+        "additionalProperties": false
+      }
+    },
+    "record_query": {
+      "description": "Record a regular expression and SQL query exactly as supplied.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "pattern": { "type": "string" },
+          "query": { "type": "string" }
+        },
+        "required": ["pattern", "query"],
+        "additionalProperties": false
+      }
+    },
+    "fetch": {
+      "description": "Fetch a fixture value by key and return it as text. It may raise RuntimeError.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" }
+        },
+        "required": ["key"],
+        "additionalProperties": false
+      }
+    },
+    "publish": {
+      "description": "Publish a synthesized body with the number of source values used.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "body": { "type": "string" },
+          "source_count": { "type": "integer" }
+        },
+        "required": ["body", "source_count"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "tasks": [
+    {
+      "id": "simple_ascii",
+      "tags": ["smoke", "literal"],
+      "instruction": "Record the exact text `agent transport works`.",
+      "available_tools": ["record_text"],
+      "expected_calls": [
+        {
+          "name": "record_text",
+          "arguments": { "text": "agent transport works" }
+        }
+      ]
+    },
+    {
+      "id": "quotes_unicode",
+      "tags": ["smoke", "escaping", "unicode"],
+      "instruction": "Record the exact text shown in the required call. Preserve every quote, backslash, newline, Unicode character, dollar sign, brace, and backtick.",
+      "available_tools": ["record_text"],
+      "expected_calls": [
+        {
+          "name": "record_text",
+          "arguments": {
+            "text": "He said, \"don't escape this\": C:\\tmp\\agent\nSnowman ☃; emoji 🧪; ${HOME}; `ticks`."
+          }
+        }
+      ]
+    },
+    {
+      "id": "nested_document",
+      "tags": ["smoke", "escaping", "structured"],
+      "instruction": "Store the exact nested document shown in the required call. Use Python values that preserve the JSON booleans and null value.",
+      "available_tools": ["store_json"],
+      "expected_calls": [
+        {
+          "name": "store_json",
+          "arguments": {
+            "document": {
+              "title": "She said \"ship it\"",
+              "paths": ["C:\\tmp\\agent", "/tmp/a b"],
+              "enabled": true,
+              "note": "line 1\nline 2 ☃",
+              "nothing": null
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "argv_no_shell",
+      "tags": ["smoke", "escaping", "process"],
+      "instruction": "Call the process tool with the exact argv shown in the required call. Do not join it into a shell command and do not expand shell syntax.",
+      "available_tools": ["run_process"],
+      "expected_calls": [
+        {
+          "name": "run_process",
+          "arguments": {
+            "argv": [
+              "python3",
+              "-c",
+              "print(\"$HOME\", r'C:\\tmp\\x')",
+              "--label",
+              "a b",
+              "--literal",
+              "$(uname)"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "unified_diff",
+      "tags": ["smoke", "escaping", "patch"],
+      "instruction": "Submit the exact multi-line patch shown in the required call. Do not rewrite or normalize it.",
+      "available_tools": ["apply_patch"],
+      "expected_calls": [
+        {
+          "name": "apply_patch",
+          "arguments": {
+            "patch": "*** Begin Patch\n*** Update File: demo.py\n@@\n-print(\"old\")\n+print(\"new: \\\"quoted\\\"\")\n+path = r\"C:\\tmp\\agent\"\n*** End Patch"
+          }
+        }
+      ]
+    },
+    {
+      "id": "regex_and_sql",
+      "tags": ["escaping", "backslashes"],
+      "instruction": "Record the exact regular expression and SQL query shown in the required call.",
+      "available_tools": ["record_query"],
+      "expected_calls": [
+        {
+          "name": "record_query",
+          "arguments": {
+            "pattern": "^(?P<name>[\\w.-]+)@(?P<host>[\\w.-]+)$",
+            "query": "SELECT path, note FROM files WHERE path = 'C:\\tmp\\x' AND note LIKE '%\"quoted\"%';"
+          }
+        }
+      ]
+    },
+    {
+      "id": "delimiter_collision",
+      "tags": ["escaping", "multiline"],
+      "instruction": "Record the exact Markdown-like text shown in the required call, including both kinds of triple quote delimiters.",
+      "available_tools": ["record_text"],
+      "expected_calls": [
+        {
+          "name": "record_text",
+          "arguments": {
+            "text": "Markdown fence:\n```python\nprint(\"hello\")\n```\nTriple single: '''; triple double: \"\"\"; backtick: `."
+          }
+        }
+      ]
+    },
+    {
+      "id": "batch_mixed_payloads",
+      "tags": ["batching", "escaping"],
+      "instruction": "Make the three required bridge calls in order from one script. Do not combine or omit them.",
+      "available_tools": ["record_text", "run_process", "store_json"],
+      "expected_calls": [
+        {
+          "name": "record_text",
+          "arguments": { "text": "first\\second\nthird" }
+        },
+        {
+          "name": "run_process",
+          "arguments": { "argv": ["printf", "%s\\n", "a b", "'quoted'"] }
+        },
+        {
+          "name": "store_json",
+          "arguments": {
+            "document": { "ok": true, "items": [1, 2, 3], "tail": null }
+          }
+        }
+      ]
+    },
+    {
+      "id": "dependent_synthesis",
+      "tags": ["batching", "dataflow"],
+      "instruction": "In one script, fetch `alpha` and `beta` in that order, join their returned text with one newline, then publish that body with source_count=2. Do not print the fetched values.",
+      "available_tools": ["fetch", "publish"],
+      "expected_calls": [
+        {
+          "name": "fetch",
+          "arguments": { "key": "alpha" }
+        },
+        {
+          "name": "fetch",
+          "arguments": { "key": "beta" }
+        },
+        {
+          "name": "publish",
+          "arguments": { "body": { "$any": true }, "source_count": 2 }
+        }
+      ]
+    },
+    {
+      "id": "explicit_retry",
+      "tags": ["control_flow", "recovery"],
+      "instruction": "In one script, try fetch(key=`primary`). If and only if it raises RuntimeError, fetch(key=`backup`) instead. Publish the obtained body with source_count=1.",
+      "available_tools": ["fetch", "publish"],
+      "expected_calls": [
+        {
+          "name": "fetch",
+          "arguments": { "key": "primary" }
+        },
+        {
+          "name": "fetch",
+          "arguments": { "key": "backup" }
+        },
+        {
+          "name": "publish",
+          "arguments": { "body": { "$any": true }, "source_count": 1 }
+        }
+      ]
+    }
+  ]
+}
