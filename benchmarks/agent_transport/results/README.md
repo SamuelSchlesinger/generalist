@@ -75,3 +75,21 @@ three JSON repetitions produced the identical ordered task/classification/code
 digest
 `16443d8fa3e9d8a4145eecd5ad78fd1ea727fe02e786aa82409b797c827005ea`,
 confirming that this Ollama route honored the pinned controls for this corpus.
+
+## Pinned legacy transport control
+
+`20260804T231555Z-...jsonl` directly compares the preloaded, compact-signature
+JSON transport with a control that requires `import tools` and supplies the
+verbose raw JSON schema. Both passed 7/10 at `temperature=0`, `seed=1`, so this
+run provides no evidence of an exact-call pass-rate improvement. The compact
+transport had a 2,161.3 ms median latency versus 2,792.2 ms for the legacy
+control, and 22 versus 38 median bytes of model-payload overhead. Those timing
+figures come from one alternated local run and may include warm-cache or order
+effects; they are engineering observations, not a model-level performance
+claim.
+
+The compact route failed with two argument mismatches and one ignored tool
+call. The legacy route ignored the tool call three times. This distinction is
+still operationally useful: bridge preloading removes a real missing-import
+runtime failure mode, while the benchmark shows that generation correctness
+remains a separate problem.
