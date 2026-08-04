@@ -752,6 +752,7 @@ name = "generalist"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "colored",
  "crossterm",

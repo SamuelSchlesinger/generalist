@@ -73,8 +73,15 @@ persistence in `src/state.rs`, plus every change to `src/memory.rs`,
    mode, echo/canonical input, bracketed paste, and the alternate screen were
    restored. Exercise `F3` while the fake provider advances: mouse selection
    must work, the captured frame must stay frozen, and the accumulated state
-   must appear after `F3` resumes. Inject a bracketed Unicode paste after
-   resuming and inspect the intercepted request. Exercise `F4` both with live
+   must appear after `F3` resumes. Re-enter with `/copy select` and verify Esc
+   follows the same resume path. Capture `/copy last` and `/copy all` output at
+   the PTY boundary, decode the OSC 52 payload, and compare it with committed
+   history; do not treat emission as proof that a real terminal accepted the
+   clipboard write. Inject a bracketed Unicode paste after resuming and inspect
+   the intercepted request. During a bursty response, open `Ctrl+F`, enter and
+   paste Unicode queries, move among duplicate matches while new text arrives,
+   and jump to an early wrapped entry. Confirm provider progress continues and
+   search causes no queue, history, or autosave mutation. Exercise `F4` both with live
    provider reasoning and with no reasoning field; answer text must stay out of
    the inspector, reasoning must stay out of conversation text, and provider
    signatures/redacted payloads must never render.

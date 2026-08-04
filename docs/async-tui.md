@@ -40,6 +40,9 @@ There are two intentionally different ways to submit while the agent is busy:
 | `F2` | Open queue manager | Open queue manager |
 | `F3` | Toggle native terminal copy mode | Toggle native terminal copy mode without stopping provider/tool progress |
 | `F4` | Inspect provider-supplied reasoning | Inspect live provider-supplied reasoning |
+| `Ctrl+F` | Search visible conversation entries and jump to a match | Search the live transcript while provider/tool work continues |
+| `/copy last` or `/copy all` | Send committed text to the terminal clipboard | Queue the local command until the active turn settles |
+| `/copy select` | Enter native terminal copy mode | Queue the local command; F3 remains the immediate copy-mode shortcut |
 | `Esc` | Clear/close the current UI layer | Interrupt the active turn when no modal owns the key |
 
 Modal input takes priority. In particular, Esc on a permission modal means
@@ -151,18 +154,40 @@ follow-latest reaches the real bottom. Mouse input belongs to the active modal:
 it scrolls permission details or a long queue selection instead of changing
 the obscured conversation.
 
+`Ctrl+F` opens a display-only, case-insensitive search over the sanitized
+conversation entries already held by the TUI: user and assistant text plus
+visible informational/error events. The query is a single-line Unicode editor;
+pasted line breaks become spaces. Match identity is the entry index rather than
+the preview text, so duplicate bodies remain distinct and appending a new event
+does not move the selected result. Enter closes the modal and schedules one
+render-time jump. That render uses Ratatui's word wrapper on the exact entry
+prefix to compute the target top row, preserving the same wrapping semantics as
+ordinary scrolling. Search query, match selection, and pending jump are not
+conversation history, queue state, episodic memory, or autosave data. Tool
+activity and provider reasoning retain their separate inspectors.
+
 ### Copy mode and reasoning inspection
 
-`F3` is a terminal-ownership mode, not a runtime pause. On entry the UI releases
-mouse capture, draws a visible `display paused` banner, hides the composer
-cursor, and then freezes Ratatui redraws. The terminal can therefore perform
-native selection and its usual copy shortcut without a frame erasing the
-selection. All application input except `F3` is suspended while this mode owns
-the screen. The same reactor continues polling the provider/tool future,
-permission channel, and frame clock; events update in-memory state and mark the
-frame dirty. On the second `F3`, mouse capture is restored and one frame redraws
-the accumulated state. Bracketed paste remains enabled and is accepted by the
-composer after copy mode closes.
+`/copy` (equivalently `/copy last`) sends the latest committed assistant text
+to the host terminal with an OSC 52 clipboard request; `/copy all` sends a
+plain transcript of committed user/assistant text. Tool payloads, provider
+reasoning, and host-authored goal continuations are structurally excluded.
+Text is base64 encoded before entering the control sequence and requests are
+size-bounded. The command is a user-triggered write only: Generalist never
+reads ambient clipboard contents. A successful write proves that the request
+reached the terminal, not that terminal policy accepted it.
+
+`F3` or idle `/copy select` enters a terminal-ownership mode, not a runtime
+pause. On entry the UI releases mouse capture, draws a visible `display paused`
+banner, hides the composer cursor, and then freezes Ratatui redraws. The
+terminal can therefore perform native selection and its usual copy shortcut
+without a frame erasing the selection. All application input except explicit
+resume (`F3` or `Esc`) is suspended while this mode owns the screen. The same
+reactor continues polling the provider/tool future, permission channel, and
+frame clock; events update in-memory state and mark the frame dirty. On resume,
+mouse capture is restored and one frame redraws the accumulated state.
+Bracketed paste remains enabled and is accepted by the composer after copy mode
+closes.
 
 `F4` opens a scrollable, follow-latest view of model reasoning. Its data boundary
 is deliberately narrower than “the agent's thoughts”: it contains only fields
@@ -322,7 +347,8 @@ The alternate screen, mouse capture, bracketed paste, cursor, and raw mode have
 one cleanup path. Startup failures after any partial terminal initialization use
 that path too, rather than returning with the terminal stranded in raw mode.
 Copy mode temporarily disables only mouse capture; terminal cleanup disables it
-again unconditionally, so exiting from either copy state is safe.
+again unconditionally, so exiting from either copy state is safe. OSC 52 copy
+requests do not alter terminal input modes or the conversation runtime.
 Ratatui display strings are sanitized at their entry boundary: ESC and other
 control bytes become visible control pictures, while newlines remain newlines.
 This applies to provider/model labels, assistant and tool output, queue text,
@@ -421,9 +447,15 @@ the Rust and shell validation.
   animation continue, but ordinary composition resumes after the decision.
 - Copy mode intentionally suspends application input and visual updates so the
   host terminal can own selection. Runtime work continues, but a permission
-  request that arrives in copy mode cannot be answered until `F3` resumes the
-  display. TLA+ liveness assumes the user eventually resumes; the implementation
-  cannot force that environmental action.
+  request that arrives in copy mode cannot be answered until `F3` or `Esc`
+  resumes the display. TLA+ liveness assumes the user eventually resumes; the
+  implementation cannot force that environmental action.
+- OSC 52 is intentionally a best-effort terminal request. Generalist can prove
+  it emitted one complete, bounded request but cannot observe whether the
+  terminal accepted, ignored, truncated, or redirected the clipboard write.
+- Conversation search intentionally covers the TUI's visible conversation
+  entries, not tool-activity payloads, provider reasoning, or archived sessions
+  outside the currently loaded conversation.
 - Reasoning inspection is provider-dependent and is not a faithful transcript
   of hidden model computation. Providers may omit, summarize, redact, or
   transform reasoning before exposing it.

@@ -5,12 +5,13 @@ use generalist::provider::{
 use generalist::tools::*;
 use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
-    default_memory_path, history_tool_protocol_is_valid, is_local_command, parse_local_command,
-    truncate_middle, Agent, AgentEvent, DeliveryMode, Episode, EpisodeEvent, EpisodeOutcome,
-    EpisodicMemory, Error, ForgetResult, GoalCommand, HistoryStore, LocalCommand, MemoryCommand,
-    MemoryEvent, MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt, PermissionChoice,
-    PermissionRequest, PermissionUiEvent, PromptQueue, PromptSource, Result, SavedState,
-    ToolRegistry, TurnControl, TurnOutcome, WorkspaceScope,
+    conversation_transcript, default_memory_path, history_tool_protocol_is_valid, is_local_command,
+    latest_assistant_text, parse_local_command, truncate_middle, Agent, AgentEvent, CopyCommand,
+    DeliveryMode, Episode, EpisodeEvent, EpisodeOutcome, EpisodicMemory, Error, ForgetResult,
+    GoalCommand, HistoryStore, LocalCommand, MemoryCommand, MemoryEvent, MemoryPermissionHandler,
+    MessageOrigin, PermissionBrokerPrompt, PermissionChoice, PermissionRequest, PermissionUiEvent,
+    PromptQueue, PromptSource, Result, SavedState, ToolRegistry, TurnControl, TurnOutcome,
+    WorkspaceScope,
 };
 use std::env;
 use std::fs;
@@ -1196,6 +1197,32 @@ async fn execute_command(
                     }
                     Err(error) => ui.error(&format!("Failed to switch model: {error}")),
                 }
+            }
+        }
+        LocalCommand::Copy(CopyCommand::Select) => terminal(ui.enter_copy_mode())?,
+        LocalCommand::Copy(copy) => {
+            let (payload, empty_message) = match copy {
+                CopyCommand::Last => (
+                    latest_assistant_text(agent.history()),
+                    "No committed assistant response to copy.",
+                ),
+                CopyCommand::All => (
+                    conversation_transcript(agent.history()),
+                    "No committed conversation text to copy.",
+                ),
+                CopyCommand::Select => unreachable!("selection copy handled above"),
+            };
+            if let Some(payload) = payload {
+                match ui.request_clipboard_copy(&payload) {
+                    Ok(bytes) => ui.info(&format!(
+                        "Sent {bytes} bytes to the terminal clipboard via OSC 52. If the terminal blocks it, use /copy select."
+                    )),
+                    Err(error) => ui.error(&format!(
+                        "Clipboard request failed: {error}. Use /copy select for native selection."
+                    )),
+                }
+            } else {
+                ui.info(empty_message);
             }
         }
         LocalCommand::Goal(GoalCommand::Edit) => {

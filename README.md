@@ -104,14 +104,25 @@ Keyboard and mouse controls:
 - `PageUp`/`PageDown` or the mouse wheel scroll the conversation. A paused
   viewport stays anchored while new text streams; scrolling to the bottom
   resumes follow-latest.
+- `Ctrl+F` opens a live, case-insensitive search over visible conversation
+  entries, including informational and error messages. Type or paste a query,
+  use `Up`/`Down`, `Tab`, or the mouse wheel to choose a match, and press
+  `Enter` to jump to its exact wrapped position. Search remains responsive
+  while a turn runs and never enters model history or durable state.
 - `F2` opens the queue manager: edit, delete, change steer/follow-up mode,
   reorder, or restore a queued message. The mouse wheel moves long queue
   selections. `Alt+Up` restores the latest queued message directly to an empty
   composer; restore never overwrites an unsent draft.
-- `F3` enters native terminal copy mode. Mouse capture and redraws pause so you
-  can select text and use the terminal's normal copy shortcut. Provider/tool
-  work continues in memory; press `F3` again to resume and redraw the latest
-  state. Normal terminal paste works in the composer after copy mode is closed.
+- `/copy` or `/copy last` sends the latest committed assistant response to the
+  terminal clipboard with OSC 52; `/copy all` sends the committed plain-text
+  conversation. Terminals may disable OSC 52 by policy, so the status message
+  points to native selection rather than claiming that every terminal accepted
+  the request. Clipboard contents are never read by Generalist.
+- `F3` or `/copy select` enters native terminal copy mode. Mouse capture and
+  redraws pause so you can select text and use the terminal's normal copy
+  shortcut. Provider/tool work continues in memory; press `F3` or `Esc` to
+  resume and redraw the latest state. Normal terminal paste works in the
+  composer after copy mode is closed.
 - `F4` opens the live model-reasoning inspector. It shows only inspectable
   reasoning fields actually supplied by the provider, separately from answer
   text, and says so explicitly when a request supplies none. Provider

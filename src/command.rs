@@ -35,6 +35,16 @@ pub enum MemoryCommand<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyCommand {
+    /// Copy the most recent committed assistant text through OSC 52.
+    Last,
+    /// Copy the complete committed user/assistant transcript through OSC 52.
+    All,
+    /// Hand mouse selection to the native terminal.
+    Select,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalCommand<'a> {
     Exit,
     Help,
@@ -43,6 +53,7 @@ pub enum LocalCommand<'a> {
     Save,
     Load,
     Model,
+    Copy(CopyCommand),
     Goal(GoalCommand<'a>),
     Memory(MemoryCommand<'a>),
     Unknown(&'a str),
@@ -65,6 +76,7 @@ enum CommandKind {
     Save,
     Load,
     Model,
+    Copy,
     Goal,
     Memory,
 }
@@ -114,6 +126,12 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         kind: CommandKind::Compact,
     },
     CommandSpec {
+        name: "/copy",
+        usage: "/copy [last|all|select]",
+        description: "copy response/transcript or select text",
+        kind: CommandKind::Copy,
+    },
+    CommandSpec {
         name: "/clear",
         usage: "/clear",
         description: "clear conversation history",
@@ -149,7 +167,11 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
         return Some(LocalCommand::Unknown(trimmed));
     };
 
-    if !matches!(spec.kind, CommandKind::Goal | CommandKind::Memory) && !arguments.is_empty() {
+    if !matches!(
+        spec.kind,
+        CommandKind::Goal | CommandKind::Memory | CommandKind::Copy
+    ) && !arguments.is_empty()
+    {
         return Some(LocalCommand::Unknown(trimmed));
     }
 
@@ -161,6 +183,21 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
         CommandKind::Save => LocalCommand::Save,
         CommandKind::Load => LocalCommand::Load,
         CommandKind::Model => LocalCommand::Model,
+        CommandKind::Copy => {
+            let copy = if arguments.is_empty() || arguments.eq_ignore_ascii_case("last") {
+                Some(CopyCommand::Last)
+            } else if arguments.eq_ignore_ascii_case("all") {
+                Some(CopyCommand::All)
+            } else if arguments.eq_ignore_ascii_case("select") {
+                Some(CopyCommand::Select)
+            } else {
+                None
+            };
+            match copy {
+                Some(copy) => LocalCommand::Copy(copy),
+                None => LocalCommand::Unknown(trimmed),
+            }
+        }
         CommandKind::Goal => {
             let goal = if arguments.is_empty() || arguments.eq_ignore_ascii_case("edit") {
                 GoalCommand::Edit
@@ -287,6 +324,30 @@ mod tests {
         assert_eq!(
             parse_local_command("/memory export elsewhere"),
             Some(LocalCommand::Unknown("/memory export elsewhere"))
+        );
+    }
+
+    #[test]
+    fn copy_commands_are_explicit_and_reject_unknown_targets() {
+        assert_eq!(
+            parse_local_command("/copy"),
+            Some(LocalCommand::Copy(CopyCommand::Last))
+        );
+        assert_eq!(
+            parse_local_command("/COPY last"),
+            Some(LocalCommand::Copy(CopyCommand::Last))
+        );
+        assert_eq!(
+            parse_local_command("/copy all"),
+            Some(LocalCommand::Copy(CopyCommand::All))
+        );
+        assert_eq!(
+            parse_local_command("/copy select"),
+            Some(LocalCommand::Copy(CopyCommand::Select))
+        );
+        assert_eq!(
+            parse_local_command("/copy something-else"),
+            Some(LocalCommand::Unknown("/copy something-else"))
         );
     }
 

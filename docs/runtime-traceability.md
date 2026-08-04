@@ -21,8 +21,13 @@ the TUI refines that environment by disabling some user transitions; it never
 adds an enqueue transition forbidden by the model. Local commands, goal
 editing, manual save/load/compaction, startup tool discovery, and provider
 selection execute only outside a mutation-capable turn and are reviewed
-separately for that ownership guard. Goal text, active/completed status,
-prompt/message provenance, and other provider payloads are hidden data in this model. Setting or
+separately for that ownership guard. `/copy last` and `/copy all` are hidden,
+explicit write-only terminal effects; `/copy select` refines `EnterCopyMode`.
+Goal text, active/completed status, conversation-search query/selection,
+prompt/message provenance, and other provider payloads are hidden data in this
+model. `Ctrl+F` scans only sanitized in-memory `ChatEntry` values and computes
+one wrapped-row viewport jump; it cannot mutate or disclose model history, the
+prompt queue, tool payloads, reasoning, or archived sessions. Setting or
 clearing only the objective refines a TLA+ stutter step; scheduling a
 host-authored continuation linearizes to `Enqueue`, and the permission-free
 completion control linearizes to `CompleteTool` plus a hidden goal-state
@@ -103,8 +108,8 @@ same-UID Python, shell, file access, or direct filesystem access.
 | `DeleteQueued` | Queue modal deletion routes the selected stable ID to `PromptQueue::delete`. Restore is the same modeled removal plus a display-only move into an empty composer; it is refused over an existing draft. | `queue_manager_mutations_address_stable_ids`, `restoring_queue_text_never_overwrites_a_draft` |
 | `ReclassifyQueued` | Queue modal `s` calls `PromptQueue::toggle_delivery`; idle cannot create a steer. | `queue_manager_mutations_address_stable_ids`, `ending_turn_normalizes_undelivered_steers` |
 | `MoveQueuedEarlier` | Queue modal Ctrl+Up/Down calls `PromptQueue::move_by` by ID. | `queue_manager_mutations_address_stable_ids` |
-| `EnterCopyMode` | F3 is intercepted before modal/composer dispatch, disables mouse capture, sets `copy_mode`, draws the paused banner once, and then suppresses application input/redraws. | `copy_mode_banner_explains_that_rendering_is_paused`; exact-binary PTY copy test |
-| `ExitCopyMode` | The next F3 reenables mouse capture, clears `copy_mode`, and performs one immediate redraw of state accumulated by the still-polled runtime. | `copy_mode_banner_explains_that_rendering_is_paused`; exact-binary PTY progress test |
+| `EnterCopyMode` | F3 is intercepted before modal/composer dispatch; idle `/copy select` calls the same transition without relying on a function key. Both disable mouse capture, set `copy_mode`, draw the paused banner once, and then suppress application input/redraws. OSC 52 `/copy last|all` requests do not change this state. | `copy_mode_banner_explains_that_rendering_is_paused`, `copy_mode_can_always_resume_with_escape_without_stealing_idle_escape`; exact-binary PTY copy test |
+| `ExitCopyMode` | F3 or Esc reenables mouse capture, clears `copy_mode`, and performs one immediate redraw of state accumulated by the still-polled runtime. Idle Esc retains its existing editor behavior. | `copy_mode_banner_explains_that_rendering_is_paused`, `copy_mode_can_always_resume_with_escape_without_stealing_idle_escape`; exact-binary PTY progress test |
 | `DispatchFollowUp` | The idle outer loop calls `claim_follow_up` once; it never scans past a non-follow-up head. | `followups_dispatch_one_at_a_time_in_fifo_order` |
 | `CommitStart` | Without an await, the controller calls `Agent::begin_turn`, commits the `PromptClaim`, and atomically writes the started history plus remaining queue. | `dropped_claim_rolls_back_and_commit_removes`; source-order review in `main` |
 | `RequeueStart` | Dropping an uncommitted `PromptClaim` restores the same ID at the front. Production start is currently infallible between claim and commit; the action over-approximates unwinding and future fallible setup. | `dropped_claim_rolls_back_and_commit_removes` |
@@ -116,7 +121,7 @@ same-UID Python, shell, file access, or direct filesystem access.
 | `AskPermission` | `PermissionBrokerPrompt::choose` allocates a monotonic request ID, sends one `PermissionRequest`, and awaits its one-shot. | `broker_correlates_the_ui_reply_with_its_request` |
 | `AllowPermission` | The reactor sends the choice only when the modal ID equals the live request ID; the handler records `AllowAlways` before execution. | `broker_request_ids_keep_out_of_order_replies_correlated`, `memory_handler_remembers_decisions_without_prompting` |
 | `DenyPermission` | A denial becomes a structured denied result. Denials inside code-mode bridge calls propagate through `ScriptResult::denied` even if Python exits successfully. | `dropped_broker_reply_denies_instead_of_hanging`, `denial_inside_code_mode_pauses_the_outer_turn` |
-| `PermissionResolution` (fairness action) | This is the union of allow/deny, not another Rust transition. Both choices are unavailable while F3 owns input and become available again on resume. | broker correlation tests; exact-binary permission-during-copy PTY trace |
+| `PermissionResolution` (fairness action) | This is the union of allow/deny, not another Rust transition. Both choices are unavailable while copy mode owns input and become available again on F3/Esc resume. | broker correlation tests; exact-binary permission-during-copy PTY trace |
 | `ClaimSteering` | At a history-valid boundary, `PromptQueue::claim_steering` removes all visible steers, preserves their relative order, and leaves follow-ups. | `steering_claim_preserves_relative_order_and_followups` |
 | `CommitSteering` | `Agent::commit_steering` appends claimed text to the valid user boundary, commits IDs, emits `SteeringCommitted`, and checkpoints with no await between those operations. | `steering_queued_during_final_response_gets_another_model_call` |
 | `RequeueSteering` | Dropping an uncommitted steering claim restores the same IDs at the front. Normal commit contains no fallible/await boundary. | `dropped_steering_claim_restores_the_same_ids_at_the_front` |
@@ -142,7 +147,7 @@ same-UID Python, shell, file access, or direct filesystem access.
 | `SettledPromptsAreCommitted` | The controller records the initial user message before `PromptClaim::commit`; interrupted and ordinary outcomes therefore refer to a committed follow-up. |
 | `HistoryOrderHasStableIds` | Queue claims and `SteeringCommitted` preserve stable-ID order. `committedOrder` is a model ghost variable, verified through claim/event tests rather than stored in model-visible text. |
 | `EveryBusyPeriodSettles` | TLC checks settlement for the finite bounds under weakly fair agent progress, weakly fair copy exit, and strongly fair permission resolution when its UI is available infinitely often. Rust bounds provider rounds/retries and keeps polling them during copy mode; permission input waits for resume. External tools/providers, a user who never resumes, or a user who never answers remain environmental blockers. |
-| `CopyModeEventuallyResumes` | `WF_vars(ExitCopyMode)` makes the environmental assumption explicit rather than silently proving liveness through a permanently disabled terminal. The PTY test verifies the concrete exit path; it cannot force a real user to press F3. |
+| `CopyModeEventuallyResumes` | `WF_vars(ExitCopyMode)` makes the environmental assumption explicit rather than silently proving liveness through a permanently disabled terminal. The PTY test verifies both concrete resume keys; it cannot force a real user to resume. |
 
 ## Episodic-memory model mapping
 
@@ -617,3 +622,51 @@ fresh identity and follow-up delivery; `update_goal` is `CompleteTool` plus a
 hidden state mutation; normal settlement followed by scheduling linearizes to
 `SettleTurn` then `Enqueue`. The updated action comments and matrices record
 those refinement points explicitly.
+
+## 2026-08-04 clipboard interaction refinement audit
+
+The exact rebuilt debug binary ran in an isolated 100×30 PTY against a local
+OpenAI-compatible SSE fixture. After one committed Unicode response, `/copy
+last` emitted one complete OSC 52 request whose decoded payload exactly matched
+the assistant text. `/copy all` decoded to the exact labeled user/assistant
+transcript. The fixture received no extra model request for either local
+command. Deterministic tests separately confirm that reasoning, redacted
+reasoning, tool arguments, tool results, and host-authored goal continuations
+do not enter clipboard payloads, while matching manually authored text remains.
+
+`/copy select` emitted the full mouse-capture disable sequence and froze the
+selection frame. A bare Esc emitted the mouse-capture enable sequence and
+redrew the live UI, exercising the same modeled `ExitCopyMode` transition as
+F3 without changing idle Esc behavior. After resumption, a bracketed multiline
+Unicode paste reached the second intercepted provider request byte-for-byte.
+Normal exit disabled bracketed paste and left the alternate screen. These
+checks establish emitted bytes and concrete TUI transitions; they do not prove
+that an arbitrary terminal's OSC 52 policy accepts a clipboard write.
+
+## 2026-08-04 conversation-search refinement audit
+
+The exact rebuilt debug binary ran in an isolated 100×30 PTY against a
+loopback OpenAI-compatible SSE fixture. An early response was long enough to
+leave the viewport and a second response streamed a duplicate Unicode marker.
+While that second stream was stalled, `Ctrl+F` accepted a bracketed multiline
+Unicode paste as one single-line query, reported both matching assistant
+entries, and moved selection between them. The scoped autosave was byte-for-byte
+unchanged while search owned the terminal and the provider was stalled.
+
+The fixture then completed the response while the search modal remained open;
+the settled assistant text reached the autosave without closing the modal.
+Selecting the earlier result restored its first wrapped row to the physical
+terminal. Exactly two provider requests occurred, the deliberately mixed-case
+search spelling appeared in neither request nor final autosave, the queue was
+empty, and normal exit disabled bracketed paste and left the alternate screen.
+Deterministic rendering tests separately calculate the selected entry's start
+with Ratatui's actual wrapping and assert the viewport lands on that exact row;
+other tests cover case-insensitive matching, stable entry identity during live
+appends, modal mouse ownership, and Unicode paste normalization.
+
+Conversation-search query, selection, and the derived viewport jump remain
+hidden display data in `AsyncRuntime.tla`: input ownership suppresses concrete
+queue/cancel actions while the modal is open, but provider/tool transitions
+continue. Search reads only sanitized in-memory `ChatEntry` values and has no
+path to provider history, queued prompts, tool payloads, reasoning, archived
+sessions, or durable writes.

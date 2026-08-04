@@ -11,9 +11,11 @@
 \*   * permission replies are correlated with a live request;
 \*   * cancellation pairs every outstanding tool use before returning idle.
 \*
-\* Idle local commands (including goal edits), goal text, terminal rendering,
-\* reasoning payloads, and other provider payloads are hidden data represented
-\* by stuttering steps.  Copy mode is the one terminal-rendering state modeled
+\* Idle local commands (including goal edits and OSC 52 clipboard writes), goal
+\* text, terminal rendering, conversation-search query/selection, reasoning
+\* payloads, and other provider payloads are hidden data represented by
+\* stuttering steps. `/copy select` instead refines EnterCopyMode. Copy mode is
+\* the one terminal-rendering state modeled
 \* explicitly: it gates user input and therefore participates in the liveness
 \* argument, while agent progress remains independent of it.
 \*
@@ -197,9 +199,10 @@ MoveQueuedEarlier(index) ==
                    failuresLeft>>
 
 \* Native terminal copy mode releases mouse capture and freezes application
-\* input/redraws. It never owns or changes protocol state. The UI reactor keeps
-\* polling AgentProgress, and weak fairness for ExitCopyMode states the user
-\* assumption required by the liveness property.
+\* input/redraws. F3 and idle `/copy select` are concrete entry gestures; F3
+\* and Esc are concrete exit gestures. It never owns or changes protocol state.
+\* The UI reactor keeps polling AgentProgress, and weak fairness for
+\* ExitCopyMode states the user assumption required by the liveness property.
 EnterCopyMode ==
     /\ ~copyMode
     /\ copyMode' = TRUE

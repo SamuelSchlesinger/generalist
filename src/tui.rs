@@ -1,5 +1,6 @@
 //! Full-screen Ratatui frontend for the interactive agent CLI.
 
+use crate::clipboard::write_osc52;
 use crate::command::COMMAND_SPECS;
 use crate::permissions::{PermissionChoice, ToolExecutionRequest};
 use crate::runtime::{DeliveryMode, PromptId, PromptQueue, PromptSource, QueuedPrompt};
@@ -65,6 +66,48 @@ struct ChatEntry {
     body: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ChatSearch {
+    query: String,
+    cursor: usize,
+    matches: Vec<usize>,
+    selected: usize,
+}
+
+impl ChatSearch {
+    fn refresh(&mut self, entries: &[ChatEntry]) {
+        let previously_selected = self.matches.get(self.selected).copied();
+        let needle = self.query.trim().to_lowercase();
+        self.matches = if needle.is_empty() {
+            Vec::new()
+        } else {
+            entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    let (label, _) = chat_kind_label(entry.kind);
+                    (label.to_lowercase().contains(&needle)
+                        || entry.body.to_lowercase().contains(&needle))
+                    .then_some(index)
+                })
+                .collect()
+        };
+        self.selected = previously_selected
+            .and_then(|entry| {
+                self.matches
+                    .iter()
+                    .position(|candidate| *candidate == entry)
+            })
+            .unwrap_or(0)
+            .min(self.matches.len().saturating_sub(1));
+        self.cursor = self.cursor.min(self.query.chars().count());
+    }
+
+    fn selected_entry(&self) -> Option<usize> {
+        self.matches.get(self.selected).copied()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReasoningEntry {
     timestamp: String,
@@ -116,6 +159,7 @@ enum Modal {
         selected: usize,
         editing: Option<QueueEditor>,
     },
+    Search(ChatSearch),
     Reasoning {
         scroll: usize,
         max_scroll: usize,
@@ -159,6 +203,7 @@ struct AppState {
     chat_scroll: usize,
     chat_max_scroll: usize,
     follow_latest: bool,
+    pending_chat_jump: Option<usize>,
     busy: bool,
     spinner_tick: usize,
     status: String,
@@ -192,6 +237,7 @@ impl AppState {
             chat_scroll: 0,
             chat_max_scroll: 0,
             follow_latest: true,
+            pending_chat_jump: None,
             busy: false,
             spinner_tick: 0,
             status: "Ready".to_string(),
@@ -211,6 +257,7 @@ impl AppState {
             timestamp: Self::timestamp(),
             body: sanitize_terminal_text(&body.into()),
         });
+        self.refresh_chat_search();
     }
 
     fn push_user(&mut self, body: impl Into<String>) {
@@ -235,6 +282,125 @@ impl AppState {
         self.chat_scroll = 0;
         self.chat_max_scroll = 0;
         self.follow_latest = true;
+        self.pending_chat_jump = None;
+        self.refresh_chat_search();
+    }
+
+    fn open_chat_search(&mut self) {
+        let mut search = ChatSearch::default();
+        search.refresh(&self.chat);
+        self.modal = Some(Modal::Search(search));
+    }
+
+    fn refresh_chat_search(&mut self) {
+        let entries = &self.chat;
+        if let Some(Modal::Search(search)) = &mut self.modal {
+            search.refresh(entries);
+        }
+    }
+
+    fn paste_chat_search(&mut self, text: &str) -> bool {
+        let entries = &self.chat;
+        let Some(Modal::Search(search)) = &mut self.modal else {
+            return false;
+        };
+        let text = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        insert_text(&mut search.query, &mut search.cursor, &text);
+        search.refresh(entries);
+        true
+    }
+
+    fn handle_chat_search_key(&mut self, key: KeyEvent) {
+        let Some(Modal::Search(mut search)) = self.modal.take() else {
+            return;
+        };
+        let mut query_changed = false;
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c' | 'f') => return,
+                KeyCode::Char('a') => search.cursor = 0,
+                KeyCode::Char('e') => search.cursor = search.query.chars().count(),
+                KeyCode::Char('u') => {
+                    search.query.clear();
+                    search.cursor = 0;
+                    query_changed = true;
+                }
+                KeyCode::Char('k') => {
+                    truncate_at_char(&mut search.query, search.cursor);
+                    query_changed = true;
+                }
+                KeyCode::Char('w') => {
+                    delete_previous_word(&mut search.query, &mut search.cursor);
+                    query_changed = true;
+                }
+                KeyCode::Char('p') => search.selected = search.selected.saturating_sub(1),
+                KeyCode::Char('n') => {
+                    search.selected = search
+                        .selected
+                        .saturating_add(1)
+                        .min(search.matches.len().saturating_sub(1));
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc => return,
+                KeyCode::Enter => {
+                    if let Some(entry) = search.selected_entry() {
+                        self.pending_chat_jump = Some(entry);
+                        self.status = format!(
+                            "Conversation match {} of {}",
+                            search.selected + 1,
+                            search.matches.len()
+                        );
+                        return;
+                    }
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    search.selected = search.selected.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    search.selected = search
+                        .selected
+                        .saturating_add(1)
+                        .min(search.matches.len().saturating_sub(1))
+                }
+                KeyCode::PageUp => search.selected = search.selected.saturating_sub(10),
+                KeyCode::PageDown => {
+                    search.selected = search
+                        .selected
+                        .saturating_add(10)
+                        .min(search.matches.len().saturating_sub(1))
+                }
+                KeyCode::Char(ch) => {
+                    insert_char(&mut search.query, &mut search.cursor, ch);
+                    query_changed = true;
+                }
+                KeyCode::Backspace => {
+                    let before = search.query.len();
+                    backspace(&mut search.query, &mut search.cursor);
+                    query_changed = search.query.len() != before;
+                }
+                KeyCode::Delete => {
+                    let before = search.query.len();
+                    delete_at_cursor(&mut search.query, search.cursor);
+                    query_changed = search.query.len() != before;
+                }
+                KeyCode::Left => search.cursor = search.cursor.saturating_sub(1),
+                KeyCode::Right => {
+                    search.cursor = (search.cursor + 1).min(search.query.chars().count());
+                }
+                KeyCode::Home => search.cursor = 0,
+                KeyCode::End => search.cursor = search.query.chars().count(),
+                _ => {}
+            }
+        }
+
+        if query_changed {
+            search.refresh(&self.chat);
+        }
+        self.modal = Some(Modal::Search(search));
     }
 
     fn load_history(&mut self, history: &[Message]) {
@@ -401,6 +567,15 @@ impl AppState {
                 }),
                 MouseEventKind::ScrollDown,
             ) => *selected = selected.saturating_add(1).min(queue_len.saturating_sub(1)),
+            (Some(Modal::Search(search)), MouseEventKind::ScrollUp) => {
+                search.selected = search.selected.saturating_sub(1)
+            }
+            (Some(Modal::Search(search)), MouseEventKind::ScrollDown) => {
+                search.selected = search
+                    .selected
+                    .saturating_add(1)
+                    .min(search.matches.len().saturating_sub(1))
+            }
             (Some(_), _) => {}
             (None, MouseEventKind::ScrollUp) => self.scroll_chat_up(3),
             (None, MouseEventKind::ScrollDown) => self.scroll_chat_down(3),
@@ -617,6 +792,7 @@ impl AppState {
                 self.context_tokens = context_tokens;
             }
         }
+        self.refresh_chat_search();
     }
 
     fn insert_input_char(&mut self, ch: char) {
@@ -836,13 +1012,27 @@ impl TerminalUi {
         }
     }
 
-    /// Toggle copy mode on F3 and suppress application input while it is
-    /// active. The terminal keeps its native copy shortcuts; only the TUI's
-    /// mouse capture and redraws are suspended.
+    /// Enter native terminal selection mode from an explicit local command.
+    pub fn enter_copy_mode(&mut self) -> io::Result<()> {
+        if !self.app.copy_mode {
+            self.toggle_copy_mode()?;
+        }
+        Ok(())
+    }
+
+    /// Send an explicit, write-only clipboard request to the host terminal.
+    pub fn request_clipboard_copy(&mut self, text: &str) -> io::Result<usize> {
+        write_osc52(self.terminal.backend_mut(), text)
+    }
+
+    /// Toggle copy mode on F3, or resume it with F3/Esc, and suppress all
+    /// other application input while it is active. The terminal keeps its
+    /// native copy shortcuts; only the TUI's mouse capture and redraws are
+    /// suspended.
     fn copy_mode_owns_event(&mut self, event: &Event) -> io::Result<bool> {
         if matches!(
             event,
-            Event::Key(key) if is_key_press(*key) && key.code == KeyCode::F(3)
+            Event::Key(key) if copy_mode_toggle_key(self.app.copy_mode, *key)
         ) {
             self.toggle_copy_mode()?;
             return Ok(true);
@@ -1141,14 +1331,16 @@ impl TerminalUi {
         Ok(match event {
             Event::Key(key) if is_key_press(key) => self.handle_key(key, queue),
             Event::Paste(text) => {
-                if let Some(Modal::Queue {
-                    editing: Some(editor),
-                    ..
-                }) = self.app.modal.as_mut()
-                {
-                    insert_text(&mut editor.value, &mut editor.cursor, &text);
-                } else if self.app.modal.is_none() {
-                    self.app.insert_input_text(&text);
+                if !self.app.paste_chat_search(&text) {
+                    if let Some(Modal::Queue {
+                        editing: Some(editor),
+                        ..
+                    }) = self.app.modal.as_mut()
+                    {
+                        insert_text(&mut editor.value, &mut editor.cursor, &text);
+                    } else if self.app.modal.is_none() {
+                        self.app.insert_input_text(&text);
+                    }
                 }
                 UiAction::None
             }
@@ -1174,6 +1366,10 @@ impl TerminalUi {
             }
             Some(Modal::Permission { .. }) => return self.handle_permission_key(key),
             Some(Modal::Queue { .. }) => return self.handle_queue_key(key, queue),
+            Some(Modal::Search(_)) => {
+                self.app.handle_chat_search_key(key);
+                return UiAction::None;
+            }
             Some(Modal::Reasoning { .. }) => return self.handle_reasoning_key(key),
             Some(Modal::Select { .. } | Modal::Prompt { .. }) => return UiAction::None,
             None => {}
@@ -1199,6 +1395,7 @@ impl TerminalUi {
                 KeyCode::Char('w') => {
                     delete_previous_word(&mut self.app.input, &mut self.app.input_cursor)
                 }
+                KeyCode::Char('f') => self.app.open_chat_search(),
                 KeyCode::Enter | KeyCode::Char('j') => self.app.insert_input_char('\n'),
                 _ => {}
             }
@@ -1637,7 +1834,7 @@ fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     render_input(frame, app, input_area);
     render_footer(frame, app, footer_area);
     if let Some(modal) = &mut app.modal {
-        render_modal(frame, modal, &app.queue, &app.reasoning);
+        render_modal(frame, modal, &app.chat, &app.queue, &app.reasoning);
     }
 }
 
@@ -1725,6 +1922,10 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut AppState, area: Rect) {
     let visible = inner.height as usize;
     let max_scroll = total_lines.saturating_sub(visible);
     app.update_chat_metrics(max_scroll);
+    if let Some(entry) = app.pending_chat_jump.take() {
+        app.chat_scroll = chat_entry_start(&app.chat, entry, width).min(max_scroll);
+        app.follow_latest = app.chat_scroll == max_scroll;
+    }
     let lines_from_latest = app.lines_from_latest();
     let title = if app.follow_latest {
         " Conversation ".to_string()
@@ -1888,7 +2089,7 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let command_hint;
     let left = if app.copy_mode {
-        " F3 resume · select text · use your terminal's copy shortcut"
+        " F3/Esc resume · select text · use your terminal's copy shortcut"
     } else if app.input.trim_start().starts_with('/') {
         command_hint = format!(
             " {}",
@@ -1900,9 +2101,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         );
         command_hint.as_str()
     } else if app.busy {
-        " F1 help  F2 queue  F3 copy  F4 reasoning  Esc/Ctrl+C interrupt"
+        " F1 help  F2 queue  F3 copy  F4 reasoning  Ctrl+F find  Esc/Ctrl+C interrupt"
     } else {
-        " F1 help  F2 queue  F3 copy  F4 reasoning  Ctrl+C quit"
+        " F1 help  F2 queue  F3 copy  F4 reasoning  Ctrl+F find  Ctrl+C quit"
     };
     let right = if app.copy_mode {
         "display paused "
@@ -1928,6 +2129,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 fn render_modal(
     frame: &mut Frame<'_>,
     modal: &mut Modal,
+    chat: &[ChatEntry],
     queue: &[QueuedPrompt],
     reasoning: &[ReasoningEntry],
 ) {
@@ -1952,12 +2154,140 @@ fn render_modal(
         Modal::Queue { selected, editing } => {
             render_queue(frame, queue, *selected, editing.as_ref())
         }
+        Modal::Search(search) => render_chat_search(frame, search, chat),
         Modal::Reasoning {
             scroll,
             max_scroll,
             follow_latest,
         } => render_reasoning(frame, reasoning, scroll, max_scroll, follow_latest),
     }
+}
+
+fn render_chat_search(frame: &mut Frame<'_>, search: &ChatSearch, entries: &[ChatEntry]) {
+    let area = centered(frame.area(), 86, 78, 58, 12);
+    frame.render_widget(Clear, area);
+    let match_label = if search.matches.len() == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{} matches", search.matches.len())
+    };
+    let block = modal_block(format!(" Find in conversation · {match_label} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [query_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+
+    let query_block = Block::new()
+        .title(" Query ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(PURPLE))
+        .style(Style::default().bg(PANEL_ALT));
+    let query_inner = query_block.inner(query_area);
+    frame.render_widget(query_block, query_area);
+    let (shown, cursor_x) =
+        visible_editor(&search.query, search.cursor, query_inner.width as usize);
+    let shown = if shown.is_empty() {
+        "Type to search visible conversation entries…".to_string()
+    } else {
+        shown
+    };
+    frame.render_widget(
+        Paragraph::new(shown).style(
+            Style::default()
+                .fg(if search.query.is_empty() { MUTED } else { TEXT })
+                .bg(PANEL_ALT),
+        ),
+        query_inner,
+    );
+
+    if search.query.trim().is_empty() {
+        frame.render_widget(
+            Paragraph::new(format!("{} conversation entries", entries.len()))
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED).bg(PANEL_ALT)),
+            list_area,
+        );
+    } else if search.matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching conversation entries")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(MUTED).bg(PANEL_ALT)),
+            list_area,
+        );
+    } else {
+        let visible = (list_area.height as usize).max(1);
+        let start = search
+            .selected
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(search.matches.len().saturating_sub(visible));
+        let items = search
+            .matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .filter_map(|(match_index, entry_index)| {
+                let entry = entries.get(*entry_index)?;
+                let active = match_index == search.selected;
+                let (label, color) = chat_kind_label(entry.kind);
+                Some(
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            if active { "› " } else { "  " },
+                            Style::default().fg(CYAN).bold(),
+                        ),
+                        Span::styled(
+                            format!("{}  {label:<9} ", entry.timestamp),
+                            Style::default().fg(color).bold(),
+                        ),
+                        Span::styled(
+                            chat_search_preview(entry, &search.query),
+                            Style::default().fg(if active { TEXT } else { MUTED }),
+                        ),
+                    ]))
+                    .style(Style::default().bg(if active {
+                        PANEL
+                    } else {
+                        PANEL_ALT
+                    })),
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(List::new(items), list_area);
+    }
+
+    let selection = search.matches.get(search.selected).map_or_else(
+        || "no selection".to_string(),
+        |_| format!("{} / {}", search.selected + 1, search.matches.len()),
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "↑/↓ or Tab choose · Enter jump · Esc/Ctrl+F close · {selection}"
+        ))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(MUTED).bg(PANEL_ALT)),
+        hint_area,
+    );
+    frame.set_cursor_position(Position::new(
+        query_inner.x + cursor_x.min(query_inner.width.saturating_sub(1)),
+        query_inner.y,
+    ));
+}
+
+fn chat_search_preview(entry: &ChatEntry, query: &str) -> String {
+    let needle = query.trim().to_lowercase();
+    let line = entry
+        .body
+        .lines()
+        .find(|line| line.to_lowercase().contains(&needle))
+        .or_else(|| entry.body.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or_default();
+    truncate_middle(line.trim(), 140)
 }
 
 fn render_help(frame: &mut Frame<'_>) {
@@ -2013,7 +2343,8 @@ fn render_help(frame: &mut Frame<'_>) {
         Line::from(Span::styled("Editor", Style::default().fg(CYAN).bold())),
         Line::from("  Ctrl+A/E home/end · Ctrl+U clear · Ctrl+W delete word"),
         Line::from("  PgUp/PgDn scroll conversation · mouse wheel also works"),
-        Line::from("  F3 native terminal copy mode · F4 provider reasoning"),
+        Line::from("  Ctrl+F find conversation text and jump to a match"),
+        Line::from("  F3 native selection · /copy last|all|select · F4 reasoning"),
     ];
     frame.render_widget(
         Paragraph::new(shortcut_lines)
@@ -2343,15 +2674,19 @@ fn render_permission(
     );
 }
 
-fn chat_text(entries: &[ChatEntry]) -> Text<'static> {
+fn chat_kind_label(kind: ChatKind) -> (&'static str, Color) {
+    match kind {
+        ChatKind::User => ("YOU", GREEN),
+        ChatKind::Assistant => ("ASSISTANT", CYAN),
+        ChatKind::Info => ("INFO", YELLOW),
+        ChatKind::Error => ("ERROR", RED),
+    }
+}
+
+fn chat_lines(entries: &[ChatEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::<Line<'static>>::new();
     for entry in entries {
-        let (label, color) = match entry.kind {
-            ChatKind::User => ("YOU", GREEN),
-            ChatKind::Assistant => ("ASSISTANT", CYAN),
-            ChatKind::Info => ("INFO", YELLOW),
-            ChatKind::Error => ("ERROR", RED),
-        };
+        let (label, color) = chat_kind_label(entry.kind);
         lines.push(Line::from(vec![
             Span::styled(format!("{}  ", entry.timestamp), Style::default().fg(MUTED)),
             Span::styled(label, Style::default().fg(color).bold()),
@@ -2383,6 +2718,11 @@ fn chat_text(entries: &[ChatEntry]) -> Text<'static> {
         }
         lines.push(Line::from(""));
     }
+    lines
+}
+
+fn chat_text(entries: &[ChatEntry]) -> Text<'static> {
+    let mut lines = chat_lines(entries);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "Start a conversation below. Tool calls will appear in the activity panel.",
@@ -2390,6 +2730,16 @@ fn chat_text(entries: &[ChatEntry]) -> Text<'static> {
         )));
     }
     Text::from(lines)
+}
+
+fn chat_entry_start(entries: &[ChatEntry], entry: usize, width: u16) -> usize {
+    let entry = entry.min(entries.len());
+    if entry == 0 {
+        return 0;
+    }
+    Paragraph::new(Text::from(chat_lines(&entries[..entry])))
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1))
 }
 
 fn reasoning_text(entries: &[ReasoningEntry]) -> Text<'static> {
@@ -2708,6 +3058,10 @@ fn is_key_press(key: KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
+fn copy_mode_toggle_key(copy_mode: bool, key: KeyEvent) -> bool {
+    is_key_press(key) && (key.code == KeyCode::F(3) || (copy_mode && key.code == KeyCode::Esc))
+}
+
 fn submission_delivery(key: KeyEvent, busy: bool) -> Option<DeliveryMode> {
     if key
         .modifiers
@@ -2882,6 +3236,77 @@ mod tests {
     }
 
     #[test]
+    fn chat_search_is_case_insensitive_and_keeps_a_stable_selected_entry() {
+        let mut app = AppState::new("api", "model");
+        app.push_user("alpha");
+        app.push_chat(ChatKind::Assistant, "first Beta answer");
+        app.push_error("second beta result");
+        app.open_chat_search();
+
+        for ch in "BETA".chars() {
+            app.handle_chat_search_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let Some(Modal::Search(search)) = &app.modal else {
+            panic!("search modal closed while entering a query");
+        };
+        assert_eq!(search.matches, vec![1, 2]);
+
+        app.handle_chat_search_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.push_info("later beta event");
+        let Some(Modal::Search(search)) = &app.modal else {
+            panic!("live chat update closed search");
+        };
+        assert_eq!(search.matches, vec![1, 2, 3]);
+        assert_eq!(search.selected_entry(), Some(2));
+
+        app.handle_chat_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert_eq!(app.pending_chat_jump, Some(2));
+        assert_eq!(app.status, "Conversation match 2 of 3");
+    }
+
+    #[test]
+    fn search_paste_is_single_line_unicode_and_rendered_jump_is_exact() {
+        let mut app = AppState::new("api", "model");
+        for index in 0..5 {
+            app.push_info(format!(
+                "earlier entry {index} with enough words to wrap across the narrow conversation"
+            ));
+        }
+        let target_entry = app.chat.len();
+        app.push_chat(ChatKind::Assistant, "needle 🦀 here");
+        for index in 0..30 {
+            app.push_info(format!("later entry {index} with enough words to wrap"));
+        }
+        app.open_chat_search();
+        assert!(app.paste_chat_search("needle\r\n🦀"));
+        let Some(Modal::Search(search)) = &app.modal else {
+            panic!("paste closed search");
+        };
+        assert_eq!(search.query, "needle 🦀");
+        assert_eq!(search.matches, vec![target_entry]);
+
+        app.handle_chat_search_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.paste_chat_search("needle"));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Find in conversation"));
+        assert!(rendered.contains("needle 🦀 here"));
+
+        app.handle_chat_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let expected_scroll = chat_entry_start(&app.chat, target_entry, 78);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.pending_chat_jump, None);
+        assert_eq!(app.chat_scroll, expected_scroll.min(app.chat_max_scroll));
+        assert!(app.chat_scroll > 0);
+        assert!(app.chat_max_scroll > 0);
+        assert!(!app.follow_latest);
+    }
+
+    #[test]
     fn mouse_wheel_respects_modal_focus() {
         let mut app = AppState::new("api", "model");
         app.update_chat_metrics(100);
@@ -2921,6 +3346,20 @@ mod tests {
         });
         app.handle_mouse_scroll(MouseEventKind::ScrollDown);
         assert!(matches!(app.modal, Some(Modal::Queue { selected: 1, .. })));
+        assert_eq!(app.chat_scroll, 100);
+
+        let search = ChatSearch {
+            query: "content".into(),
+            cursor: 7,
+            matches: vec![0, 1],
+            selected: 0,
+        };
+        app.modal = Some(Modal::Search(search));
+        app.handle_mouse_scroll(MouseEventKind::ScrollDown);
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Search(ChatSearch { selected: 1, .. }))
+        ));
         assert_eq!(app.chat_scroll, 100);
     }
 
@@ -3125,9 +3564,22 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("F3 resume"));
+        assert!(rendered.contains("F3/Esc resume"));
         assert!(rendered.contains("select text"));
         assert!(rendered.contains("display paused"));
+    }
+
+    #[test]
+    fn copy_mode_can_always_resume_with_escape_without_stealing_idle_escape() {
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let f3 = KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE);
+        let ordinary = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert!(copy_mode_toggle_key(false, f3));
+        assert!(copy_mode_toggle_key(true, f3));
+        assert!(copy_mode_toggle_key(true, escape));
+        assert!(!copy_mode_toggle_key(false, escape));
+        assert!(!copy_mode_toggle_key(true, ordinary));
     }
 
     #[test]
