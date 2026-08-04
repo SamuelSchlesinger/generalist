@@ -115,3 +115,19 @@ with an object-valued `tool_choice`, which Alibaba does not support in thinking
 mode. This is an API-profile incompatibility, not a 0/10 code-generation
 result: Generalist's OpenAI-compatible adapter omits `tool_choice`, and an
 unforced JSON control is required before drawing a production conclusion.
+
+## OpenRouter implicit-tool control
+
+`20260804T234315Z-...jsonl` resolves the Qwen API-profile question using the
+production-like `json_tool_implicit` transport, which omits `tool_choice` and
+`parallel_tool_calls`. Qwen 3.8 Max passed 10/10 at a provider-reported cost of
+$0.039186. The earlier forced-profile HTTP errors therefore do not apply to
+Generalist's current request shape.
+
+`20260804T234322Z-...jsonl` applies the same control to Kimi K3. It passed 7/10
+at a provider-reported cost of $0.048652. On `argv_no_shell` and
+`delimiter_collision`, Kimi returned text instead of calling Python; on
+`batch_mixed_payloads`, it changed the second call's arguments. The forced
+Kimi profile passed 9/10 in its first sample, suggesting that explicit tool
+selection may improve call propensity, but one repetition per profile is not
+enough to estimate that effect.
