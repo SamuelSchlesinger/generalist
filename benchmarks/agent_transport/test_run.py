@@ -94,6 +94,14 @@ bridge.publish(body=value + "\\nnext", source_count=1)
         self.assertFalse(result["passed"])
         self.assertEqual(result["actual_calls"], [])
 
+    def test_tools_reference_without_import_is_rejected(self):
+        result = benchmark.check_source(
+            "tools.record_text(text='x')",
+            [{"name": "record_text", "arguments": {"text": "x"}}],
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failure_kind"], "missing_tools_import")
+
 
 class WireFormatTests(unittest.TestCase):
     @classmethod
@@ -183,6 +191,23 @@ class WireFormatTests(unittest.TestCase):
         code, details = benchmark.extract_responses_code(response)
         self.assertEqual(code, "import tools\n")
         self.assertEqual(details["python_call_count"], 1)
+
+    def test_classifies_custom_tool_downgrade(self):
+        response = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "python",
+                    "arguments": '{"text":"not freeform code"}',
+                }
+            ],
+        }
+        code, details = benchmark.extract_responses_code(response)
+        self.assertIsNone(code)
+        self.assertEqual(
+            benchmark.classify(200, details, None), "custom_tool_degraded"
+        )
 
     def test_jsonl_writer_preserves_prior_records(self):
         with tempfile.TemporaryDirectory() as directory:

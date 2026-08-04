@@ -308,18 +308,28 @@ def extract_chat_code(response: Any, transport: str) -> tuple[str | None, dict[s
 def extract_responses_code(response: Any) -> tuple[str | None, dict[str, Any]]:
     output = response.get("output", []) if isinstance(response, dict) else []
     calls = [item for item in output if isinstance(item, dict) and item.get("type") == "custom_tool_call"]
+    degraded_calls = [
+        item for item in output if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
     python_calls = [item for item in calls if item.get("name") == "python"]
     details: dict[str, Any] = {
         "format": "responses_custom",
         "tool_call_count": len(calls),
         "python_call_count": len(python_calls),
+        "degraded_function_call_count": len(degraded_calls),
         "status": response.get("status") if isinstance(response, dict) else None,
         "incomplete_reason": (response.get("incomplete_details") or {}).get("reason")
         if isinstance(response, dict)
         else None,
     }
     if len(python_calls) != 1:
-        details["error"] = f"expected one custom python call, received {len(python_calls)}"
+        if degraded_calls:
+            details["error"] = (
+                "provider degraded the custom tool to a JSON function_call "
+                f"({len(degraded_calls)} returned)"
+            )
+        else:
+            details["error"] = f"expected one custom python call, received {len(python_calls)}"
         return None, details
     code = python_calls[0].get("input")
     if not isinstance(code, str):
@@ -403,7 +413,7 @@ def constant_bindings(tree: ast.AST) -> dict[str, Any]:
 
 
 def tool_aliases(tree: ast.AST) -> tuple[set[str], dict[str, str]]:
-    module_aliases = {"tools"}
+    module_aliases: set[str] = set()
     function_aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -430,11 +440,11 @@ def tool_call_name(
     return None
 
 
-def extract_source_calls(source: str) -> tuple[list[dict[str, Any]], str | None]:
+def extract_source_calls(source: str) -> tuple[list[dict[str, Any]], str | None, bool]:
     try:
         tree = ast.parse(source)
     except SyntaxError as error:
-        return [], f"{error.msg} at line {error.lineno}, column {error.offset}"
+        return [], f"{error.msg} at line {error.lineno}, column {error.offset}", False
     constants = constant_bindings(tree)
     module_aliases, function_aliases = tool_aliases(tree)
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
@@ -450,7 +460,7 @@ def extract_source_calls(source: str) -> tuple[list[dict[str, Any]], str | None]
         if any(keyword.arg is None for keyword in call.keywords):
             arguments["$expanded_kwargs"] = True
         extracted.append({"name": name, "arguments": arguments, "line": call.lineno})
-    return extracted, None
+    return extracted, None, bool(module_aliases or function_aliases)
 
 
 def value_matches(expected: Any, actual: Any) -> bool:
@@ -468,7 +478,7 @@ def value_matches(expected: Any, actual: Any) -> bool:
 
 
 def check_source(source: str, expected_calls: list[dict[str, Any]]) -> dict[str, Any]:
-    actual_calls, syntax_error = extract_source_calls(source)
+    actual_calls, syntax_error, has_tools_import = extract_source_calls(source)
     comparable_calls = [
         {"name": call["name"], "arguments": call["arguments"]} for call in actual_calls
     ]
@@ -477,6 +487,13 @@ def check_source(source: str, expected_calls: list[dict[str, Any]]) -> dict[str,
             "passed": False,
             "failure_kind": "syntax_error",
             "detail": syntax_error,
+            "actual_calls": comparable_calls,
+        }
+    if expected_calls and not has_tools_import:
+        return {
+            "passed": False,
+            "failure_kind": "missing_tools_import",
+            "detail": "script never imports the generated tools bridge",
             "actual_calls": comparable_calls,
         }
     if len(expected_calls) != len(comparable_calls):
@@ -528,6 +545,8 @@ def classify(http_status: int, extraction: dict[str, Any], checker: dict[str, An
     if not 200 <= http_status < 300:
         return "http_error"
     if extraction.get("error"):
+        if extraction.get("degraded_function_call_count", 0) > 0:
+            return "custom_tool_degraded"
         if extraction.get("finish_reason") in {"length", "max_tokens"} or extraction.get(
             "incomplete_reason"
         ) == "max_output_tokens":

@@ -107,3 +107,15 @@ python3 benchmarks/agent_transport/summarize.py \
 The summary reports exact-call pass rate, failure taxonomy, median latency,
 mean token counts, median model-argument overhead, and provider-reported cost
 when available. Raw JSONL remains the authoritative evidence.
+
+When the checker becomes stricter, derive a new result file instead of editing
+old evidence:
+
+```sh
+python3 benchmarks/agent_transport/recheck.py \
+  benchmarks/agent_transport/results/OLDER-RUN.jsonl
+```
+
+The derived attempts retain the original request, response, metrics, run ID,
+and classification under `derived_from`, while recording hashes for every
+source file and checker artifact.
