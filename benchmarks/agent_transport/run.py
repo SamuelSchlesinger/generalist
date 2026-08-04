@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -39,6 +40,14 @@ def slug(value: str) -> str:
 
 def json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(128 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class JsonlWriter:
@@ -246,14 +255,24 @@ def strip_code_fence(text: str) -> str:
 
 def extract_chat_code(response: Any, transport: str) -> tuple[str | None, dict[str, Any]]:
     try:
-        message = response["choices"][0]["message"]
+        choice = response["choices"][0]
+        message = choice["message"]
     except (KeyError, IndexError, TypeError):
         return None, {"error": "response missing choices[0].message", "tool_call_count": 0}
+    finish_reason = choice.get("finish_reason")
     if transport == "plain_text":
         text = response_text(message)
         if not text:
-            return None, {"error": "assistant response contained no text", "tool_call_count": 0}
-        return strip_code_fence(text), {"format": "assistant_text", "tool_call_count": 0}
+            return None, {
+                "error": "assistant response contained no text",
+                "tool_call_count": 0,
+                "finish_reason": finish_reason,
+            }
+        return strip_code_fence(text), {
+            "format": "assistant_text",
+            "tool_call_count": 0,
+            "finish_reason": finish_reason,
+        }
 
     tool_calls = message.get("tool_calls") or []
     python_calls = [
@@ -265,6 +284,7 @@ def extract_chat_code(response: Any, transport: str) -> tuple[str | None, dict[s
         "format": "chat_function",
         "tool_call_count": len(tool_calls),
         "python_call_count": len(python_calls),
+        "finish_reason": finish_reason,
     }
     if len(python_calls) != 1:
         details["error"] = f"expected one python call, received {len(python_calls)}"
@@ -293,6 +313,10 @@ def extract_responses_code(response: Any) -> tuple[str | None, dict[str, Any]]:
         "format": "responses_custom",
         "tool_call_count": len(calls),
         "python_call_count": len(python_calls),
+        "status": response.get("status") if isinstance(response, dict) else None,
+        "incomplete_reason": (response.get("incomplete_details") or {}).get("reason")
+        if isinstance(response, dict)
+        else None,
     }
     if len(python_calls) != 1:
         details["error"] = f"expected one custom python call, received {len(python_calls)}"
@@ -504,6 +528,10 @@ def classify(http_status: int, extraction: dict[str, Any], checker: dict[str, An
     if not 200 <= http_status < 300:
         return "http_error"
     if extraction.get("error"):
+        if extraction.get("finish_reason") in {"length", "max_tokens"} or extraction.get(
+            "incomplete_reason"
+        ) == "max_output_tokens":
+            return "output_limit"
         return "extraction_error"
     if checker is None:
         return "internal_error"
@@ -620,7 +648,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-tasks", type=int)
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--max-output-tokens", type=int, default=1200)
-    parser.add_argument("--reasoning-effort", choices=("minimal", "low", "medium", "high", "xhigh"))
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh"),
+    )
     parser.add_argument("--timeout-seconds", type=float, default=300)
     parser.add_argument("--corpus", type=pathlib.Path, default=DEFAULT_CORPUS)
     parser.add_argument("--output", type=pathlib.Path)
@@ -675,6 +706,10 @@ def main(argv: list[str] | None = None) -> int:
             "max_output_tokens": args.max_output_tokens,
             "reasoning_effort": args.reasoning_effort,
             "corpus": str(args.corpus.resolve()),
+            "artifacts": {
+                "runner_sha256": sha256_file(pathlib.Path(__file__).resolve()),
+                "corpus_sha256": sha256_file(args.corpus.resolve()),
+            },
             "runtime": {"python": platform.python_version(), "platform": platform.platform()},
         }
     )

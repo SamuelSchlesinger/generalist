@@ -54,7 +54,8 @@ python3 benchmarks/agent_transport/run.py \
   --model qwen3.6:35b-a3b \
   --tag smoke \
   --transport json_tool \
-  --transport plain_text
+  --transport plain_text \
+  --reasoning-effort none
 ```
 
 OpenRouter credentials are read only from `OPENROUTER_API_KEY`. A bounded

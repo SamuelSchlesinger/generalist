@@ -160,6 +160,16 @@ class WireFormatTests(unittest.TestCase):
         self.assertIsNone(code)
         self.assertIn("invalid function arguments JSON", details["error"])
 
+    def test_output_limit_is_not_reported_as_a_transport_error(self):
+        response = {
+            "choices": [
+                {"finish_reason": "length", "message": {"content": "", "tool_calls": []}}
+            ]
+        }
+        code, details = benchmark.extract_chat_code(response, "json_tool")
+        self.assertIsNone(code)
+        self.assertEqual(benchmark.classify(200, details, None), "output_limit")
+
     def test_extracts_custom_freeform_code(self):
         response = {
             "output": [
@@ -186,6 +196,15 @@ class WireFormatTests(unittest.TestCase):
             self.assertEqual(
                 [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()],
                 [{"n": 1}, {"n": 2}],
+            )
+
+    def test_artifact_hash_is_stable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "artifact"
+            path.write_bytes(b"generalist\n")
+            self.assertEqual(
+                benchmark.sha256_file(path),
+                "985bfe71d0f386c5bbce96722eb5dece3b132953561da58d05fc5bf093c0f466",
             )
 
 
