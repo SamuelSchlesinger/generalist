@@ -20,12 +20,44 @@ help, and queue modals temporarily accept a smaller set of terminal keys, so
 the TUI refines that environment by disabling some user transitions; it never
 adds an enqueue transition forbidden by the model. Local commands, goal
 editing, manual save/load/compaction, startup tool discovery, and provider
-selection execute only outside a mutation-capable turn and are reviewed
-separately for that ownership guard. `/copy last` and `/copy all` are hidden,
-explicit write-only terminal effects; `/copy select` refines `EnterCopyMode`.
+selection execute only outside a mutation-capable turn. During MCP discovery,
+composer and queue-manager mutations refine the existing idle queue actions;
+discovery progress/cancellation is hidden and no dispatch occurs until the
+registry is finalized or explicitly skipped. Remembered permission-policy
+contents and `/permissions` list/reset/clear are hidden idle state: no live
+request exists while they run, so a policy mutation is a TLA+ stutter and only
+changes whether a later tool use reaches `AskPermission`. The stable, bounded
+`/tools` list/search/show projection is also hidden idle state: it reads the
+finalized registry and effective advertised definitions but cannot request a
+completion, permission, or execution, and does not mutate history. `/copy last` and
+`/copy all` are hidden, explicit write-only terminal effects; `/copy select`
+refines `EnterCopyMode`.
+`/mcp status` is a hidden read of typed process-local connection state.
+`/mcp retry [server]` performs an explicit external handshake only while the
+agent is idle, using the same responsive discovery reactor; it may add
+recovered bridge definitions to the existing registry but cannot start a
+provider completion, execute a capability, or mutate model history. Tool
+definitions and MCP wire state are hidden payloads in this model, so a
+successful or failed retry is a stutter; queued composer/F2 work during retry
+continues to refine ordinary idle `Enqueue`/queue-edit actions.
+The bounded `/history` list/search/show projection is another hidden idle
+read: it is hard-bound to the active store's current scope, returns the same
+sanitized event shape as archive tools, never loads a session, and cannot
+request a provider completion or tool execution. `/history forget` is not
+hidden: after a default-Cancel host confirmation, its successful durable unlink
+refines `ForgetHistory`. It cannot target the live autosave or another scope.
+Cross-scope access remains in the modeled permissioned archive path.
+Process-local `/usage show|reset` is also hidden idle state. Provider-attempt
+events update a display-only, saturating per-provider/model ledger; missing
+usage payloads and optional cache-field coverage remain explicit. Reading or
+resetting that ledger cannot enqueue, call a provider/tool, mutate model
+history, or write durable state, so both commands refine a TLA+ stutter.
 Goal text, active/completed status, conversation-search query/selection,
 prompt/message provenance, and other provider payloads are hidden data in this
-model. `Ctrl+F` scans only sanitized in-memory `ChatEntry` values and computes
+model. Catalog-backed slash completion is likewise a hidden composer edit:
+when Tab is consumed it cannot enqueue, while an unrecognized/full argument
+falls through to the existing `Enqueue` path. `Ctrl+F` scans only sanitized
+in-memory `ChatEntry` values and computes
 one wrapped-row viewport jump; it cannot mutate or disclose model history, the
 prompt queue, tool payloads, reasoning, or archived sessions. Setting or
 clearing only the objective refines a TLA+ stutter step; scheduling a
@@ -89,7 +121,7 @@ same-UID Python, shell, file access, or direct filesystem access.
 | TLA+ state | Authoritative Rust representation | Review note |
 | --- | --- | --- |
 | `copyMode` | `tui::AppState::copy_mode`, changed only by `TerminalUi::toggle_copy_mode` | It controls terminal ownership/redraw only; no queue, history, permission ID, or turn state moves with the toggle. |
-| `phase` | Control location in `main::drive_started_turn`, `Agent::run_started_turn`, and the permission broker | It is a model program counter, not a second mutable Rust enum that could drift. |
+| `phase` | Control location in `main::drive_started_turn`, `Agent::run_started_turn`, and the permission broker | It is a model program counter, not a second mutable Rust enum that could drift. `AppState::turn_active` is only its TUI input-routing projection; unlike `busy`, it is set precisely around the sole mutation-capable agent future. |
 | `activeTurn` | The one prompt synchronously recorded by `Agent::begin_turn` before the controller pins the sole `&mut Agent` future | The current-thread reactor cannot start another turn until that future returns. |
 | `queue`, `delivery` | `runtime::PromptQueue` containing `QueuedPrompt { id, text, delivery, source }` | `Rc<RefCell<_>>` is the sole store; `tui::AppState::queue` is a render snapshot only. `PromptSource` is hidden payload, not a second modeled lifecycle. |
 | `lifecycle`, `claimedSteers` | `PromptClaim` ownership plus visible membership in `PromptQueue` | `lifecycle` is a ghost variable. `Drop` requeues uncommitted IDs; `commit` consumes them. |
@@ -104,23 +136,23 @@ same-UID Python, shell, file access, or direct filesystem access.
 
 | TLA+ action | Concrete Rust transition | Deterministic evidence |
 | --- | --- | --- |
-| `Enqueue` | `tui::submission_delivery` selects steer/follow-up; `main::enqueue_submission` forces idle and local-command submissions to follow-up; `PromptQueue::enqueue` assigns user IDs. After a normally settled active-goal turn, `reconcile_goal_continuation(true)` appends at most one host-authored follow-up with the same fresh-ID transition. | `composer_keys_distinguish_busy_steering_from_followups`, `duplicate_text_keeps_distinct_stable_ids`, `goal_continuation_is_unique_removable_and_becomes_user_text_when_edited`, `active_goal_continues_only_after_normal_settlement` |
+| `Enqueue` | `tui::submission_delivery` selects steer/follow-up from actual turn ownership; `main::enqueue_submission` forces idle, background-operation, and local-command submissions to follow-up; `PromptQueue::enqueue` assigns user IDs. MCP discovery uses this path before `Agent` construction and atomically persists the pre-agent durable boundary. After a normally settled active-goal turn, `reconcile_goal_continuation(true)` appends at most one host-authored follow-up with the same fresh-ID transition. | `composer_keys_distinguish_turn_steering_from_background_queueing`, `background_busy_state_does_not_offer_or_create_steering`, `duplicate_text_keeps_distinct_stable_ids`, `goal_continuation_is_unique_removable_and_becomes_user_text_when_edited`, `active_goal_continues_only_after_normal_settlement`; exact-binary stalled-MCP PTY test |
 | `DeleteQueued` | Queue modal deletion routes the selected stable ID to `PromptQueue::delete`. Restore is the same modeled removal plus a display-only move into an empty composer; it is refused over an existing draft. | `queue_manager_mutations_address_stable_ids`, `restoring_queue_text_never_overwrites_a_draft` |
-| `ReclassifyQueued` | Queue modal `s` calls `PromptQueue::toggle_delivery`; idle cannot create a steer. | `queue_manager_mutations_address_stable_ids`, `ending_turn_normalizes_undelivered_steers` |
+| `ReclassifyQueued` | Queue modal `s` calls `PromptQueue::toggle_delivery` with `turn_active`, not presentation-level `busy`; idle and background work cannot create a steer. | `queue_manager_mutations_address_stable_ids`, `background_busy_state_does_not_offer_or_create_steering`, `ending_turn_normalizes_undelivered_steers` |
 | `MoveQueuedEarlier` | Queue modal Ctrl+Up/Down calls `PromptQueue::move_by` by ID. | `queue_manager_mutations_address_stable_ids` |
-| `EnterCopyMode` | F3 is intercepted before modal/composer dispatch; idle `/copy select` calls the same transition without relying on a function key. Both disable mouse capture, set `copy_mode`, draw the paused banner once, and then suppress application input/redraws. OSC 52 `/copy last|all` requests do not change this state. | `copy_mode_banner_explains_that_rendering_is_paused`, `copy_mode_can_always_resume_with_escape_without_stealing_idle_escape`; exact-binary PTY copy test |
+| `EnterCopyMode` | F3 is intercepted before modal/composer dispatch; idle `/copy select` calls the same transition without relying on a function key. Both disable mouse capture, set `copy_mode`, draw the paused banner once, and then suppress application input/redraws. OSC 52 `/copy last|all|reasoning` requests do not change this state. | `copy_mode_banner_explains_that_rendering_is_paused`, `copy_mode_can_always_resume_with_escape_without_stealing_idle_escape`; exact-binary PTY copy test |
 | `ExitCopyMode` | F3 or Esc reenables mouse capture, clears `copy_mode`, and performs one immediate redraw of state accumulated by the still-polled runtime. Idle Esc retains its existing editor behavior. | `copy_mode_banner_explains_that_rendering_is_paused`, `copy_mode_can_always_resume_with_escape_without_stealing_idle_escape`; exact-binary PTY progress test |
 | `DispatchFollowUp` | The idle outer loop calls `claim_follow_up` once; it never scans past a non-follow-up head. | `followups_dispatch_one_at_a_time_in_fifo_order` |
 | `CommitStart` | Without an await, the controller calls `Agent::begin_turn`, commits the `PromptClaim`, and atomically writes the started history plus remaining queue. | `dropped_claim_rolls_back_and_commit_removes`; source-order review in `main` |
 | `RequeueStart` | Dropping an uncommitted `PromptClaim` restores the same ID at the front. Production start is currently infallible between claim and commit; the action over-approximates unwinding and future fallible setup. | `dropped_claim_rolls_back_and_commit_removes` |
-| `ProviderAnswer` | `complete_with_retry` commits a complete assistant response, emits no partial response into history, then reaches the no-tools boundary. Text and provider-supplied reasoning are separate display deltas; aborted streams receive separate display-only uncommitted markers. | `steering_queued_during_final_response_gets_another_model_call`, `provider_cancellation_commits_no_partial_assistant_message`, `cancelling_a_partial_stream_marks_the_visible_text_uncommitted`, `streamed_text_is_not_double_emitted`, `provider_reasoning_stays_out_of_chat_and_has_a_live_inspector` |
+| `ProviderAnswer` | `complete_with_retry` commits a complete assistant response only after host byte/block/tool validation, then reaches the no-tools boundary. Text and provider-supplied reasoning are separate display deltas; aborted streams receive separate display-only uncommitted markers. Committed Ratatui projections are bounded without changing history. | `steering_queued_during_final_response_gets_another_model_call`, `provider_cancellation_commits_no_partial_assistant_message`, `custom_provider_oversized_final_response_never_enters_history`, `custom_stream_stops_on_host_callback_limit_and_marks_preview_uncommitted`, `ignored_callback_limit_error_still_prevents_custom_provider_commit`, `committed_chat_and_reasoning_use_bounded_exact_projections` |
 | `ProviderRefusal` | Refusal pairs any anomalous tool uses with synthetic errors, checkpoints, and returns without accepting steering. | `refusal_with_tool_uses_is_repaired_before_checkpointing` |
 | `ProviderFailure` | A non-retryable error or exhausted retry sequence commits no partial assistant response and returns `Err`; the controller preserves prior valid history, normalizes queued steers to follow-ups, and returns idle without consuming them. | `non_retryable_errors_surface_immediately`, `history_survives_api_errors_after_tool_execution` |
-| `ProviderToolBatch` | A committed assistant response is scanned into a finite `tool_uses` vector; one loop iteration is consumed. | `tool_results_are_truncated_in_history`, `iteration_limit_leaves_late_steering_for_controller_normalization` |
+| `ProviderToolBatch` | A host-bounded committed assistant response is scanned into a finite `tool_uses` vector; one loop iteration is consumed. A burst over the completion limit is rejected before any tool-start event or execution. | `tool_results_are_truncated_in_history`, `iteration_limit_leaves_late_steering_for_controller_normalization`, `oversized_tool_burst_is_rejected_before_execution_or_commit` |
 | `CompleteTool` | Tools run sequentially; each outcome becomes one `ToolResult`. Truncation and unknown tools also return structured results. In code mode, an undeclared native call is never started or permission-checked and receives a synthetic error result. The reserved `update_goal` host control validates exact completion input, clears hidden goal state without capability permission, and produces a normal paired result at this same boundary. | `tool_results_are_truncated_in_history`, `history_survives_api_errors_after_tool_execution`, `code_mode_rejects_unadvertised_direct_tool_calls`, `update_goal_completes_without_capability_permission`, `invalid_goal_completion_keeps_the_goal_active` |
 | `AskPermission` | `PermissionBrokerPrompt::choose` allocates a monotonic request ID, sends one `PermissionRequest`, and awaits its one-shot. | `broker_correlates_the_ui_reply_with_its_request` |
-| `AllowPermission` | The reactor sends the choice only when the modal ID equals the live request ID; the handler records `AllowAlways` before execution. | `broker_request_ids_keep_out_of_order_replies_correlated`, `memory_handler_remembers_decisions_without_prompting` |
-| `DenyPermission` | A denial becomes a structured denied result. Denials inside code-mode bridge calls propagate through `ScriptResult::denied` even if Python exits successfully. | `dropped_broker_reply_denies_instead_of_hanging`, `denial_inside_code_mode_pauses_the_outer_turn` |
+| `AllowPermission` | The reactor sends the choice only when the modal ID equals the live request ID; the handler records `AllowAlways` before execution and removes an opposite remembered deny. | `broker_request_ids_keep_out_of_order_replies_correlated`, `memory_handler_remembers_decisions_without_prompting`, `remembered_policy_replacement_reset_and_clear_are_disjoint` |
+| `DenyPermission` | A denial becomes a structured denied result. `DenyAlways` removes an opposite remembered allow, and contradictory legacy/shared state is checked deny-first. Denials inside code-mode bridge calls propagate through `ScriptResult::denied` even if Python exits successfully. | `contradictory_remembered_permission_is_loaded_as_deny`, `contradictory_shared_policy_denies_fail_closed`, `dropped_broker_reply_denies_instead_of_hanging`, `denial_inside_code_mode_pauses_the_outer_turn` |
 | `PermissionResolution` (fairness action) | This is the union of allow/deny, not another Rust transition. Both choices are unavailable while copy mode owns input and become available again on F3/Esc resume. | broker correlation tests; exact-binary permission-during-copy PTY trace |
 | `ClaimSteering` | At a history-valid boundary, `PromptQueue::claim_steering` removes all visible steers, preserves their relative order, and leaves follow-ups. | `steering_claim_preserves_relative_order_and_followups` |
 | `CommitSteering` | `Agent::commit_steering` appends claimed text to the valid user boundary, commits IDs, emits `SteeringCommitted`, and checkpoints with no await between those operations. | `steering_queued_during_final_response_gets_another_model_call` |
@@ -130,7 +162,7 @@ same-UID Python, shell, file access, or direct filesystem access.
 | `RequestCancel` | Esc/Ctrl+C retires a live permission with deny-once, sets the turn-scoped watch flag, and keeps polling the controlled future until repair completes. | `cancellation_wins_over_a_ready_permission_before_steering`, `provider_cancellation_commits_no_partial_assistant_message` |
 | `RepairCancelledTool` | Cancellation drops the running tool future and emits synthetic error results for it and every unstarted tool use. | `interruption_pairs_the_running_and_unstarted_tool_uses`, `history_tool_protocol_is_valid` debug assertion |
 | `FinishCancellation` | After results are appended, the agent checkpoints and returns `Interrupted`; the controller retires nested TUI activity and normalizes undelivered steers. | `interruption_pairs_the_running_and_unstarted_tool_uses`, `interrupted_turn_retires_all_nested_activity`, `ending_turn_normalizes_undelivered_steers` |
-| `IdleWait` | With no follow-up, the outer `tokio::select!` continues polling terminal input, stale permission events, and frame ticks without owning `Agent` mutably. | `composer_keys_distinguish_busy_steering_from_followups`, source-order review in `main` |
+| `IdleWait` | With no follow-up, the outer `tokio::select!` continues polling terminal input, stale permission events, and frame ticks without owning `Agent` mutably. The pre-agent MCP reactor is a concrete strengthening: it permits the same idle queue transitions while withholding dispatch until registry ownership is settled. | `composer_keys_distinguish_turn_steering_from_background_queueing`, startup-recovery tests, source-order review in `main`; exact-binary stalled-MCP PTY test |
 
 ## Property mapping
 
@@ -139,11 +171,11 @@ same-UID Python, shell, file access, or direct filesystem access.
 | `TypeOK` | Rust enums and ownership constrain concrete values; TLC separately checks every modeled variable over the configured state space. |
 | `QueueIdentity` | `PromptQueue` owns one vector, saved duplicate IDs are filtered, all mutations address IDs, and claims remove before returning. Covered by the runtime queue tests. |
 | `SingleTurnOwnership` | A current-thread reactor pins one future borrowing `&mut Agent`; the outer loop cannot dispatch again until it returns. No `Arc<Mutex<Agent>>` or background runtime exists. |
-| `DeliveryIsWellFormed` | `DeliveryMode` has only two variants; idle submissions and host goal continuations are follow-ups, and all residual steers are normalized when ownership ends. `PromptSource` does not alter delivery semantics. |
+| `DeliveryIsWellFormed` | `DeliveryMode` has only two variants; idle/background submissions and host goal continuations are follow-ups, only `turn_active` permits creating a steer, and all residual steers are normalized when ownership ends. `PromptSource` does not alter delivery semantics. |
 | `SafeSteeringBoundary` | `commit_steering` is called only after a complete assistant answer or after the full result vector is appended. It is not called on refusal, cancellation, or an exhausted iteration budget. |
 | `TerminalReasonIsWellFormed` | Distinct Rust branches implement final answer, refusal, terminal provider error, structured denial, and cap. Error/refusal/cap cannot consume steering. The cancellation/permission race test prevents a cancelled turn from taking the denial-to-steer branch. |
 | `ToolHistoryIsValid` | `history_tool_protocol_is_valid` checks exact adjacent ID sets; every emitted `HistoryCheckpoint` debug-asserts it, every persistence path refuses an invalid history, load rejects invalid saves, and cancellation/refusal tests inspect checkpoint histories. |
-| `PermissionIsCorrelated` | IDs are monotonic, choices travel over the request's own one-shot, mismatched modal IDs are ignored, and dropping a reply denies once. |
+| `PermissionIsCorrelated` | IDs are monotonic, choices travel over the request's own one-shot, mismatched modal IDs are ignored, and dropping a reply denies once. Remembered policy is concrete hidden state: snapshots are disjoint, reset/clear runs only without a live request, and deny wins any contradictory loaded/shared entry. |
 | `SettledPromptsAreCommitted` | The controller records the initial user message before `PromptClaim::commit`; interrupted and ordinary outcomes therefore refer to a committed follow-up. |
 | `HistoryOrderHasStableIds` | Queue claims and `SteeringCommitted` preserve stable-ID order. `committedOrder` is a model ghost variable, verified through claim/event tests rather than stored in model-visible text. |
 | `EveryBusyPeriodSettles` | TLC checks settlement for the finite bounds under weakly fair agent progress, weakly fair copy exit, and strongly fair permission resolution when its UI is available infinitely often. Rust bounds provider rounds/retries and keeps polling them during copy mode; permission input waits for resume. External tools/providers, a user who never resumes, or a user who never answers remain environmental blockers. |
@@ -242,7 +274,7 @@ Rust SQL and catalog tests separately check every returned member.
 | TLA+ state | Authoritative Rust representation | Review note |
 | --- | --- | --- |
 | `activeScope`, `globalWasExplicit` | One `WorkspaceScope` selected in `main` before either store or the model context is built | `WorkspaceScope` has no default. Project discovery cannot return global, unscoped state does not deserialize, and only `--global` or the explicitly named library constructor selects global. |
-| `histories`, `memories` | Scoped state files under manifest-bearing scope directories and scope-keyed rows in `scoped-episodes.sqlite3` | These sets include archives written by prior runs. The model hides their text and disk representation. |
+| `histories`, `memories` | Live scoped state files under manifest-bearing scope directories and scope-keyed rows in `scoped-episodes.sqlite3` | These sets include archives written by prior runs and remove a named history after durable deletion. The model hides their text and disk representation. |
 | `writtenHistories`, `capturedMemories` | Files/rows created through the current `HistoryStore` and `MemoryWorker` | Both clients own an immutable scope and reject mismatched payload labels. |
 | `pendingKind`, `pendingFilter` | The archive tool name plus required `scope` input owned by one `ToolRegistry::execute_tool` invocation | Interactive policy checks additionally have a monotonic broker request ID and one-shot; remembered policy decisions do not open a modal. |
 | `disclosedHistory`, `historyDisclosureFilter` | The representative conversation result and categorical filter returned from an allowed search/read | Conversation manifests are filtered before any state file in an unselected scope is opened. Reads repeat both the filter and exact returned scope label. |
@@ -256,7 +288,9 @@ Rust SQL and catalog tests separately check every returned member.
 | --- | --- | --- |
 | `SelectProjectScope` | Default startup calls `WorkspaceScope::discover`, choosing the nearest canonical Git root or canonical working directory. The resulting value is passed unchanged to `HistoryStore`, `EpisodicMemory`, tool construction, saved state, and the model system context. | `project_discovery_uses_the_nearest_git_root`, `global_is_explicit_and_storage_keys_are_stable_and_distinct` |
 | `SelectGlobalScope` | Only CLI `--global` or the explicitly named library constructor creates `WorkspaceScope::Global`; there is no `Default` implementation and unscoped state is rejected. Global startup also omits project-local `AGENTS.md`/`CLAUDE.md`. Pre-scope flat files are not searched. | `unscoped_state_is_rejected_instead_of_becoming_global` plus source-order review in `main` |
-| `SaveHistory` | Every autosave, checkpoint, queue edit, `/save`, and compaction routes through the active `HistoryStore::save`, which rejects a state claiming another scope and writes beneath the deterministic scope directory. | `project_autosaves_are_isolated_and_global_does_not_fallback`, `save_rejects_scope_mismatch_and_path_traversal`, `persistence_rejects_an_invalid_tool_protocol_boundary` |
+| `SaveHistory` | Every autosave, checkpoint, queue edit, `/save`, and compaction routes through the active `HistoryStore`. Controller checkpoints use atomic replace. A fresh manual name uses atomic no-clobber creation; concurrent creators have exactly one winner. Replacing a valid named save requires a separate default-Cancel host confirmation, while invalid/symlinked targets and manual `autosave` are refused. Every path rejects state claiming another scope and writes beneath the deterministic scope directory. | `project_autosaves_are_isolated_and_global_does_not_fallback`, `save_rejects_scope_mismatch_and_path_traversal`, `save_if_absent_never_clobbers_an_existing_named_session`, `concurrent_save_if_absent_has_exactly_one_winner`, `persistence_rejects_an_invalid_tool_protocol_boundary`, exact-binary saved-session lifecycle probe |
+| `ForgetHistory` | `/history forget <name>` verifies a current-scope saved state, requires an explicit host confirmation with Cancel selected by default, rejects `autosave`, removes only that regular file, and syncs the scope directory before reporting success. Historical `writtenHistories` evidence remains monotone, and saving the same name later is allowed. | `forgetting_is_current_scope_only_durable_and_allows_resave`, `forgetting_rejects_reserved_traversal_and_symlinked_targets`, `successful_forget_is_recorded_in_the_archive_model_trace`, exact-binary saved-session lifecycle probe |
+| host history inspection (hidden stutter) | `/history list|search|show` calls only `HistoryStore::list`, `search_current_archives`, or `inspect_current_archive`; each is bound to the handle's current scope and returns sanitized metadata/events without replacing `Agent` history. | `history_commands_preserve_names_and_require_explicit_arguments`, `host_inspection_is_current_scope_only_sanitized_and_non_loading`, `history_catalog_is_sorted_searchable_sanitized_and_non_mutating` |
 | `CaptureMemory` | `EpisodicMemory::build_episode` stamps the handle's immutable scope label; `MemoryWorker::record` rejects another label and inserts with the worker-owned scope key. | `project_handles_cannot_search_or_delete_each_others_episodes`, `global_scope_is_explicit_and_cross_scope_search_is_bounded_by_filter` |
 | `RequestSearch` | Each archive tool requires a non-empty query/ID and categorical scope selector; each read also repeats the exact scope label from search. `ToolRegistry` submits that input to the ordinary permission policy and privately constructs `ToolAuthorization` only after allow. | `archive_tools_run_through_the_registry_permission_gate`, `tools_require_explicit_scope_and_return_scope_labels`, `disclosure_grants_are_bound_to_the_exact_authorized_call` |
 | `DenySearch` | A denied registry decision returns a structured denied tool result without calling the history catalog or SQLite worker. | `archive_tools_run_through_the_registry_permission_gate` |
@@ -307,12 +341,16 @@ execution. Display-only actions are covered by
 - Streaming text/reasoning deltas, reasoning-modal scroll, and Ratatui frames
   are hidden display state. Copy-mode ownership is modeled separately because
   it disables user transitions; rendering beneath that ownership remains
-  hidden. Only a complete provider response enters model history. The event
-  channel is unbounded, but
-  permission, frame, and terminal branches precede display-event draining and
-  frames are batched by the 50 ms tick; a pathological provider can consume
-  memory but cannot indefinitely starve terminal input outside the user's
-  explicit copy-mode pause.
+  hidden. Only a complete provider response enters model history. The concrete
+  display pump coalesces consecutive text/reasoning fragments into one record,
+  caps their combined pending preview at 16 KiB, reports omitted byte counts,
+  and reconciles a successful attempt from a post-commit `StreamCommitted`
+  snapshot. Each committed chat/reasoning projection is capped at 64 Ki
+  characters while full accepted content remains in history and explicit copy
+  paths. Permission, frame, and terminal branches precede display draining, and
+  frames are batched by the 50 ms tick. Lossless structural events and
+  checkpoints are not globally capacity-limited; adversarial structural volume
+  remains outside the display abstraction.
 - Provider tool-name validation is an implementation strengthening outside the
   model's payload abstraction. Code mode advertises only `python` as a
   capability plus the reserved `update_goal` control while a goal is active; any
@@ -339,6 +377,13 @@ execution. Display-only actions are covered by
   bounded, resumable transcript pages so the bridge does not receive one
   unbounded result; building/searching the local archive still has no storage
   quota.
+- MCP connection state, schemas, per-server progress, and discovery cancellation
+  are hidden startup data. Servers are attempted in deterministic name order;
+  Esc retains only the completed prefix and drops the in-progress transport.
+  The model sees queue edits accepted during that interval as ordinary idle
+  transitions. Exact autosave checks and the pre-agent `DurableBoundary` are
+  concrete refinement evidence; the model does not prove transport cleanup or
+  successful connection to an external server.
 - Typed local commands, including `/goal edit`, and `/load` mutate session
   state only while idle. They are outside the active-turn model and must retain
   that guard. The active objective is host instruction state, not conversation
@@ -398,10 +443,10 @@ TLC then completed all checked configurations without error:
 
 - `AsyncRuntime.cfg`: 470,086 generated states, 117,750 distinct, depth 27;
 - `MemoryRuntime.cfg`: 7,627 generated states, 1,690 distinct, depth 16; and
-- `ArchiveScopeRuntime.cfg`: 163,652 generated states, 20,341 distinct,
-  depth 11.
+- `ArchiveScopeRuntime.cfg`: 519,516 generated states, 59,725 distinct,
+  depth 13.
 
-The complete locked Rust validation passed 144 library tests, 6 binary tests,
+The complete locked Rust validation passed 176 library tests, 12 binary tests,
 all example targets, and 2 documentation tests. Formatting, Clippy with
 warnings denied, ShellCheck, the strengthened traceability lint, research
 corpus validators, hook tests, and `git diff --check` also passed.
@@ -476,6 +521,21 @@ transition. The review found and corrected:
 - idle and spinner-only ticks rebuilding the complete transcript unnecessarily,
   and ordinary agent-event backlog taking priority over terminal input. Dirty
   frames, a 10 FPS spinner, and reactor branch ordering bound the display work;
+- provider token fragmentation still allocating one unbounded FIFO record per
+  callback despite that branch ordering. The same-task pump now preserves
+  structural boundaries while coalescing one million alternating single-byte
+  text/reasoning callbacks into one 16 KiB preview record, discloses the exact
+  omitted byte count, and uses a committed response snapshot to remove the cap
+  marker only on success. `structural_events_split_stream_batches_without_reordering`,
+  `million_fragment_burst_has_one_hard_bounded_preview_record`, and
+  `committed_stream_replaces_a_truncated_preview_exactly` cover those boundaries;
+- arbitrary provider output-token defaults and large committed snapshots. The
+  fixed 16,000-token request is gone: Anthropic discovers its model maximum,
+  compatible endpoints own their default unless the user passes
+  `--max-tokens`, and independent byte/block/tool/wire limits reject malformed
+  or oversized responses before commit. Ratatui renders exact bounded
+  projections with explicit full-copy paths. The adversarial callback, final
+  response, tool-burst, and maximum-projection tests cover these boundaries;
 - untrusted text reaching terminal cells with raw control bytes, and partial
   startup failures leaving terminal modes enabled. Display-only sanitization
   and a shared cleanup path now cover every rendered source and initialization
@@ -670,3 +730,170 @@ queue/cancel actions while the modal is open, but provider/tool transitions
 continue. Search reads only sanitized in-memory `ChatEntry` values and has no
 path to provider history, queued prompts, tool payloads, reasoning, archived
 sessions, or durable writes.
+
+## 2026-08-04 interactive MCP-startup refinement audit
+
+The exact rebuilt debug binary ran in two isolated 100×30 PTYs. The first used
+an MCP JSON object that deliberately listed `z_stalled` before `a_ready`.
+Discovery nevertheless completed and reported `a_ready` first, registered its
+one bridge, then blocked in `z_stalled`'s initialize handshake. While that
+future remained pending, the composer accepted a bracketed Unicode paste and
+Enter persisted it as `delivery: follow_up`. F2 opened the same authoritative
+queue, replaced the text, and atomically updated the scoped autosave. No
+provider request occurred before either write.
+
+After the queue modal closed, Esc skipped discovery. The in-progress stdio
+child was killed and reaped, the completed `a_ready_ping` bridge appeared in
+the subsequent provider request, `z_stalled_ping` did not, and the edited text
+was the only submitted prompt. Exactly one provider request settled, the final
+autosave had an empty queue and matching committed user/assistant history, and
+normal exit restored echo, canonical input, bracketed-paste state, and the
+alternate screen. A second process exited with Ctrl+D during a lone stalled
+handshake: it issued no provider request, reaped that child, and restored the
+same terminal modes.
+
+Focused Rust tests separately verify sorted configuration order, cumulative
+per-server progress, pre-agent recovery admission, invalid tool-boundary
+rejection, follow-up delivery during background activity, and the prohibition
+on reclassifying a queued follow-up as steer without turn ownership. The TLA+
+model needs no startup variable: MCP transport/progress/cancellation is hidden,
+while accepted queue operations refine existing idle actions and concrete
+dispatch is withheld until registry ownership moves into `Agent`.
+
+## 2026-08-04 remembered-permission control audit
+
+The exact rebuilt debug binary ran against a deterministic streaming provider
+in an isolated 100×30 PTY. Its first turn requested the outer code-mode
+`python` capability and then nested `bash`; choosing allow-always for both
+produced a scoped autosave containing exactly those two allows.
+`/permissions` displayed the policy in stable name order. Resetting only
+`bash` atomically removed that entry while preserving `python`, and the next
+turn auto-allowed `python` but opened a fresh modal for `bash`. Choosing
+deny-always persisted one allow and one deny, after which `/permissions clear`
+persisted two empty sets. A third turn prompted for both layers again;
+allow-once completed it without repopulating either set. Exactly five provider
+requests occurred, matching the two successful two-round turns plus the
+single denied turn, and Ctrl+D restored echo/canonical input, bracketed paste,
+and the alternate screen.
+
+A second isolated process began from a protocol-valid autosave that deliberately
+listed `bash` in both remembered sets and contained one queued prompt. Startup
+normalized the conflict to deny before installing policy. After allow-once for
+the outer `python` call, nested `bash` was automatically denied: a sentinel
+shell side effect did not occur, no second provider request was issued, and the
+settled autosave held only `always_deny_tools = {bash}` with an empty queue.
+The `/permissions` display and terminal cleanup matched that state.
+
+Parser/controller tests cover exact command grammar, sorted rendering, reset,
+and clear. Policy/state tests separately cover disjoint replacement, shared
+contradictory state, and saved-state normalization. The TLA+ model deliberately
+hides the remembered sets: each command runs without a live permission request
+and refines a stutter step; the next concrete tool use either applies policy or
+reaches the existing correlated `AskPermission` action.
+
+## 2026-08-04 tool-catalog control audit
+
+The exact rebuilt debug binary ran in an isolated 140×70 tmux PTY with one
+stdio MCP fixture. Discovery registered `catalog_find` as the eighteenth
+bridge. `/tools search FAKE CATALOG` matched it case-insensitively and labeled
+its schema on demand; `/tools show catalog_find` displayed the description and
+JSON schema including the required `needle` field; `/tools` showed all bridge
+names in stable alphabetical order and reported `python` as the separate
+model-facing interface.
+
+The loopback provider received zero requests. The MCP server observed exactly
+`initialize`, `notifications/initialized`, and `tools/list`, with no
+`tools/call`. The scoped autosave's SHA-256 digest remained unchanged across
+list/search/show and exit; its history, queue, goal, and remembered permission
+sets stayed empty. Normal exit reaped the MCP child, restored echo and
+canonical input, and left tmux's alternate screen.
+
+Parser tests cover the complete typed grammar. Counter-backed controller tests
+separately prove that list/search/show execute no registered capability, append
+no history, sort independently of registration order, and cap both long lists
+and oversized detail. This remains a hidden idle-state projection in
+`AsyncRuntime.tla`; it enables no modeled transition and therefore needs no new
+state variable or operator.
+
+## 2026-08-04 slash-completion refinement audit
+
+The exact rebuilt debug binary ran in an isolated 120×40 tmux PTY against a
+loopback provider. Unmodified Tab changed the unique `/to` prefix to canonical
+`/tools ` without enqueueing or creating an autosave. The ambiguous
+`/tools s` prefix remained byte-for-byte unchanged while the footer continuously
+showed `/tools search` and `/tools show`; completing `/tools se` produced
+`/tools search ` and a stable complete-prefix hint.
+
+After the user added the argument `catalog`, Tab followed its preexisting
+fallback path and submitted the local command. `/tools search catalog` ran with
+an empty result, after which the scoped autosave contained empty history and
+queue. The provider received zero requests throughout, exit did not change the
+autosave digest, and echo/canonical input plus the alternate screen were
+restored. Unit tests additionally cover leading whitespace, case
+canonicalization, top-level ambiguity, Unicode argument text, mid-composer
+cursor refusal, newline refusal, and catalog-to-parser subcommand closure.
+
+Completion does not add a TLA+ transition. A consumed Tab mutates only hidden
+composer/display data; when completion returns no match because an argument is
+already present, the unchanged key path refines the existing `Enqueue` action.
+
+## 2026-08-05 explicit-memory evaluation audit
+
+`benchmarks/episodic_memory` exercises the shipped Stage 1 boundary rather than
+simulating another store. Eight corpus records were written through distinct
+`EpisodicMemory` handles, saved through the real `HistoryStore`, and searched
+through the permission-gated `search_memories` and `search_conversations`
+tools. B0 retained no row. B1 and deliberately named saves each recovered all
+seven supported facts at precision `0.875`; latest autosave recovered one.
+Both full-history conditions returned the older preference after the newer
+one, so the result establishes chronological literal retrieval—not semantic or
+temporal truth selection.
+
+The exact rebuilt binary then ran in an isolated 120×44 tmux PTY against a
+loopback streaming provider. A paused-capture prompt was answered but remained
+absent from explicit search and the final database. During a 1.5-second
+provider stall, new input rendered in 80 ms and queued for later dispatch.
+During an external `BEGIN IMMEDIATE`, new input rendered in 59 ms and queued;
+no provider request began while `/memory pause` was pending, the command
+reported `database is locked` after the configured timeout, and the queued turn
+ran after settlement. FIFO search then found it. After the four accounting
+requests, a fifth request streamed 30,000 one-byte deltas. Once 20,000 had
+crossed the provider boundary, composer input rendered in 73 ms, the committed
+tail became visible, and the turn returned idle. All five provider requests
+advertised only the outer `python` tool, normal `/exit` ended the PTY, and the
+three B1 markers were the only evaluated markers retained.
+Before those turns, a fail-once stdio MCP fixture surfaced as failed at
+startup. `/mcp retry flaky` connected it, `/mcp status` changed from 0/1 to
+1/1, and `/tools show flaky_ping` exposed the recovered bridge immediately.
+Retries of the connected server and an unknown name were both refused. The
+recovery path made zero provider requests.
+The same process then ran `/history search b0-not-retained-5q` and `/history
+show autosave`: both rendered the sanitized current-scope save, made zero
+provider requests, and left the autosave content hash unchanged. It then used
+direct `/save lifecycle checkpoint`, canceled a replacement while preserving a
+seeded prior-file hash, explicitly replaced it, refused manual `/save autosave`,
+and loaded the named checkpoint. It then canceled the first confirmed forget,
+deleted on the second confirmation, verified the file and `/history show`
+result were absent, and refused forgetting `autosave`. The entire host lifecycle
+still made zero provider requests and did not change autosave content.
+Finally, `/usage` rendered four attempts, four usage payloads, four input and
+four output tokens, plus explicit zero-of-four cache-field coverage. After
+`/usage reset`, `/usage show` rendered an empty ledger. These commands made no
+provider request and left autosave bytes unchanged; the fixture establishes
+controller accounting, not vendor token accuracy or cost.
+
+The same evaluator ran eight abrupt process exits after non-awaited enqueue,
+three exits after awaited durable acknowledgement, and three kills after
+enqueue while a writer lock prevented insertion. Every non-awaited outcome was
+either absent or one complete episode; every acknowledged row was complete;
+every locked kill was absent. There were no duplicate/partial rows, the
+immutable update trigger rejected mutation, and SQLite `integrity_check`
+returned `ok`. This is sampled fault injection around the current single-row
+insert, not proof of the unimplemented draft/event/finalize protocol.
+
+The authoritative result is
+`benchmarks/episodic_memory/results/20260805T014941Z-local-explicit-memory.jsonl`.
+It supports retaining explicit episodic inspection because it outperforms
+latest autosave, but it does not justify automatic retrieval or consolidation:
+named saves matched retrieval quality, and the deterministic provider does not
+measure answer quality.

@@ -164,6 +164,7 @@ def normalize_archive(events: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
         "select_project_scope",
         "select_global_scope",
         "save_history",
+        "forget_history",
         "capture_memory",
         "request_search",
         "deny_search",
@@ -183,7 +184,11 @@ def normalize_archive(events: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
             scope_name = scope(event["scope"])
         elif action == "select_global_scope":
             scope_name = "global"
-        elif action in {"save_history", "approve_history_search"}:
+        elif action in {
+            "save_history",
+            "forget_history",
+            "approve_history_search",
+        }:
             item = histories.get(event["history_id"])
         elif action in {"capture_memory", "approve_memory_search"}:
             item = memories.get(event["memory_id"])
@@ -254,6 +259,7 @@ TraceAction(event) ==
     CASE event[1] = "select_project_scope" -> SelectProjectScope(event[2])
       [] event[1] = "select_global_scope" -> SelectGlobalScope
       [] event[1] = "save_history" -> SaveHistory(event[3])
+      [] event[1] = "forget_history" -> ForgetHistory(event[3])
       [] event[1] = "capture_memory" -> CaptureMemory(event[3])
       [] event[1] = "request_search" -> RequestSearch(event[4], event[5])
       [] event[1] = "deny_search" -> DenySearch

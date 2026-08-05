@@ -45,6 +45,7 @@ impl SavedState {
     pub fn from_json(json: &str) -> serde_json::Result<Self> {
         let mut state = serde_json::from_str::<SavedState>(json)?;
         state.sanitize_host_message_origins();
+        state.normalize_permission_policy();
         Ok(state)
     }
 
@@ -55,6 +56,14 @@ impl SavedState {
                 message.origin = MessageOrigin::Conversation;
             }
         }
+    }
+
+    /// Contradictory legacy policy is resolved fail-closed. New writes are
+    /// disjoint, but applying the rule at the load boundary also protects
+    /// users who inspect or transform a `SavedState` before installing it.
+    fn normalize_permission_policy(&mut self) {
+        self.always_allow_tools
+            .retain(|tool| !self.always_deny_tools.contains(tool));
     }
 }
 
@@ -128,5 +137,22 @@ mod tests {
             MessageOrigin::Conversation,
             "matching text is not host-authored without explicit provenance"
         );
+    }
+
+    #[test]
+    fn contradictory_remembered_permission_is_loaded_as_deny() {
+        let json = r#"{
+            "scope": {"kind": "global"},
+            "provider": "openai",
+            "model": "model",
+            "conversation_history": [],
+            "always_allow_tools": ["bash", "read_file"],
+            "always_deny_tools": ["bash"]
+        }"#;
+
+        let loaded = SavedState::from_json(json).unwrap();
+
+        assert_eq!(loaded.always_allow_tools, ["read_file".to_string()].into());
+        assert_eq!(loaded.always_deny_tools, ["bash".to_string()].into());
     }
 }

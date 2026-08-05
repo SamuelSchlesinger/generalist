@@ -30,6 +30,33 @@ pub fn latest_assistant_text(history: &[Message]) -> Option<String> {
         .find(|text| !text.is_empty())
 }
 
+/// Return the most recent inspectable provider reasoning in committed history.
+///
+/// Only the human-readable `thinking` field is returned. Provider signatures
+/// and redacted reasoning payloads are deliberately excluded.
+pub fn latest_assistant_reasoning(history: &[Message]) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "assistant")
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    crate::types::ContentBlock::Thinking { thinking, .. }
+                        if !thinking.is_empty() =>
+                    {
+                        Some(thinking.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .find(|reasoning| !reasoning.is_empty())
+}
+
 /// Render committed user/assistant text as a plain, model-visible transcript.
 ///
 /// Host-authored goal continuations and tool-only messages are omitted. A
@@ -123,6 +150,28 @@ mod tests {
             latest_assistant_text(&history).as_deref(),
             Some("first answer")
         );
+    }
+
+    #[test]
+    fn latest_reasoning_excludes_signatures_and_redacted_payloads() {
+        let history = vec![Message::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "inspectable first".into(),
+                signature: "provider-signature-secret".into(),
+            },
+            ContentBlock::RedactedThinking {
+                data: "opaque-provider-payload".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "inspectable second".into(),
+                signature: "another-signature".into(),
+            },
+        ])];
+
+        let reasoning = latest_assistant_reasoning(&history).unwrap();
+        assert_eq!(reasoning, "inspectable first\n\ninspectable second");
+        assert!(!reasoning.contains("signature"));
+        assert!(!reasoning.contains("opaque"));
     }
 
     #[test]

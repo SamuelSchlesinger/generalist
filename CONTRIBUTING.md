@@ -28,7 +28,7 @@ architecture prose that can be updated from memory.
 
 For every change touching `src/main.rs`, `src/command.rs`, `src/goal.rs`, `src/tui.rs`,
 `src/runtime.rs`, `src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`,
-`src/tool.rs`, `src/provider/`, `src/types.rs`, or queue/goal-bearing
+`src/tool.rs`, `src/mcp.rs`, `src/provider/`, `src/types.rs`, or queue/goal-bearing
 persistence in `src/state.rs`, plus every change to `src/memory.rs`,
 `src/history.rs`, `src/scope.rs`, or `src/tools/archive.rs`:
 
@@ -74,7 +74,8 @@ persistence in `src/state.rs`, plus every change to `src/memory.rs`,
    restored. Exercise `F3` while the fake provider advances: mouse selection
    must work, the captured frame must stay frozen, and the accumulated state
    must appear after `F3` resumes. Re-enter with `/copy select` and verify Esc
-   follows the same resume path. Capture `/copy last` and `/copy all` output at
+   follows the same resume path. Capture `/copy last`, `/copy all`, and
+   `/copy reasoning` output at
    the PTY boundary, decode the OSC 52 payload, and compare it with committed
    history; do not treat emission as proof that a real terminal accepted the
    clipboard write. Inject a bracketed Unicode paste after resuming and inspect
@@ -85,12 +86,58 @@ persistence in `src/state.rs`, plus every change to `src/memory.rs`,
    provider reasoning and with no reasoning field; answer text must stay out of
    the inspector, reasoning must stay out of conversation text, and provider
    signatures/redacted payloads must never render.
+   For remembered-policy changes, choose allow-always in the permission modal,
+   verify `/permissions` and the scoped autosave show that exact tool, reset it,
+   and confirm the next use prompts again. Repeat with deny-always and
+   `/permissions clear`; a contradictory saved fixture must deny and normalize
+   to disjoint sets. Treat the command's rendered status as insufficient
+   without the subsequent prompt and durable JSON evidence.
+   Exercise `/tools`, a case-insensitive `/tools search`, and `/tools show` on
+   the rebuilt binary after MCP discovery. Confirm stable ordering, the
+   schema-on-demand label, the separate model-facing interface, and that no
+   provider request, permission modal, tool activity, history entry, or change
+   to durable-state contents occurs.
+   Exercise `/save lifecycle checkpoint`, `/load lifecycle checkpoint`,
+   `/history list`, a case-insensitive `/history search`, and `/history show`
+   against current- and foreign-scope fixtures. Run `/history forget lifecycle
+   checkpoint` once with the default Cancel and once with explicit Delete;
+   confirm the first retains the file, the second durably removes only the
+   current-scope file, and `/history forget autosave` is refused. Save the same
+   checkpoint once with the default Cancel and once with explicit Replace;
+   confirm the file is respectively unchanged and replaced, `/save autosave`
+   is refused, and concurrent fresh creators cannot clobber each other. Also
+   confirm stable names, current-scope filtering, reasoning/tool-payload omission,
+   bounded detail, no unintended active-session replacement, unchanged
+   autosave contents, and zero provider requests. Keep direct host inspection
+   distinct from permission-gated cross-scope archive tools.
+   After deterministic provider calls, exercise `/usage`, `/usage reset`, and
+   `/usage show`. Confirm per-provider/model attempts and provider-reported
+   input/output totals, explicit missing/cache-field coverage, an empty ledger
+   after reset, unchanged autosave bytes, and zero additional provider calls.
+   Do not treat the current-context estimate or these reports as monetary cost.
+   For command-completion changes, drive unmodified Tab through a unique
+   command prefix, an ambiguous subcommand prefix, and a completed command with
+   argument text. The first two must not enqueue or create an autosave; the
+   third must retain Tab's follow-up submission behavior. Check canonical text,
+   candidate status, provider request count, queue state, and terminal cleanup.
+   For startup changes, configure a deliberately stalled MCP server and repeat
+   the terminal exercise before any `Agent` exists: type and paste a prompt,
+   edit it through F2, and verify the scoped autosave changes before releasing
+   the handshake. Confirm the header reports completed servers in deterministic
+   order, Enter queues a follow-up rather than a steer, no provider request
+   begins early, and Esc drops the in-progress transport while retaining only
+   already reported tools. Then use a fail-once server to verify `/mcp status`,
+   targeted `/mcp retry <server>`, connected status, and immediate `/tools show`
+   visibility without a provider request; retrying an already connected or
+   unknown server must be refused. Check terminal cleanup on an exit during
+   discovery.
 9. Run `make check`, inspect the complete diff, and repeat the trace for any
    fix made during validation.
 
 Pay particular attention to the races that have found real defects before:
 
 - terminal input becoming ready at the same time as a provider response;
+- terminal input or cancellation becoming ready with MCP discovery progress;
 - cancellation becoming ready with the final permission reply;
 - cancellation during the running and not-yet-started members of a tool batch;
 - a denial inside a code-mode script that catches the Python exception;
@@ -138,8 +185,10 @@ Do not represent the prototype as the research design. In particular, its
 same-UID in-process worker is not a supervisor security boundary, its physical
 delete is only a live-store operation, and it has no trusted secret redaction,
 lineage, candidates, tombstone ledger, automatic retrieval, collaboration, or
-consolidation. Product-value evaluation of explicit episodic search is the next
-gate; do not add those later layers merely because the schema could hold them.
+  consolidation. The maintained B0/B1 evaluation found that episodic capture
+  beats latest autosave but ties deliberately named saves and returns stale
+  lexical matches alongside current ones. Keep this as an explicit inspection
+  feature; do not add later layers merely because the schema could hold them.
 
 Review memory changes against these boundaries:
 
@@ -172,6 +221,13 @@ If future work introduces automatic retrieval, derived records, external
 workers, or multi-agent sharing, the deferred provenance, epoch, tombstone,
 worker-session, and `CollaborationRuntime.tla` requirements in the research
 handoff become active gates rather than optional polish.
+
+Run `make memory-evaluation` after changing episodic capture/search, scoped
+history search, deletion, worker scheduling, process-exit behavior, or the
+memory-command TUI reactor. Preserve failed JSONL runs rather than overwriting
+them. The deterministic fixture establishes lifecycle and retrieval mechanics,
+not model answer quality; any product-quality claim still needs paired real
+model trajectories with fixed provider/model versions.
 
 ## Change hygiene
 

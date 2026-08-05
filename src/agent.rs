@@ -23,8 +23,8 @@ use crate::provider::Provider;
 use crate::runtime::{PromptSource, QueuedPrompt, TurnControl};
 use crate::tool::{ToolCallOutcome, ToolCallResult, ToolRegistry};
 use crate::types::{
-    estimate_tokens, truncate_middle, CompletionDelta, CompletionRequest, ContentBlock, Message,
-    StopReason, Usage,
+    estimate_tokens, truncate_middle, CompletionDelta, CompletionLimits, CompletionRequest,
+    ContentBlock, Message, StopReason, Usage,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -75,11 +75,26 @@ pub enum AgentEvent {
     /// deltas).
     AssistantText(String),
     /// A streamed fragment of assistant text. Render incrementally; a final
-    /// `ApiCallFinished` closes the message.
+    /// [`AgentEvent::StreamCommitted`] reconciles a successful bounded preview.
     AssistantTextDelta(String),
     /// A provider-supplied reasoning fragment. This is inspectable UI data,
     /// not assistant-visible conversation text.
     ReasoningDelta(String),
+    /// The authoritative display contents for kinds that streamed during a
+    /// successful provider attempt. Emitted only after the response entered
+    /// conversation history, so a UI may replace a bounded live preview
+    /// without mistaking an uncommitted stream for durable conversation.
+    StreamCommitted {
+        text: Option<String>,
+        reasoning: Option<String>,
+    },
+    /// The live display pump omitted fragment bytes to keep its pending
+    /// preview bounded. This is display-only: a successful attempt is later
+    /// reconciled by [`AgentEvent::StreamCommitted`].
+    StreamDisplayTruncated {
+        text_bytes: usize,
+        reasoning_bytes: usize,
+    },
     /// A provider attempt emitted visible deltas but failed or was cancelled
     /// before a complete response could enter conversation history.
     AssistantStreamAborted { reason: String },
@@ -147,8 +162,12 @@ pub struct Agent {
     history: Vec<Message>,
     /// Cap on request → tool → request rounds within a single turn.
     pub max_iterations: usize,
-    /// `max_tokens` per completion.
-    pub max_tokens: u32,
+    /// Optional provider output-token request. `None` delegates to the
+    /// adapter/provider where its protocol permits.
+    pub max_tokens: Option<u32>,
+    /// Host-authoritative response limits, independent of provider token
+    /// accounting or compliance with `max_tokens`.
+    pub completion_limits: CompletionLimits,
     /// Cap (in characters) on a single tool result as stored in history.
     pub max_tool_result_chars: usize,
     /// Retries for transient API errors, with exponential backoff.
@@ -190,7 +209,8 @@ impl Agent {
             goal: None,
             history: Vec::new(),
             max_iterations: 100,
-            max_tokens: 16_000,
+            max_tokens: None,
+            completion_limits: CompletionLimits::default(),
             max_tool_result_chars: 40_000,
             max_retries: 3,
             code_mode: true,
@@ -261,6 +281,16 @@ impl Agent {
         self.code_mode && !self.registry.has_tool("python")
     }
 
+    /// Whether the built-in Python runner currently owns the model-facing
+    /// capability boundary.
+    ///
+    /// This is useful to host UIs that describe the effective tool surface:
+    /// a library user can disable code mode or override the reserved runner by
+    /// registering a custom tool named `python`.
+    pub fn uses_builtin_code_mode(&self) -> bool {
+        self.builtin_code_mode_enabled()
+    }
+
     fn is_code_mode_call(&self, name: &str) -> bool {
         self.builtin_code_mode_enabled() && name == "python"
     }
@@ -282,6 +312,15 @@ impl Agent {
             definitions.push(update_goal_tool_def());
         }
         definitions
+    }
+
+    /// Exact tool definitions that the next provider request will advertise.
+    ///
+    /// In built-in code mode this is the synthetic `python` runner plus the
+    /// host-owned `update_goal` control when a goal is active. Registered
+    /// bridge capabilities remain inspectable through [`ToolRegistry`].
+    pub fn advertised_tool_defs(&self) -> Vec<crate::types::ToolDef> {
+        self.model_tool_defs()
     }
 
     pub fn provider(&self) -> &dyn Provider {
@@ -449,6 +488,32 @@ impl Agent {
 
             self.history
                 .push(Message::assistant(response.content.clone()));
+
+            if streamed.text || streamed.reasoning {
+                let text = streamed.text.then(|| {
+                    response
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+                let reasoning = streamed.reasoning.then(|| {
+                    response
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                });
+                on_event(AgentEvent::StreamCommitted { text, reasoning });
+            }
 
             if !streamed.reasoning {
                 for block in &response.content {
@@ -899,9 +964,11 @@ impl Agent {
             system: Some("You produce faithful, dense summaries of agent conversations."),
             messages: &to_summarize,
             tools: &[],
-            max_tokens: 2_000,
+            max_tokens: Some(2_000),
+            limits: self.completion_limits,
         };
         let response = self.provider.complete(request).await?;
+        self.completion_limits.validate_response(&response)?;
         let summary = response
             .content
             .iter()
@@ -982,18 +1049,38 @@ impl Agent {
                 messages: &self.history,
                 tools: &tools,
                 max_tokens: self.max_tokens,
+                limits: self.completion_limits,
             };
             let mut streamed = StreamedKinds::default();
+            let mut streamed_bytes = 0usize;
+            let mut callback_limit_error = None::<String>;
             let maybe_result = {
-                let mut forward = |delta: CompletionDelta| match delta {
-                    CompletionDelta::Text(text) => {
-                        streamed.text = true;
-                        on_event(AgentEvent::AssistantTextDelta(text));
+                let mut forward = |delta: CompletionDelta| -> Result<()> {
+                    if let Some(error) = &callback_limit_error {
+                        return Err(crate::error::Error::Other(error.clone()));
                     }
-                    CompletionDelta::Reasoning(reasoning) => {
-                        streamed.reasoning = true;
-                        on_event(AgentEvent::ReasoningDelta(reasoning));
+                    streamed_bytes = match self
+                        .completion_limits
+                        .checked_response_bytes(streamed_bytes, delta.len_bytes())
+                    {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            let error = error.to_string();
+                            callback_limit_error = Some(error.clone());
+                            return Err(crate::error::Error::Other(error));
+                        }
+                    };
+                    match delta {
+                        CompletionDelta::Text(text) => {
+                            streamed.text = true;
+                            on_event(AgentEvent::AssistantTextDelta(text));
+                        }
+                        CompletionDelta::Reasoning(reasoning) => {
+                            streamed.reasoning = true;
+                            on_event(AgentEvent::ReasoningDelta(reasoning));
+                        }
                     }
+                    Ok(())
                 };
                 let completion = self.provider.complete_streaming(request, &mut forward);
                 tokio::pin!(completion);
@@ -1001,6 +1088,13 @@ impl Agent {
                     result = &mut completion => Some(result),
                     _ = control.cancelled() => None,
                 }
+            };
+            // A custom provider may violate the callback contract and ignore
+            // its error. The host still rejects the attempt before commit.
+            let maybe_result = if let Some(error) = callback_limit_error {
+                maybe_result.map(|_| Err(crate::error::Error::Other(error)))
+            } else {
+                maybe_result
             };
             let Some(result) = maybe_result else {
                 emit_stream_aborted(
@@ -1013,6 +1107,15 @@ impl Agent {
             };
             match result {
                 Ok(response) => {
+                    if let Err(error) = self.completion_limits.validate_response(&response) {
+                        emit_stream_aborted(
+                            on_event,
+                            streamed,
+                            format!("response was rejected before it was committed: {error}"),
+                        );
+                        on_event(AgentEvent::ApiCallFinished { usage: None });
+                        return Err(error);
+                    }
                     on_event(AgentEvent::ApiCallFinished {
                         usage: response.usage.clone(),
                     });
@@ -1560,9 +1663,9 @@ mod tests {
         async fn complete_streaming(
             &self,
             _request: CompletionRequest<'_>,
-            on_delta: &mut dyn FnMut(CompletionDelta),
+            on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
         ) -> Result<CompletionResponse> {
-            on_delta(CompletionDelta::Text("visible but uncommitted".to_string()));
+            on_delta(CompletionDelta::Text("visible but uncommitted".to_string()))?;
             self.started.notify_one();
             std::future::pending::<Result<CompletionResponse>>().await
         }
@@ -1605,6 +1708,201 @@ mod tests {
                 }));
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn custom_provider_oversized_final_response_never_enters_history() {
+        let mut agent = Agent::new(
+            Box::new(Script::new(vec![Ok(text_response("too large"))])),
+            ToolRegistry::new(),
+            "test",
+        );
+        agent.completion_limits = CompletionLimits {
+            max_response_bytes: 4,
+            ..CompletionLimits::default()
+        };
+        let mut events = Vec::new();
+
+        let error = agent
+            .run_turn("question", &mut |event| events.push(event))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("payload limit of 4 bytes"));
+        assert_eq!(agent.history.len(), 1);
+        assert!(matches!(
+            agent.history[0].content[0],
+            ContentBlock::Text { .. }
+        ));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ApiCallFinished { usage: None })));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::AssistantText(_) | AgentEvent::StreamCommitted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn custom_stream_stops_on_host_callback_limit_and_marks_preview_uncommitted() {
+        struct LimitAwareStream {
+            attempted: Arc<AtomicUsize>,
+        }
+
+        #[async_trait(?Send)]
+        impl Provider for LimitAwareStream {
+            fn id(&self) -> &'static str {
+                "limit-aware"
+            }
+
+            fn model(&self) -> &str {
+                "limit-aware"
+            }
+
+            async fn complete(
+                &self,
+                _request: CompletionRequest<'_>,
+            ) -> Result<CompletionResponse> {
+                unreachable!("streaming path only")
+            }
+
+            async fn complete_streaming(
+                &self,
+                _request: CompletionRequest<'_>,
+                on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
+            ) -> Result<CompletionResponse> {
+                for fragment in ["abc", "def", "must-not-run"] {
+                    self.attempted.fetch_add(1, Ordering::SeqCst);
+                    on_delta(CompletionDelta::Text(fragment.into()))?;
+                }
+                unreachable!("the host limit must stop this provider")
+            }
+        }
+
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::new(
+            Box::new(LimitAwareStream {
+                attempted: Arc::clone(&attempted),
+            }),
+            ToolRegistry::new(),
+            "test",
+        );
+        agent.completion_limits = CompletionLimits {
+            max_response_bytes: 5,
+            ..CompletionLimits::default()
+        };
+        let mut events = Vec::new();
+
+        let error = agent
+            .run_turn("question", &mut |event| events.push(event))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("payload limit of 5 bytes"));
+        assert_eq!(attempted.load(Ordering::SeqCst), 2);
+        assert_eq!(agent.history.len(), 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AssistantTextDelta(text) if text == "abc")));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AssistantTextDelta(text) if text == "def")));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::AssistantStreamAborted { reason }
+                if reason.contains("failed before it was committed")
+        )));
+    }
+
+    #[tokio::test]
+    async fn ignored_callback_limit_error_still_prevents_custom_provider_commit() {
+        struct IgnoresCallbackError;
+
+        #[async_trait(?Send)]
+        impl Provider for IgnoresCallbackError {
+            fn id(&self) -> &'static str {
+                "ignores-callback"
+            }
+
+            fn model(&self) -> &str {
+                "ignores-callback"
+            }
+
+            async fn complete(
+                &self,
+                _request: CompletionRequest<'_>,
+            ) -> Result<CompletionResponse> {
+                unreachable!("streaming path only")
+            }
+
+            async fn complete_streaming(
+                &self,
+                _request: CompletionRequest<'_>,
+                on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
+            ) -> Result<CompletionResponse> {
+                on_delta(CompletionDelta::Text("abc".into()))?;
+                let _ignored = on_delta(CompletionDelta::Text("def".into()));
+                Ok(text_response("ok"))
+            }
+        }
+
+        let mut agent = Agent::new(Box::new(IgnoresCallbackError), ToolRegistry::new(), "test");
+        agent.completion_limits = CompletionLimits {
+            max_response_bytes: 5,
+            ..CompletionLimits::default()
+        };
+        let mut events = Vec::new();
+
+        let error = agent
+            .run_turn("question", &mut |event| events.push(event))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("payload limit of 5 bytes"));
+        assert_eq!(agent.history.len(), 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AssistantStreamAborted { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::StreamCommitted { .. })));
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_burst_is_rejected_before_execution_or_commit() {
+        let response = CompletionResponse {
+            content: (0..2)
+                .map(|index| ContentBlock::ToolUse {
+                    name: "echo".into(),
+                    input: json!({}),
+                    id: format!("tool-{index}"),
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            usage: None,
+        };
+        let mut agent = agent_with(Script::new(vec![Ok(response)]));
+        agent.completion_limits = CompletionLimits {
+            max_tool_uses: 1,
+            ..CompletionLimits::default()
+        };
+        let mut events = Vec::new();
+
+        let error = agent
+            .run_turn("question", &mut |event| events.push(event))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("2 tool calls"));
+        assert_eq!(agent.history.len(), 1);
+        assert!(agent.registry.execution_history().is_empty());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. })));
     }
 
     #[tokio::test]
@@ -2293,12 +2591,12 @@ tools.mirror(marker="silent")
             async fn complete_streaming(
                 &self,
                 _r: CompletionRequest<'_>,
-                on_delta: &mut dyn FnMut(CompletionDelta),
+                on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
             ) -> Result<CompletionResponse> {
-                on_delta(CompletionDelta::Reasoning("because ".to_string()));
-                on_delta(CompletionDelta::Reasoning("evidence".to_string()));
-                on_delta(CompletionDelta::Text("hel".to_string()));
-                on_delta(CompletionDelta::Text("lo".to_string()));
+                on_delta(CompletionDelta::Reasoning("because ".to_string()))?;
+                on_delta(CompletionDelta::Reasoning("evidence".to_string()))?;
+                on_delta(CompletionDelta::Text("hel".to_string()))?;
+                on_delta(CompletionDelta::Text("lo".to_string()))?;
                 Ok(CompletionResponse {
                     content: vec![
                         ContentBlock::Thinking {
@@ -2319,11 +2617,15 @@ tools.mirror(marker="silent")
         let mut deltas = String::new();
         let mut reasoning = String::new();
         let mut full_blocks = 0;
+        let mut committed = None;
         agent
             .run_turn("hi", &mut |event| match event {
                 AgentEvent::AssistantTextDelta(t) => deltas.push_str(&t),
                 AgentEvent::ReasoningDelta(t) => reasoning.push_str(&t),
                 AgentEvent::AssistantText(_) => full_blocks += 1,
+                AgentEvent::StreamCommitted { text, reasoning } => {
+                    committed = Some((text, reasoning))
+                }
                 _ => {}
             })
             .await
@@ -2331,6 +2633,13 @@ tools.mirror(marker="silent")
         assert_eq!(deltas, "hello");
         assert_eq!(reasoning, "because evidence");
         assert_eq!(full_blocks, 0, "streamed text must not be re-emitted whole");
+        assert_eq!(
+            committed,
+            Some((
+                Some("hello".to_string()),
+                Some("because evidence".to_string())
+            ))
+        );
         assert!(matches!(
             agent.history[1].content[0],
             ContentBlock::Thinking { .. }

@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: check lint test fmt format-staged clippy shellcheck traceability memory-research agent-benchmarks hooks-check tla conformance setup hooks tla-tools doctor
+.PHONY: check lint test fmt format-staged clippy shellcheck traceability memory-research agent-benchmarks memory-evaluation hooks-check tla conformance setup hooks tla-tools doctor
 
 check: lint test
 
@@ -35,6 +35,10 @@ memory-research:
 
 agent-benchmarks:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks/agent_transport -p 'test_*.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks/episodic_memory -p 'test_*.py'
+
+memory-evaluation:
+	PYTHONDONTWRITEBYTECODE=1 python3 benchmarks/episodic_memory/run.py
 
 hooks-check:
 	test -x .githooks/pre-commit

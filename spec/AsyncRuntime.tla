@@ -11,13 +11,23 @@
 \*   * permission replies are correlated with a live request;
 \*   * cancellation pairs every outstanding tool use before returning idle.
 \*
-\* Idle local commands (including goal edits and OSC 52 clipboard writes), goal
-\* text, terminal rendering, conversation-search query/selection, reasoning
-\* payloads, and other provider payloads are hidden data represented by
-\* stuttering steps. `/copy select` instead refines EnterCopyMode. Copy mode is
+\* Idle local commands (including goal edits, remembered-permission
+\* list/reset/clear, and OSC 52 clipboard writes), goal text, terminal
+\* rendering, conversation-search query/selection, reasoning payloads, and
+\* other provider payloads are hidden data represented by stuttering steps.
+\* Permission-policy mutation occurs with no live request and only changes
+\* whether a later concrete tool use reaches AskPermission. `/copy select`
+\* instead refines EnterCopyMode. Copy mode is
 \* the one terminal-rendering state modeled
 \* explicitly: it gates user input and therefore participates in the liveness
 \* argument, while agent progress remains independent of it.
+\*
+\* MCP startup discovery and its cancellation/progress payloads are also
+\* hidden. Before an Agent exists, accepted composer and queue-manager actions
+\* refine the ordinary idle Enqueue/DeleteQueued/ReclassifyQueued/
+\* MoveQueuedEarlier transitions; no steer can be created and DispatchFollowUp
+\* remains disabled concretely until the registry is finalized or discovery is
+\* explicitly skipped.
 \*
 \* See docs/async-tui.md for the corresponding implementation architecture.
 

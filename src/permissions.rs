@@ -27,6 +27,16 @@ pub enum PermissionChoice {
     DenyOnce,
 }
 
+/// A consistent snapshot of remembered per-tool decisions.
+///
+/// The sets are disjoint. If legacy or externally shared state contains the
+/// same tool in both sets, deny wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RememberedPermissionPolicy {
+    pub always_allow: HashSet<String>,
+    pub always_deny: HashSet<String>,
+}
+
 /// Everything a handler needs to decide about one tool call.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionRequest {
@@ -343,25 +353,79 @@ impl MemoryPermissionHandler {
     }
 
     pub fn set_always_allow(&self, tools: HashSet<String>) {
-        *self.always_allow.lock().unwrap() = tools;
+        let mut always_allow = self.always_allow.lock().unwrap();
+        let mut always_deny = self.always_deny.lock().unwrap();
+        always_deny.retain(|tool| !tools.contains(tool));
+        *always_allow = tools;
     }
 
     pub fn set_always_deny(&self, tools: HashSet<String>) {
-        *self.always_deny.lock().unwrap() = tools;
+        let mut always_allow = self.always_allow.lock().unwrap();
+        let mut always_deny = self.always_deny.lock().unwrap();
+        always_allow.retain(|tool| !tools.contains(tool));
+        *always_deny = tools;
+    }
+
+    /// Replace both remembered sets atomically. A deny wins if the supplied
+    /// policy contains a contradictory legacy entry.
+    pub fn replace_remembered_policy(
+        &self,
+        mut always_allow: HashSet<String>,
+        always_deny: HashSet<String>,
+    ) {
+        always_allow.retain(|tool| !always_deny.contains(tool));
+        let mut current_allow = self.always_allow.lock().unwrap();
+        let mut current_deny = self.always_deny.lock().unwrap();
+        *current_allow = always_allow;
+        *current_deny = always_deny;
+    }
+
+    /// Take a consistent, fail-closed snapshot for display or persistence.
+    pub fn remembered_policy(&self) -> RememberedPermissionPolicy {
+        let current_allow = self.always_allow.lock().unwrap();
+        let current_deny = self.always_deny.lock().unwrap();
+        let mut always_allow = current_allow.clone();
+        always_allow.retain(|tool| !current_deny.contains(tool));
+        RememberedPermissionPolicy {
+            always_allow,
+            always_deny: current_deny.clone(),
+        }
+    }
+
+    /// Remove any remembered decision for one exact tool name.
+    pub fn reset_remembered_tool(&self, tool: &str) -> bool {
+        let mut always_allow = self.always_allow.lock().unwrap();
+        let mut always_deny = self.always_deny.lock().unwrap();
+        always_allow.remove(tool) | always_deny.remove(tool)
+    }
+
+    /// Remove every remembered decision and return the number of distinct
+    /// affected tools.
+    pub fn clear_remembered_policy(&self) -> usize {
+        let mut always_allow = self.always_allow.lock().unwrap();
+        let mut always_deny = self.always_deny.lock().unwrap();
+        let count = always_allow.union(&always_deny).count();
+        always_allow.clear();
+        always_deny.clear();
+        count
+    }
+
+    fn remember(&self, tool: &str, allowed: bool) {
+        let mut always_allow = self.always_allow.lock().unwrap();
+        let mut always_deny = self.always_deny.lock().unwrap();
+        if allowed {
+            always_deny.remove(tool);
+            always_allow.insert(tool.to_string());
+        } else {
+            always_allow.remove(tool);
+            always_deny.insert(tool.to_string());
+        }
     }
 }
 
 #[async_trait]
 impl ToolPermissionHandler for MemoryPermissionHandler {
     async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision {
-        {
-            let always_allow = self.always_allow.lock().unwrap();
-            if always_allow.contains(&request.tool_name) {
-                self.prompt.automatic_decision(request, true);
-                return PermissionDecision::Allow;
-            }
-        }
-
         {
             let always_deny = self.always_deny.lock().unwrap();
             if always_deny.contains(&request.tool_name) {
@@ -372,20 +436,22 @@ impl ToolPermissionHandler for MemoryPermissionHandler {
             }
         }
 
+        {
+            let always_allow = self.always_allow.lock().unwrap();
+            if always_allow.contains(&request.tool_name) {
+                self.prompt.automatic_decision(request, true);
+                return PermissionDecision::Allow;
+            }
+        }
+
         match self.prompt.choose(request).await {
             PermissionChoice::AllowAlways => {
-                self.always_allow
-                    .lock()
-                    .unwrap()
-                    .insert(request.tool_name.clone());
+                self.remember(&request.tool_name, true);
                 PermissionDecision::Allow
             }
             PermissionChoice::AllowOnce => PermissionDecision::Allow,
             PermissionChoice::DenyAlways => {
-                self.always_deny
-                    .lock()
-                    .unwrap()
-                    .insert(request.tool_name.clone());
+                self.remember(&request.tool_name, false);
                 PermissionDecision::DenyWithReason(
                     "User chose to never allow this tool".to_string(),
                 )
@@ -444,6 +510,44 @@ mod tests {
             handler.check_permission(&request("bash")).await,
             PermissionDecision::DenyWithReason(_)
         ));
+    }
+
+    #[test]
+    fn remembered_policy_replacement_reset_and_clear_are_disjoint() {
+        let handler = MemoryPermissionHandler::new();
+        handler.replace_remembered_policy(
+            ["bash".to_string(), "read_file".to_string()].into(),
+            ["bash".to_string(), "patch_file".to_string()].into(),
+        );
+
+        let policy = handler.remembered_policy();
+        assert_eq!(policy.always_allow, ["read_file".to_string()].into());
+        assert_eq!(
+            policy.always_deny,
+            ["bash".to_string(), "patch_file".to_string()].into()
+        );
+        assert!(handler.reset_remembered_tool("bash"));
+        assert!(!handler.reset_remembered_tool("missing"));
+        assert_eq!(handler.clear_remembered_policy(), 2);
+        assert_eq!(handler.clear_remembered_policy(), 0);
+        assert!(handler.remembered_policy().always_allow.is_empty());
+        assert!(handler.remembered_policy().always_deny.is_empty());
+    }
+
+    #[tokio::test]
+    async fn contradictory_shared_policy_denies_fail_closed() {
+        let handler = MemoryPermissionHandler::with_shared_state(
+            Arc::new(Mutex::new(["bash".to_string()].into())),
+            Arc::new(Mutex::new(["bash".to_string()].into())),
+        );
+
+        assert!(matches!(
+            handler.check_permission(&request("bash")).await,
+            PermissionDecision::DenyWithReason(_)
+        ));
+        let policy = handler.remembered_policy();
+        assert!(policy.always_allow.is_empty());
+        assert_eq!(policy.always_deny, ["bash".to_string()].into());
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ use uuid::Uuid;
 const SCOPES_DIRECTORY: &str = "scopes";
 const SCOPE_MANIFEST: &str = ".scope.json";
 const PENDING_QUEUE_NAME: &str = "pending-queue";
+const ACTIVE_AUTOSAVE_NAME: &str = "autosave";
 const ARCHIVE_SEARCH_LIMIT: usize = 20;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +116,36 @@ impl HistoryStore {
         Ok(path)
     }
 
+    /// Create a named state without replacing any path that appeared first.
+    /// This is the manual-save primitive; the controller can separately ask
+    /// before using [`Self::save`] as an explicit replacement.
+    pub fn save_if_absent(&self, state: &SavedState, filename: &str) -> Result<Option<PathBuf>> {
+        validate_filename(filename)?;
+        if filename == ACTIVE_AUTOSAVE_NAME {
+            return Err(Error::Other(
+                "The live autosave name is reserved for controller checkpoints".to_string(),
+            ));
+        }
+        if state.scope != self.scope {
+            return Err(Error::Other(format!(
+                "Refusing to save {} state into {} scope",
+                state.scope.display_name(),
+                self.scope.display_name()
+            )));
+        }
+        let path = self.scope_directory.join(format!("{filename}.json"));
+        let bytes = serialize_state(state)?;
+        if !write_new_atomically(&path, &bytes)? {
+            return Ok(None);
+        }
+        if let Some(trace) = &self.model_trace {
+            trace.record_archive(ArchiveModelAction::SaveHistory {
+                history_id: filename.to_string(),
+            });
+        }
+        Ok(Some(path))
+    }
+
     /// Load only from the active scoped directory.
     pub fn load(&self, filename: &str) -> Result<SavedState> {
         validate_filename(filename)?;
@@ -148,6 +179,64 @@ impl HistoryStore {
         }
         names.sort();
         names
+    }
+
+    /// Explicit host command: search sanitized archives in this handle's
+    /// current scope only. Cross-scope model access remains permission-gated
+    /// through [`Self::search_archives`].
+    pub fn search_current_archives(&self, query: &str) -> Result<Vec<ConversationSummary>> {
+        self.search_archives_impl(query, ScopeFilter::Current)
+    }
+
+    /// Explicit host command: inspect one named archive in this handle's
+    /// current scope without loading it into the active conversation.
+    pub fn inspect_current_archive(&self, filename: &str) -> Result<Option<ArchivedConversation>> {
+        validate_filename(filename)?;
+        let entry = self
+            .archive_entries(ScopeFilter::Current)?
+            .into_iter()
+            .find(|entry| entry.name == filename);
+        Ok(entry.map(ArchiveEntry::into_conversation))
+    }
+
+    /// Explicit host command: durably delete one named archive from this
+    /// handle's current scope. The live autosave is reserved because the
+    /// controller continuously recreates it while a session is running.
+    pub fn forget_current_archive(&self, filename: &str) -> Result<bool> {
+        validate_filename(filename)?;
+        if filename == ACTIVE_AUTOSAVE_NAME {
+            return Err(Error::Other(
+                "The active autosave cannot be forgotten; use /clear to replace its conversation content"
+                    .to_string(),
+            ));
+        }
+        reject_symlink(&self.scope_directory, "history directory")?;
+        for candidate in self.current_search_paths(filename) {
+            if read_state(&candidate.path, &candidate.scope)?.is_none() {
+                continue;
+            }
+            fs::remove_file(&candidate.path).map_err(|error| {
+                Error::Other(format!(
+                    "Failed to delete {}: {error}",
+                    candidate.path.display()
+                ))
+            })?;
+            fs::File::open(&self.scope_directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    Error::Other(format!(
+                        "Failed to flush {}: {error}",
+                        self.scope_directory.display()
+                    ))
+                })?;
+            if let Some(trace) = &self.model_trace {
+                trace.record_archive(ArchiveModelAction::ForgetHistory {
+                    history_id: filename.to_string(),
+                });
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Permissioned-tool backend: search sanitized conversation text in an
@@ -233,17 +322,7 @@ impl HistoryStore {
                     "Conversation scope mismatch: expected '{expected_scope}', found '{actual_scope}'"
                 )));
             }
-            let events = retained_conversation_events(&entry.state);
-            return Ok(Some(ArchivedConversation {
-                id: entry.id,
-                scope: actual_scope,
-                name: entry.name,
-                updated_at: entry.updated_at,
-                provider: entry.state.provider,
-                model: entry.state.model,
-                goal: entry.state.goal,
-                events,
-            }));
+            return Ok(Some(entry.into_conversation()));
         }
         Ok(None)
     }
@@ -357,6 +436,22 @@ struct ArchiveEntry {
     name: String,
     updated_at: DateTime<Utc>,
     state: SavedState,
+}
+
+impl ArchiveEntry {
+    fn into_conversation(self) -> ArchivedConversation {
+        let events = retained_conversation_events(&self.state);
+        ArchivedConversation {
+            id: self.id,
+            scope: self.scope.display_name(),
+            name: self.name,
+            updated_at: self.updated_at,
+            provider: self.state.provider,
+            model: self.state.model,
+            goal: self.state.goal,
+            events,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -525,6 +620,7 @@ fn validate_filename(filename: &str) -> Result<()> {
         || filename == "."
         || filename == ".."
         || filename == SCOPE_MANIFEST.trim_end_matches(".json")
+        || filename == PENDING_QUEUE_NAME
         || filename.contains('/')
         || filename.contains('\0')
     {
@@ -585,6 +681,41 @@ fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| Error::Other(format!("Failed to flush {}: {error}", parent.display())))
+}
+
+fn write_new_atomically(path: &Path, contents: &[u8]) -> Result<bool> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Other(format!("{} has no parent directory", path.display())))?;
+    reject_symlink(path, "history file")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".generalist-state-")
+        .tempfile_in(parent)
+        .map_err(|error| Error::Other(format!("Failed to create state file: {error}")))?;
+    temporary
+        .write_all(contents)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| Error::Other(format!("Failed to flush state file: {error}")))?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| Error::Other(format!("Failed to restrict state file: {error}")))?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    Error::Other(format!("Failed to flush {}: {error}", parent.display()))
+                })?;
+            Ok(true)
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(Error::Other(format!(
+            "Failed to create {}: {}",
+            path.display(),
+            error.error
+        ))),
+    }
 }
 
 fn is_symlink(path: &Path) -> bool {
@@ -791,6 +922,63 @@ mod tests {
     }
 
     #[test]
+    fn host_inspection_is_current_scope_only_sanitized_and_non_loading() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_scope = project_scope(&temp, "first");
+        let second_scope = project_scope(&temp, "second");
+        let first = HistoryStore::open(temp.path().to_path_buf(), first_scope.clone()).unwrap();
+        let second = HistoryStore::open(temp.path().to_path_buf(), second_scope.clone()).unwrap();
+
+        let mut local = state(first_scope, "local inspection needle");
+        local.goal = Some("prospective local goal".into());
+        local.conversation_history.push(Message::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "private reasoning".into(),
+                signature: "private signature".into(),
+            },
+            ContentBlock::ToolUse {
+                name: "bash".into(),
+                input: serde_json::json!({"secret": "private input"}),
+                id: "private-id".into(),
+            },
+        ]));
+        local
+            .conversation_history
+            .push(Message::user(vec![ContentBlock::ToolResult {
+                content: "private output".into(),
+                tool_use_id: "private-id".into(),
+                is_error: Some(false),
+            }]));
+        first.save(&local, "local").unwrap();
+        second
+            .save(&state(second_scope, "foreign inspection needle"), "foreign")
+            .unwrap();
+
+        let matches = first.search_current_archives("inspection needle").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "local");
+        let archive = first.inspect_current_archive("local").unwrap().unwrap();
+        assert_eq!(archive.name, "local");
+        assert_eq!(archive.goal.as_deref(), Some("prospective local goal"));
+        let serialized = serde_json::to_string(&archive).unwrap();
+        assert!(serialized.contains("local inspection needle"));
+        assert!(serialized.contains("\"name\":\"bash\""));
+        for excluded in [
+            "private reasoning",
+            "private signature",
+            "private input",
+            "private output",
+            "private-id",
+            "foreign inspection needle",
+        ] {
+            assert!(!serialized.contains(excluded), "retained {excluded}");
+        }
+        assert!(first.inspect_current_archive("foreign").unwrap().is_none());
+        assert!(first.inspect_current_archive("../foreign").is_err());
+        assert_eq!(first.load("local").unwrap().goal, local.goal);
+    }
+
+    #[test]
     fn save_rejects_scope_mismatch_and_path_traversal() {
         let temp = tempfile::tempdir().unwrap();
         let scope = project_scope(&temp, "project");
@@ -803,5 +991,151 @@ mod tests {
             .is_err());
         let scoped = SavedState::new(scope, "openai".into(), "model".into());
         assert!(store.save(&scoped, "../escape").is_err());
+        assert!(store.save(&scoped, PENDING_QUEUE_NAME).is_err());
+    }
+
+    #[test]
+    fn forgetting_is_current_scope_only_durable_and_allows_resave() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_scope = project_scope(&temp, "first");
+        let second_scope = project_scope(&temp, "second");
+        let first = HistoryStore::open(temp.path().to_path_buf(), first_scope.clone()).unwrap();
+        let second = HistoryStore::open(temp.path().to_path_buf(), second_scope.clone()).unwrap();
+        first
+            .save(&state(first_scope.clone(), "first copy"), "checkpoint")
+            .unwrap();
+        second
+            .save(&state(second_scope, "second copy"), "checkpoint")
+            .unwrap();
+
+        assert!(first.forget_current_archive("checkpoint").unwrap());
+        assert!(!first.forget_current_archive("checkpoint").unwrap());
+        assert!(first.load("checkpoint").is_err());
+        assert_eq!(
+            second.load("checkpoint").unwrap().conversation_history[0].text(),
+            "second copy"
+        );
+
+        first
+            .save(&state(first_scope, "replacement"), "checkpoint")
+            .unwrap();
+        assert_eq!(
+            first.load("checkpoint").unwrap().conversation_history[0].text(),
+            "replacement"
+        );
+    }
+
+    #[test]
+    fn save_if_absent_never_clobbers_an_existing_named_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = project_scope(&temp, "project");
+        let store = HistoryStore::open(temp.path().to_path_buf(), scope.clone()).unwrap();
+        let first = state(scope.clone(), "first version");
+        let second = state(scope, "second version");
+
+        assert!(store
+            .save_if_absent(&first, "checkpoint")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .save_if_absent(&second, "checkpoint")
+            .unwrap()
+            .is_none());
+        assert!(store.save_if_absent(&second, ACTIVE_AUTOSAVE_NAME).is_err());
+        assert_eq!(
+            store.load("checkpoint").unwrap().conversation_history[0].text(),
+            "first version"
+        );
+    }
+
+    #[test]
+    fn concurrent_save_if_absent_has_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let scope = project_scope(&temp, "project");
+        let store = Arc::new(HistoryStore::open(temp.path().to_path_buf(), scope.clone()).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let outcomes = std::thread::scope(|threads| {
+            let first_store = store.clone();
+            let first_barrier = barrier.clone();
+            let first_state = state(scope.clone(), "first contender");
+            let first = threads.spawn(move || {
+                first_barrier.wait();
+                first_store
+                    .save_if_absent(&first_state, "contended")
+                    .unwrap()
+                    .is_some()
+            });
+            let second_store = store.clone();
+            let second_barrier = barrier.clone();
+            let second_state = state(scope, "second contender");
+            let second = threads.spawn(move || {
+                second_barrier.wait();
+                second_store
+                    .save_if_absent(&second_state, "contended")
+                    .unwrap()
+                    .is_some()
+            });
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+
+        assert_eq!(outcomes.into_iter().filter(|won| *won).count(), 1);
+        let stored = store.load("contended").unwrap().conversation_history[0].text();
+        assert!(matches!(
+            stored.as_str(),
+            "first contender" | "second contender"
+        ));
+    }
+
+    #[test]
+    fn forgetting_rejects_reserved_traversal_and_symlinked_targets() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let scope = project_scope(&temp, "project");
+        let store = HistoryStore::open(temp.path().to_path_buf(), scope.clone()).unwrap();
+        store
+            .save(&state(scope, "live"), ACTIVE_AUTOSAVE_NAME)
+            .unwrap();
+
+        assert!(store.forget_current_archive(ACTIVE_AUTOSAVE_NAME).is_err());
+        assert!(store.forget_current_archive(PENDING_QUEUE_NAME).is_err());
+        assert!(store.forget_current_archive("../escape").is_err());
+        assert!(store.load(ACTIVE_AUTOSAVE_NAME).is_ok());
+
+        let outside = temp.path().join("outside.json");
+        fs::write(&outside, "do not delete").unwrap();
+        symlink(&outside, store.directory().join("linked.json")).unwrap();
+        assert!(store.forget_current_archive("linked").is_err());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "do not delete");
+    }
+
+    #[test]
+    fn successful_forget_is_recorded_in_the_archive_model_trace() {
+        use crate::ModelKind;
+
+        let temp = tempfile::tempdir().unwrap();
+        let scope = project_scope(&temp, "project");
+        let trace = ModelTrace::for_models(&[ModelKind::ArchiveScopeRuntime]);
+        let store = HistoryStore::open_with_model_trace(
+            temp.path().to_path_buf(),
+            scope.clone(),
+            trace.clone(),
+        )
+        .unwrap();
+        store.save(&state(scope, "temporary"), "temporary").unwrap();
+        assert!(store.forget_current_archive("temporary").unwrap());
+
+        assert!(matches!(
+            trace.snapshot().archive_scope_runtime.as_slice(),
+            [
+                ArchiveModelAction::SelectProjectScope { .. },
+                ArchiveModelAction::SaveHistory { history_id },
+                ArchiveModelAction::ForgetHistory {
+                    history_id: forgotten
+                }
+            ] if history_id == "temporary" && forgotten == "temporary"
+        ));
     }
 }

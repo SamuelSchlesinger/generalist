@@ -71,10 +71,11 @@ pub mod tui;
 pub mod types;
 
 pub use agent::{history_tool_protocol_is_valid, Agent, AgentEvent, TurnOutcome};
-pub use clipboard::{conversation_transcript, latest_assistant_text};
+pub use clipboard::{conversation_transcript, latest_assistant_reasoning, latest_assistant_text};
 pub use command::{
-    is_local_command, parse_local_command, CommandSpec, CopyCommand, GoalCommand, LocalCommand,
-    MemoryCommand, COMMAND_SPECS,
+    complete_local_command, is_local_command, parse_local_command, CommandCompletion, CommandSpec,
+    CopyCommand, GoalCommand, HistoryCommand, LocalCommand, McpCommand, MemoryCommand,
+    PermissionCommand, ToolsCommand, UsageCommand, COMMAND_SPECS,
 };
 pub use error::{Error, Result};
 pub use execution::{ExecutionState, ToolExecution};
@@ -93,7 +94,7 @@ pub use model_trace::{
 pub use permissions::{
     AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler, PermissionBrokerPrompt,
     PermissionChoice, PermissionDecision, PermissionPrompt, PermissionRequest, PermissionUiEvent,
-    PolicyPermissions, ToolExecutionRequest, ToolPermissionHandler,
+    PolicyPermissions, RememberedPermissionPolicy, ToolExecutionRequest, ToolPermissionHandler,
 };
 pub use provider::Provider;
 pub use runtime::{
@@ -107,6 +108,6 @@ pub use tool::{
     ToolCallResult, ToolRegistry,
 };
 pub use types::{
-    estimate_tokens, truncate_middle, CompletionDelta, CompletionRequest, CompletionResponse,
-    ContentBlock, Message, MessageOrigin, StopReason, ToolDef, ToolUse, Usage,
+    estimate_tokens, truncate_middle, CompletionDelta, CompletionLimits, CompletionRequest,
+    CompletionResponse, ContentBlock, Message, MessageOrigin, StopReason, ToolDef, ToolUse, Usage,
 };

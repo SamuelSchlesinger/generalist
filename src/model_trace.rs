@@ -98,6 +98,7 @@ pub enum ArchiveModelAction {
     SelectProjectScope { scope: String },
     SelectGlobalScope,
     SaveHistory { history_id: String },
+    ForgetHistory { history_id: String },
     CaptureMemory { memory_id: String },
     RequestSearch { kind: String, filter: ScopeFilter },
     DenySearch,

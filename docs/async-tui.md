@@ -29,21 +29,23 @@ Primary references:
 
 ## User-visible semantics
 
-There are two intentionally different ways to submit while the agent is busy:
+The UI distinguishes presentation activity from mutation-capable turn
+ownership. Submission therefore has three intentional modes:
 
-| Action | Idle | Busy |
-| --- | --- | --- |
-| `Enter` | Start a turn | Steer the active turn at its next safe boundary |
-| `Tab` or `Alt+Enter` | Start a turn | Queue a follow-up after the active turn settles |
-| `Shift+Enter` or `Ctrl+J` | Insert a newline | Insert a newline |
-| `Alt+Up` | Restore the latest queued item into an empty composer | Restore the latest queued item into an empty composer |
-| `F2` | Open queue manager | Open queue manager |
-| `F3` | Toggle native terminal copy mode | Toggle native terminal copy mode without stopping provider/tool progress |
-| `F4` | Inspect provider-supplied reasoning | Inspect live provider-supplied reasoning |
-| `Ctrl+F` | Search visible conversation entries and jump to a match | Search the live transcript while provider/tool work continues |
-| `/copy last` or `/copy all` | Send committed text to the terminal clipboard | Queue the local command until the active turn settles |
-| `/copy select` | Enter native terminal copy mode | Queue the local command; F3 remains the immediate copy-mode shortcut |
-| `Esc` | Clear/close the current UI layer | Interrupt the active turn when no modal owns the key |
+| Action | Idle | Background work (startup, compaction, memory) | Active model turn |
+| --- | --- | --- | --- |
+| `Enter` | Start a turn | Queue a follow-up for when the operation settles | Steer at the next safe boundary |
+| `Tab` | Complete a recognized slash prefix; otherwise start a turn | Complete a slash prefix; otherwise queue a follow-up | Complete a slash prefix; otherwise queue a follow-up |
+| `Alt+Enter` | Start a turn | Queue a follow-up | Queue a follow-up after the turn settles |
+| `Shift+Enter` or `Ctrl+J` | Insert a newline | Insert a newline | Insert a newline |
+| `Alt+Up` | Restore the latest queued item into an empty composer | Restore the latest queued item | Restore the latest queued item |
+| `F2` | Open queue manager | Open queue manager | Open queue manager |
+| `F3` | Toggle native terminal copy mode | Toggle copy mode without stopping the operation | Toggle copy mode without stopping provider/tool progress |
+| `F4` | Inspect provider-supplied reasoning | Inspect the current reasoning log | Inspect live provider-supplied reasoning |
+| `Ctrl+F` | Search visible conversation entries | Search while the operation continues | Search while provider/tool work continues |
+| `/copy last`, `/copy all`, or `/copy reasoning` | Send the selected committed field to the terminal clipboard | Queue the local command | Queue the local command until the turn settles |
+| `/copy select` | Enter native terminal copy mode | Queue the local command; F3 remains immediate | Queue the local command; F3 remains immediate |
+| `Esc` | Clear/close the current UI layer | Apply the operation's policy: skip discovery, cancel compaction, or report a non-cancellable memory transaction | Interrupt the active turn when no modal owns the key |
 
 Modal input takes priority. In particular, Esc on a permission modal means
 deny-once; that denial settles the turn unless queued steering redirects it.
@@ -68,6 +70,79 @@ border/title and lists catalog entries in the footer. The help window renders
 the same catalog, so parser and discovery cannot silently drift. Help may open
 immediately. Commands that require mutable agent state wait in the same visible
 queue until the active turn releases that state.
+
+`/tools`, `/tools search <query>`, and `/tools show <name>` project the
+finalized registry into bounded host-only display text. Listing is stable and
+search is case-insensitive over names/descriptions. Detail distinguishes
+ordinary bridge definitions, progressive schema-on-demand definitions, the
+synthetic `python` runner, and the goal-only `update_goal` control. Inspection
+does not issue a provider request, ask permission, execute a tool, alter
+conversation history, or change durable state (the outer idle boundary may
+still checkpoint an unchanged snapshot).
+
+`/history`, `/history search <query>`, and `/history show <name>` similarly
+project only the active `HistoryStore` scope. They reuse the sanitized archive
+event representation, omit provider reasoning and tool payloads, and never
+load the selected session into `Agent`. `/history forget <name>` is a separate
+current-scope mutation: it first verifies the named state, opens a confirmation
+with Cancel selected, durably unlinks only that file, and reports that prior
+copies remain. It refuses the live `autosave`. None of these host controls
+issues a provider request or asks model-tool permission; the separate
+cross-scope archive tools still require an exact permission-derived disclosure
+grant. `/save <name>` and `/load <name>` bypass only the prompt/picker; bare
+`/save` and `/load` retain the interactive paths. Manual save first attempts an
+atomic no-clobber create; an existing valid checkpoint requires a separate
+default-Cancel replacement confirmation, while invalid/symlinked targets and
+the controller-owned `autosave` name are refused.
+
+`/usage` and `/usage show` read a process-local ledger populated from
+`ApiCallStarted` and `ApiCallFinished`. Attempts are grouped by the provider and
+model active when each call began. Only an explicit provider `Usage` payload
+adds input/output tokens; missing payloads remain counted as unreported
+attempts, and optional cache fields retain report coverage. `/usage reset`
+clears the ledger without changing model context, conversation history,
+provider state, or durable files. The command does not estimate price and does
+not conflate cumulative reports with the header's current-context estimate.
+
+Command completion is derived from the same `COMMAND_SPECS` entries and typed
+subcommand metadata. At the end of the composer, unmodified Tab canonicalizes
+a unique command/subcommand prefix or reports all ambiguous matches without
+submitting. Once a value-bearing command has argument text, for ordinary
+prose, with a mid-string cursor, or with modified Tab, the existing follow-up
+path is unchanged. Completion itself is editor-only state and is neither
+queued nor persisted.
+
+### Interactive MCP discovery
+
+When `.generalist/mcp.json` exists, startup connects servers in sorted name
+order before constructing `Agent`. The discovery future owns the mutable tool
+registry, while the ordinary UI reactor continues polling terminal input,
+frame ticks, stale permission messages, memory-worker events, and per-server
+progress. A single terminal reader remains authoritative.
+
+Recovered goal/queue state is classified before discovery. A queued,
+protocol-valid autosave restores its matching history and permission policy;
+goal state survives independently, exactly as in ordinary crash recovery.
+Composer submissions and F2 mutations during discovery operate on that same
+authoritative queue and atomically save it with the admitted pre-agent history
+boundary. They are always follow-ups because no turn exists to steer. Help,
+search, and copy mode remain display-only. `Esc` drops the pending discovery
+future and continues with the deterministic prefix of servers that already
+reported completion; an in-progress stdio child has `kill_on_drop`, and an
+in-progress HTTP request is cancelled with its future. No provider request can
+start until discovery finishes or is explicitly skipped and the registry is
+moved into `Agent`.
+
+The controller retains typed per-server outcomes after startup. `/mcp status`
+renders them in stable server-name order without opening a connection.
+`/mcp retry` selects every failed/skipped server; `/mcp retry <server>` selects
+one exact configured name. Retry reuses the same responsive discovery reactor
+at an idle boundary while temporarily borrowing the existing `Agent` registry.
+Already connected servers are refused rather than duplicated. Successfully
+recovered tools enter that registry and therefore the next dynamically built
+code-mode bridge surface; conversation history, provider state, permissions,
+and the loaded configuration are not replaced. An interrupted retry leaves its
+unfinished targets explicitly skipped and retryable again.
 
 ### Active goal
 
@@ -101,7 +176,7 @@ letting the idle controller immediately restart the turn.
 The TUI holds only a sanitized render copy and displays it on the second header
 row. Saved sessions and autosave carry the raw optional goal. Startup restores
 it even when there is no queued turn and schedules one continuation; named
-`/load` replaces the current goal with the loaded session's value and reconciles
+`/load <name>` replaces the current goal with the loaded session's value and reconciles
 its automatic queue entry. Once dispatched, a continuation carries
 `MessageOrigin::GoalContinuation`; matching text without that provenance
 remains ordinary user input in rendering and episodic capture.
@@ -129,17 +204,50 @@ this preserves the existing `Provider` trait's `?Send` contract. `tokio::select!
 keeps terminal events, frame ticks, permission requests, and the active turn
 progressing together.
 
-The active future emits events into a same-task channel. Answer deltas are
-appended to one live chat entry; provider-supplied reasoning deltas are appended
-to a separate inspector entry for the same API attempt. Drawing happens on the
-50 ms frame tick rather than once per token or terminal event. Rapid key-repeat
-and mouse-wheel bursts therefore update in-memory display state immediately but
-produce at most one frame per tick. Dirty tracking avoids rebuilding an idle
-transcript, and spinner-only frames run at 10 FPS. Permission, frame, and
-terminal branches are polled ahead of ordinary display events, so a
-streaming-event backlog cannot starve input or a permission answer. The channel
-is intentionally not a second committed-history authority: committed history
-remains inside `Agent`.
+Startup MCP discovery uses the same shape before `Agent` exists: the pinned
+discovery future exclusively borrows the registry while the reactor owns the
+terminal and pre-agent queue. `AppState::busy` controls presentation and
+interrupt routing; the separate `turn_active` projection controls whether Enter
+may request steering and whether F2 may reclassify a follow-up as a steer. The
+controller sets that projection immediately before polling
+`Agent::run_started_turn` and clears it with the busy state on every outcome.
+The actual `&mut Agent` future remains the authority for turn ownership.
+
+The active future emits events into a same-task display pump. Ordered structural
+events remain lossless. Consecutive answer and provider-reasoning fragments in
+one structural segment coalesce into one preview record whose combined retained
+payload is capped at 16 KiB, preserving order within each of the two separately
+rendered streams. If more bytes arrive before the reactor drains that preview,
+the UI reports the omitted counts. After a successful response enters
+`Agent` history, `StreamCommitted` replaces the bounded preview with text and
+inspectable reasoning derived from that authoritative response. A failed or
+interrupted stream has no committed snapshot, so its cap marker remains beside
+the existing uncommitted-stream label. `HistoryCheckpoint` continues through a
+separate lossless, high-priority path.
+
+The authoritative snapshot is still projected before Ratatui sees it. Each
+conversation or reasoning entry retains at most 64 Ki characters, keeping its
+beginning and end around an explicit omission marker. The complete accepted
+response remains in `Agent` history and is available through `/copy last`,
+`/copy all`, or `/copy reasoning`. Live entries stop growing after they reach
+the display cap and are replaced from committed history on success.
+
+Generation policy and host safety are separate. `Agent::max_tokens` is an
+optional ordinary-completion request: Anthropic resolves the selected model's
+advertised maximum when it is absent, while OpenAI-compatible adapters omit the
+non-portable field. `CompletionLimits` independently bounds logical bytes,
+content blocks, tool uses, and transport framing. Built-in adapters enforce
+these during accumulation; `Agent` revalidates every final response and keeps a
+stream-limit error sticky even if a custom provider violates the callback
+contract and ignores it.
+
+Drawing happens on the 50 ms frame tick rather than once per token or terminal
+event. Rapid key-repeat and mouse-wheel bursts therefore update in-memory
+display state immediately but produce at most one frame per tick. Dirty
+tracking avoids rebuilding an idle transcript, and spinner-only frames run at
+10 FPS. Permission, frame, and terminal branches are polled ahead of ordinary
+display events. The pump is intentionally not a second committed-history
+authority: committed history remains inside `Agent`.
 
 Conversation scrolling stores an absolute top line while follow-latest is
 paused. New streamed lines therefore do not move the user's viewport.
@@ -170,8 +278,11 @@ activity and provider reasoning retain their separate inspectors.
 
 `/copy` (equivalently `/copy last`) sends the latest committed assistant text
 to the host terminal with an OSC 52 clipboard request; `/copy all` sends a
-plain transcript of committed user/assistant text. Tool payloads, provider
-reasoning, and host-authored goal continuations are structurally excluded.
+plain transcript of committed user/assistant text. `/copy reasoning` sends the
+latest human-readable `Thinking` fields from committed assistant history.
+Provider signatures and `RedactedThinking` data are excluded. Tool payloads and
+host-authored goal continuations are structurally excluded from conversation
+copy.
 Text is base64 encoded before entering the control sequence and requests are
 size-bounded. The command is a user-triggered write only: Generalist never
 reads ambient clipboard contents. A successful write proves that the request
@@ -276,6 +387,10 @@ Silently dropping either side would produce a transcript that does not match the
 provider's preceding response; translating the call into executable Python
 would bypass the code-mode boundary.
 
+The `/tools` view does not weaken that boundary: registered entries are
+descriptive snapshots only. In particular, showing a progressive MCP schema
+does not load it into model context or authorize its use.
+
 ## Permissions
 
 Permission prompting becomes asynchronous. `MemoryPermissionHandler` awaits a
@@ -287,6 +402,16 @@ The UI owns the modal. A stale response whose turn or request ID no longer
 matches is ignored. Interrupting a turn resolves or drops its pending request
 before closing the modal. Remembered allow/deny decisions emit lightweight
 status events without opening a modal.
+
+The remembered policy is host-owned, inspectable, and revocable while idle.
+`/permissions` renders both sets in stable tool-name order;
+`/permissions reset <tool>` removes one exact decision and
+`/permissions clear` removes all decisions. The outer controller persists the
+mutation at the same local-command boundary as goal/model/history changes, so
+the affected tool asks again after the command settles. Loading a named save
+replaces both sets together. `SavedState::from_json`, policy replacement, live
+checks, and snapshots all resolve a contradictory allow/deny entry in favor of
+deny; new snapshots are disjoint.
 
 This avoids two terminal readers and avoids deadlocking an agent future behind
 a terminal mutex held by a blocking input loop.
@@ -319,8 +444,9 @@ the controller when the turn returns.
 
 ## Persistence
 
-Autosave happens after every committed boundary, local state command, and
-visible queue edit, not only after a whole multi-turn queue drains. The
+Autosave happens after every committed boundary, local state command (including
+remembered-permission reset/clear), and visible queue edit, not only after a
+whole multi-turn queue drains. The
 controller retains a clone of the latest history-valid boundary and active goal
 while the agent future owns the live history. It writes that boundary, goal,
 and current queue together to one file using flush, atomic rename, and
@@ -330,6 +456,14 @@ follow-ups because their target turn no longer exists. Goal restoration is
 independent of queued-work recovery. `HistoryCheckpoint` carries the goal along
 with history so the cross-channel display event for completion cannot race a
 checkpoint that still persists the old objective.
+
+The same rule begins before MCP discovery: recovery first admits a goal and,
+only when queued work has a protocol-valid boundary, its matching history and
+permission policy. A `DurableBoundary` containing that pre-agent state persists
+every submission or F2 mutation accepted while discovery is pending. Startup
+therefore never displays “queued” for work that exists only in an ephemeral
+buffer. Once discovery finishes or is skipped, the queue and admitted history
+are moved unchanged into the ordinary controller.
 
 Terminal actions explicitly report whether they changed the queue. Submission,
 edit, delete, reclassification, reorder, and restore trigger the atomic write;
@@ -374,6 +508,12 @@ tool data are not rewritten.
    or enters model-visible prompt construction.
 10. At most one host-authored goal continuation is visible in the queue, and
     none remains after goal completion or an outcome that pauses autorun.
+11. Spinner-visible background work cannot create steering: only a live agent
+    turn sets `turn_active`, and the registry is finalized before such a turn
+    can begin.
+12. Effective and newly persisted remembered permission policy is disjoint;
+    deny takes precedence over a contradictory legacy or externally shared
+    entry.
 
 ## Alternatives rejected
 
@@ -441,8 +581,16 @@ the Rust and shell validation.
 - The model phase is the Rust program counter, not a mirrored runtime enum.
   This avoids a second authority but makes the source trace a necessary human
   review step.
-- The same-task event channel is unbounded. Frame-rate batching avoids terminal
-  churn, but a pathological provider can still create a display backlog.
+- Token fragmentation cannot multiply same-task queue records: each consecutive
+  preview is capped at 16 KiB and successful output is reconciled from committed
+  history. Each committed chat/reasoning projection is independently capped at
+  64 Ki characters. Structural events and checkpoints deliberately remain
+  lossless rather than globally capacity-limited, so adversarial structural-event
+  volume can still create display work.
+- The default 1 MiB logical completion limit is a host safety policy, not a
+  model-token claim. Library users asking models for exceptionally large output
+  must raise `CompletionLimits` intentionally as well as any provider token
+  request, accepting the larger memory and transport bounds.
 - A permission modal temporarily owns keyboard input. The agent future and
   animation continue, but ordinary composition resumes after the decision.
 - Copy mode intentionally suspends application input and visual updates so the
@@ -459,8 +607,10 @@ the Rust and shell validation.
 - Reasoning inspection is provider-dependent and is not a faithful transcript
   of hidden model computation. Providers may omit, summarize, redact, or
   transform reasoning before exposing it.
-- Startup MCP discovery is asynchronous I/O but is not yet multiplexed with
-  ordinary composer input. Active model turns and manual compaction are.
+- MCP retry is explicit rather than a background health monitor. It recovers
+  startup failures/skips within the configuration loaded for this process, but
+  does not hot-reload edited configuration or replace a bridge whose transport
+  fails after it was registered; those cases still require restart.
 - Cooperative cancellation repairs history and kills subprocesses on drop
   where supported; it cannot establish whether an arbitrary external action
   completed before its future was dropped.

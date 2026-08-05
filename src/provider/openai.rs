@@ -7,8 +7,8 @@
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::types::{
-    CompletionDelta, CompletionRequest, CompletionResponse, ContentBlock, Message, StopReason,
-    ToolDef, Usage,
+    CompletionDelta, CompletionLimits, CompletionRequest, CompletionResponse, ContentBlock,
+    Message, StopReason, ToolDef, Usage,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -116,6 +116,29 @@ impl OpenAiProvider {
             .collect()
     }
 
+    fn build_body(&self, request: &CompletionRequest<'_>, streaming: bool) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "messages": Self::to_wire_messages(request.system, request.messages),
+        });
+        if streaming {
+            body["stream"] = json!(true);
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        if let Some(max_tokens) = request.max_tokens {
+            let field = if self.base_url == DEFAULT_BASE_URL {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            body[field] = json!(max_tokens);
+        }
+        if !request.tools.is_empty() {
+            body["tools"] = Value::Array(Self::to_wire_tools(request.tools));
+        }
+        body
+    }
+
     /// Reasoning extensions used by common OpenAI-compatible servers.
     ///
     /// Qwen/vLLM/SGLang commonly use `reasoning_content`; Ollama's model
@@ -208,11 +231,12 @@ struct ChunkState {
     tool_calls: Vec<(String, String, String)>,
     finish_reason: Option<StopReason>,
     usage: Option<Usage>,
+    retained_bytes: usize,
 }
 
 impl ChunkState {
     /// Apply one stream chunk; returns every inspectable delta it contains.
-    fn apply(&mut self, chunk: &Value) -> Vec<CompletionDelta> {
+    fn apply(&mut self, chunk: &Value, limits: CompletionLimits) -> Result<Vec<CompletionDelta>> {
         let mut emitted = Vec::new();
         // The final usage chunk has an empty `choices` array.
         if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
@@ -234,34 +258,91 @@ impl ChunkState {
             .and_then(|c| c.as_array())
             .and_then(|c| c.first());
         let Some(choice) = choice else {
-            return emitted;
+            return Ok(emitted);
         };
         if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
             self.finish_reason = Some(StopReason::parse(finish));
         }
         let Some(delta) = choice.get("delta") else {
-            return emitted;
+            return Ok(emitted);
         };
         if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for call in calls {
-                let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                while self.tool_calls.len() <= index {
+                let index = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let index = usize::try_from(index).map_err(|_| {
+                    Error::Other("provider tool-call index does not fit this host".to_string())
+                })?;
+                if index >= limits.max_tool_uses {
+                    return Err(Error::Other(format!(
+                        "provider tool-call index {index} exceeds the host limit of {} tool calls",
+                        limits.max_tool_uses
+                    )));
+                }
+                if index > self.tool_calls.len() {
+                    return Err(Error::Other(format!(
+                        "provider tool-call index {index} was out of sequence; expected at most {}",
+                        self.tool_calls.len()
+                    )));
+                }
+                if index == self.tool_calls.len() {
+                    let projected_blocks = self
+                        .tool_calls
+                        .len()
+                        .saturating_add(1)
+                        .saturating_add(usize::from(!self.text.is_empty()))
+                        .saturating_add(usize::from(!self.reasoning.is_empty()));
+                    if projected_blocks > limits.max_content_blocks {
+                        return Err(Error::Other(format!(
+                            "provider completion exceeded the host limit of {} blocks",
+                            limits.max_content_blocks
+                        )));
+                    }
                     self.tool_calls
                         .push((String::new(), String::new(), String::new()));
                 }
+                let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let arguments = call
+                    .pointer("/function/arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                self.retained_bytes = limits.checked_response_bytes(
+                    self.retained_bytes,
+                    id.len()
+                        .saturating_add(name.len())
+                        .saturating_add(arguments.len()),
+                )?;
                 let entry = &mut self.tool_calls[index];
-                if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                if !id.is_empty() {
                     entry.0.push_str(id);
                 }
-                if let Some(name) = call.pointer("/function/name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
                     entry.1.push_str(name);
                 }
-                if let Some(args) = call.pointer("/function/arguments").and_then(|v| v.as_str()) {
-                    entry.2.push_str(args);
+                if !arguments.is_empty() {
+                    entry.2.push_str(arguments);
                 }
             }
         }
         if let Some(reasoning) = OpenAiProvider::reasoning_text(delta) {
+            if self.reasoning.is_empty()
+                && self
+                    .tool_calls
+                    .len()
+                    .saturating_add(usize::from(!self.text.is_empty()))
+                    .saturating_add(1)
+                    > limits.max_content_blocks
+            {
+                return Err(Error::Other(format!(
+                    "provider completion exceeded the host limit of {} blocks",
+                    limits.max_content_blocks
+                )));
+            }
+            self.retained_bytes =
+                limits.checked_response_bytes(self.retained_bytes, reasoning.len())?;
             self.reasoning.push_str(reasoning);
             emitted.push(CompletionDelta::Reasoning(reasoning.to_string()));
         }
@@ -270,10 +351,24 @@ impl ChunkState {
             .and_then(|c| c.as_str())
             .filter(|text| !text.is_empty())
         {
+            if self.text.is_empty()
+                && self
+                    .tool_calls
+                    .len()
+                    .saturating_add(usize::from(!self.reasoning.is_empty()))
+                    .saturating_add(1)
+                    > limits.max_content_blocks
+            {
+                return Err(Error::Other(format!(
+                    "provider completion exceeded the host limit of {} blocks",
+                    limits.max_content_blocks
+                )));
+            }
+            self.retained_bytes = limits.checked_response_bytes(self.retained_bytes, text.len())?;
             self.text.push_str(text);
             emitted.push(CompletionDelta::Text(text.to_string()));
         }
-        emitted
+        Ok(emitted)
     }
 
     fn into_response(self) -> CompletionResponse {
@@ -328,13 +423,8 @@ impl Provider for OpenAiProvider {
     }
 
     async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse> {
-        let mut body = json!({
-            "model": self.model,
-            "messages": Self::to_wire_messages(request.system, request.messages),
-        });
-        if !request.tools.is_empty() {
-            body["tools"] = Value::Array(Self::to_wire_tools(request.tools));
-        }
+        let limits = request.limits;
+        let body = self.build_body(&request, false);
 
         let response = self
             .client
@@ -350,9 +440,9 @@ impl Provider for OpenAiProvider {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(crate::error::Error::parse_retry_after);
-        let text = response.text().await?;
+        let response_body = crate::provider::read_response_body_bounded(response, limits).await?;
         if !status.is_success() {
-            let message = serde_json::from_str::<Value>(&text)
+            let message = serde_json::from_slice::<Value>(&response_body)
                 .ok()
                 .and_then(|v| {
                     v.get("error")
@@ -360,7 +450,7 @@ impl Provider for OpenAiProvider {
                         .and_then(|m| m.as_str())
                         .map(str::to_string)
                 })
-                .unwrap_or(text);
+                .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
@@ -368,23 +458,18 @@ impl Provider for OpenAiProvider {
             });
         }
 
-        Self::from_wire_response(&serde_json::from_str(&text)?)
+        let response = Self::from_wire_response(&serde_json::from_slice(&response_body)?)?;
+        limits.validate_response(&response)?;
+        Ok(response)
     }
 
     async fn complete_streaming(
         &self,
         request: CompletionRequest<'_>,
-        on_delta: &mut dyn FnMut(CompletionDelta),
+        on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
     ) -> Result<CompletionResponse> {
-        let mut body = json!({
-            "model": self.model,
-            "messages": Self::to_wire_messages(request.system, request.messages),
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
-        if !request.tools.is_empty() {
-            body["tools"] = Value::Array(Self::to_wire_tools(request.tools));
-        }
+        let limits = request.limits;
+        let body = self.build_body(&request, true);
 
         let response = self
             .client
@@ -402,15 +487,16 @@ impl Provider for OpenAiProvider {
             .and_then(|v| v.to_str().ok())
             .and_then(crate::error::Error::parse_retry_after);
         if !status.is_success() {
-            let text = response.text().await?;
-            let message = serde_json::from_str::<Value>(&text)
+            let response_body =
+                crate::provider::read_response_body_bounded(response, limits).await?;
+            let message = serde_json::from_slice::<Value>(&response_body)
                 .ok()
                 .and_then(|v| {
                     v.pointer("/error/message")
                         .and_then(|m| m.as_str())
                         .map(str::to_string)
                 })
-                .unwrap_or(text);
+                .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
@@ -422,15 +508,17 @@ impl Provider for OpenAiProvider {
         let mut assembler = crate::provider::SseAssembler::default();
         let mut state = ChunkState::default();
         let mut done = false;
+        let mut received = 0usize;
         while let Some(chunk) = response.chunk().await? {
+            crate::provider::account_wire_bytes(limits, &mut received, chunk.len())?;
             for payload in assembler.push(&chunk) {
                 if payload.trim() == "[DONE]" {
                     done = true;
                     continue;
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-                    for delta in state.apply(&value) {
-                        on_delta(delta);
+                    for delta in state.apply(&value, limits)? {
+                        on_delta(delta)?;
                     }
                 }
             }
@@ -439,8 +527,8 @@ impl Provider for OpenAiProvider {
             if payload.trim() == "[DONE]" {
                 done = true;
             } else if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-                for delta in state.apply(&value) {
-                    on_delta(delta);
+                for delta in state.apply(&value, limits)? {
+                    on_delta(delta)?;
                 }
             }
         }
@@ -453,7 +541,9 @@ impl Provider for OpenAiProvider {
                 retry_after: None,
             });
         }
-        Ok(state.into_response())
+        let response = state.into_response();
+        limits.validate_response(&response)?;
+        Ok(response)
     }
 }
 
@@ -476,6 +566,43 @@ mod tests {
         assert_eq!(official.display_name(), "OpenAI");
         assert_eq!(compatible.id(), "openai");
         assert_eq!(compatible.display_name(), "OpenAI-compatible");
+    }
+
+    #[test]
+    fn request_body_uses_the_service_appropriate_explicit_token_field() {
+        let provider =
+            OpenAiProvider::new("key".into(), DEFAULT_BASE_URL.into(), "model".into()).unwrap();
+        let messages = vec![Message::user_text("hi")];
+        let request = CompletionRequest {
+            system: None,
+            messages: &messages,
+            tools: &[],
+            max_tokens: None,
+            limits: CompletionLimits::default(),
+        };
+        let body = provider.build_body(&request, false);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("stream").is_none());
+
+        let request = CompletionRequest {
+            max_tokens: Some(32_000),
+            ..request
+        };
+        let body = provider.build_body(&request, true);
+        assert_eq!(body["max_completion_tokens"], 32_000);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+
+        let compatible = OpenAiProvider::new(
+            "key".into(),
+            "http://localhost:11434/v1".into(),
+            "model".into(),
+        )
+        .unwrap();
+        let body = compatible.build_body(&request, false);
+        assert_eq!(body["max_tokens"], 32_000);
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
@@ -597,7 +724,7 @@ mod tests {
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
         for chunk in &chunks {
-            for delta in state.apply(chunk) {
+            for delta in state.apply(chunk, CompletionLimits::default()).unwrap() {
                 match delta {
                     CompletionDelta::Text(text) => streamed_text.push_str(&text),
                     CompletionDelta::Reasoning(reasoning) => {
@@ -627,6 +754,56 @@ mod tests {
             other => panic!("expected tool use, got {:?}", other),
         }
         assert_eq!(response.usage.unwrap().output_tokens, 8);
+    }
+
+    #[test]
+    fn chunk_state_rejects_sparse_tool_indexes_without_allocating_placeholders() {
+        let mut state = ChunkState::default();
+        let chunk = json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 200, "function": {"name": "x"}}]},
+                "finish_reason": null
+            }]
+        });
+        let error = state
+            .apply(&chunk, CompletionLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("out of sequence"));
+        assert!(state.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn chunk_state_rejects_payload_and_block_overflow_before_append() {
+        let mut state = ChunkState::default();
+        let text = json!({
+            "choices": [{"delta": {"content": "four"}, "finish_reason": null}]
+        });
+        let error = state
+            .apply(
+                &text,
+                CompletionLimits {
+                    max_response_bytes: 3,
+                    ..CompletionLimits::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("payload limit of 3 bytes"));
+        assert!(state.text.is_empty());
+
+        let error = state
+            .apply(
+                &text,
+                CompletionLimits {
+                    max_content_blocks: 0,
+                    ..CompletionLimits::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("limit of 0 blocks"));
+        assert!(state.text.is_empty());
     }
 
     #[test]

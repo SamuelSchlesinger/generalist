@@ -133,6 +133,19 @@ SaveHistory(history) ==
                    disclosedMemory, memoryDisclosureFilter,
                    authorizedMemoryDisclosure>>
 
+ForgetHistory(history) ==
+    /\ activeScope \in ScopeIds
+    /\ history \in HistoryIds
+    /\ LET item == <<activeScope, history>> IN
+       /\ item \in histories
+       /\ histories' = histories \ {item}
+    /\ UNCHANGED <<activeScope, globalWasExplicit, memories,
+                   writtenHistories, capturedMemories, pendingKind,
+                   pendingFilter, disclosedHistory,
+                   historyDisclosureFilter, authorizedHistoryDisclosure,
+                   disclosedMemory, memoryDisclosureFilter,
+                   authorizedMemoryDisclosure>>
+
 CaptureMemory(memory) ==
     /\ activeScope \in ScopeIds
     /\ memory \in MemoryIds
@@ -211,6 +224,7 @@ Next ==
     \/ \E scope \in ScopeIds : SelectProjectScope(scope)
     \/ SelectGlobalScope
     \/ \E history \in HistoryIds : SaveHistory(history)
+    \/ \E history \in HistoryIds : ForgetHistory(history)
     \/ \E memory \in MemoryIds : CaptureMemory(memory)
     \/ \E kind \in SearchKinds, filter \in SearchFilters :
         RequestSearch(kind, filter)

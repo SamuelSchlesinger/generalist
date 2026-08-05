@@ -19,7 +19,7 @@ use crate::tool::Tool;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -42,13 +42,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 ///   }
 /// }
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct McpConfig {
     #[serde(default)]
     pub servers: HashMap<String, McpServerConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum McpServerConfig {
     Http {
@@ -63,10 +63,102 @@ pub enum McpServerConfig {
     },
 }
 
+/// Typed result of connecting one configured MCP server and registering its
+/// discovered tools. The CLI retains this instead of parsing display strings
+/// when deciding which servers can be retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRegistrationReport {
+    pub server_name: String,
+    pub outcome: McpRegistrationOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpRegistrationOutcome {
+    Connected {
+        discovered_tools: usize,
+        registered_tools: usize,
+    },
+    ConnectionFailed {
+        error: String,
+    },
+    ToolListFailed {
+        error: String,
+    },
+    RegistrationFailed {
+        discovered_tools: usize,
+        error: String,
+    },
+}
+
+impl McpRegistrationReport {
+    pub fn registered_tools(&self) -> usize {
+        match &self.outcome {
+            McpRegistrationOutcome::Connected {
+                registered_tools, ..
+            } => *registered_tools,
+            _ => 0,
+        }
+    }
+
+    pub fn display_line(&self) -> String {
+        match &self.outcome {
+            McpRegistrationOutcome::Connected {
+                discovered_tools,
+                registered_tools,
+            } if discovered_tools == registered_tools => {
+                format!("mcp '{}': {} tool(s)", self.server_name, registered_tools)
+            }
+            McpRegistrationOutcome::Connected {
+                discovered_tools,
+                registered_tools,
+            } => format!(
+                "mcp '{}': {}/{} tool(s) registered; conflicting names were skipped",
+                self.server_name, registered_tools, discovered_tools
+            ),
+            McpRegistrationOutcome::ConnectionFailed { error } => {
+                format!("mcp '{}': connection failed: {}", self.server_name, error)
+            }
+            McpRegistrationOutcome::ToolListFailed { error } => {
+                format!("mcp '{}': tools/list failed: {}", self.server_name, error)
+            }
+            McpRegistrationOutcome::RegistrationFailed {
+                discovered_tools,
+                error,
+            } => format!(
+                "mcp '{}': none of {} discovered tool(s) registered: {}",
+                self.server_name, discovered_tools, error
+            ),
+        }
+    }
+}
+
 impl McpConfig {
+    /// Load a configuration while distinguishing absence from malformed or
+    /// unreadable input. The interactive CLI surfaces these errors instead of
+    /// silently behaving as though no servers were configured.
+    pub fn load_checked(path: &Path) -> Result<Option<Self>> {
+        let data = match std::fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(Error::Other(format!(
+                    "Failed to read MCP configuration {}: {error}",
+                    path.display()
+                )))
+            }
+        };
+        serde_json::from_str(&data).map(Some).map_err(|error| {
+            Error::Other(format!(
+                "Failed to parse MCP configuration {}: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Compatibility helper for callers that intentionally treat invalid and
+    /// absent configuration alike.
     pub fn load(path: &Path) -> Option<Self> {
-        let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        Self::load_checked(path).ok().flatten()
     }
 }
 
@@ -384,12 +476,67 @@ pub async fn register_servers(
     registry: &mut crate::tool::ToolRegistry,
     config: &McpConfig,
 ) -> Vec<String> {
-    let mut report = Vec::new();
-    for (name, server_config) in &config.servers {
-        match McpServer::connect(name, server_config).await {
+    register_servers_with_progress(registry, config, |_, _| {}).await
+}
+
+/// Connect and register configured servers in stable name order, reporting
+/// each completed server without waiting for the entire configuration.
+///
+/// `registered_total` counts only MCP tools successfully added so callers can
+/// update a live bridge count while this future owns the mutable registry.
+pub async fn register_servers_with_progress(
+    registry: &mut crate::tool::ToolRegistry,
+    config: &McpConfig,
+    mut on_progress: impl FnMut(&str, usize),
+) -> Vec<String> {
+    register_servers_with_reports(registry, config, |report, registered_total| {
+        on_progress(&report.display_line(), registered_total);
+    })
+    .await
+    .iter()
+    .map(McpRegistrationReport::display_line)
+    .collect()
+}
+
+/// Connect every configured server and return typed per-server outcomes.
+pub async fn register_servers_with_reports(
+    registry: &mut crate::tool::ToolRegistry,
+    config: &McpConfig,
+    on_progress: impl FnMut(&McpRegistrationReport, usize),
+) -> Vec<McpRegistrationReport> {
+    register_ordered_servers(registry, ordered_servers(config), on_progress).await
+}
+
+/// Connect only the named configured servers, in the configuration's stable
+/// lexical order. Unknown names are ignored here; the host command validates
+/// selections before starting discovery.
+pub async fn register_named_servers_with_reports(
+    registry: &mut crate::tool::ToolRegistry,
+    config: &McpConfig,
+    names: &BTreeSet<String>,
+    on_progress: impl FnMut(&McpRegistrationReport, usize),
+) -> Vec<McpRegistrationReport> {
+    let servers = ordered_servers(config)
+        .into_iter()
+        .filter(|(name, _)| names.contains(name.as_str()))
+        .collect();
+    register_ordered_servers(registry, servers, on_progress).await
+}
+
+async fn register_ordered_servers(
+    registry: &mut crate::tool::ToolRegistry,
+    servers: Vec<(&String, &McpServerConfig)>,
+    mut on_progress: impl FnMut(&McpRegistrationReport, usize),
+) -> Vec<McpRegistrationReport> {
+    let mut reports = Vec::new();
+    let mut registered_total = 0;
+    for (name, server_config) in servers {
+        let outcome = match McpServer::connect(name, server_config).await {
             Ok(server) => match server.list_tools().await {
                 Ok(tools) => {
-                    let mut registered = 0;
+                    let discovered_tools = tools.len();
+                    let mut registered_tools = 0;
+                    let mut first_error = None;
                     for (tool_name, description, schema) in tools {
                         let tool = McpTool {
                             server: Arc::clone(&server),
@@ -398,18 +545,51 @@ pub async fn register_servers(
                             schema,
                             tool_name,
                         };
-                        if registry.register(Arc::new(tool)).is_ok() {
-                            registered += 1;
+                        match registry.register(Arc::new(tool)) {
+                            Ok(()) => registered_tools += 1,
+                            Err(error) if first_error.is_none() => {
+                                first_error = Some(error.to_string())
+                            }
+                            Err(_) => {}
                         }
                     }
-                    report.push(format!("mcp '{}': {} tool(s)", name, registered));
+                    if discovered_tools > 0 && registered_tools == 0 {
+                        McpRegistrationOutcome::RegistrationFailed {
+                            discovered_tools,
+                            error: first_error.unwrap_or_else(|| {
+                                "all discovered tool names were rejected".to_string()
+                            }),
+                        }
+                    } else {
+                        McpRegistrationOutcome::Connected {
+                            discovered_tools,
+                            registered_tools,
+                        }
+                    }
                 }
-                Err(e) => report.push(format!("mcp '{}': tools/list failed: {}", name, e)),
+                Err(error) => McpRegistrationOutcome::ToolListFailed {
+                    error: error.to_string(),
+                },
             },
-            Err(e) => report.push(format!("mcp '{}': connection failed: {}", name, e)),
-        }
+            Err(error) => McpRegistrationOutcome::ConnectionFailed {
+                error: error.to_string(),
+            },
+        };
+        let report = McpRegistrationReport {
+            server_name: name.clone(),
+            outcome,
+        };
+        registered_total += report.registered_tools();
+        on_progress(&report, registered_total);
+        reports.push(report);
     }
-    report
+    reports
+}
+
+fn ordered_servers(config: &McpConfig) -> Vec<(&String, &McpServerConfig)> {
+    let mut servers = config.servers.iter().collect::<Vec<_>>();
+    servers.sort_unstable_by_key(|(name, _)| *name);
+    servers
 }
 
 #[cfg(test)]
@@ -455,6 +635,63 @@ mod tests {
             config.servers["local"],
             McpServerConfig::Stdio { .. }
         ));
+        assert_eq!(
+            ordered_servers(&config)
+                .into_iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local", "web"],
+            "server discovery order must not depend on hash randomization"
+        );
+    }
+
+    #[test]
+    fn checked_config_load_distinguishes_missing_invalid_and_valid_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        assert!(McpConfig::load_checked(&path).unwrap().is_none());
+
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(McpConfig::load_checked(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to parse MCP configuration"));
+
+        std::fs::write(
+            &path,
+            r#"{"servers":{"web":{"url":"https://example.com"}}}"#,
+        )
+        .unwrap();
+        let config = McpConfig::load_checked(&path).unwrap().unwrap();
+        assert!(config.servers.contains_key("web"));
+    }
+
+    #[test]
+    fn typed_registration_reports_preserve_machine_state_and_display_detail() {
+        let connected = McpRegistrationReport {
+            server_name: "files".into(),
+            outcome: McpRegistrationOutcome::Connected {
+                discovered_tools: 3,
+                registered_tools: 2,
+            },
+        };
+        assert_eq!(connected.registered_tools(), 2);
+        assert_eq!(
+            connected.display_line(),
+            "mcp 'files': 2/3 tool(s) registered; conflicting names were skipped"
+        );
+
+        let failed = McpRegistrationReport {
+            server_name: "files".into(),
+            outcome: McpRegistrationOutcome::ConnectionFailed {
+                error: "offline".into(),
+            },
+        };
+        assert_eq!(failed.registered_tools(), 0);
+        assert_eq!(
+            failed.display_line(),
+            "mcp 'files': connection failed: offline"
+        );
     }
 
     /// Full stack against a fake stdio MCP server: connect, handshake,
@@ -498,8 +735,13 @@ for line in sys.stdin:
         };
 
         let mut registry = ToolRegistry::new();
-        let report = register_servers(&mut registry, &config).await;
+        let mut progress = Vec::new();
+        let report = register_servers_with_progress(&mut registry, &config, |line, total| {
+            progress.push((line.to_string(), total));
+        })
+        .await;
         assert_eq!(report, vec!["mcp 'fake': 1 tool(s)".to_string()]);
+        assert_eq!(progress, vec![(report[0].clone(), 1)]);
         assert!(registry.has_tool("fake_add"));
 
         // MCP tools are code-only: hidden from the model-facing defs,
@@ -521,5 +763,22 @@ for line in sys.stdin:
             crate::types::ContentBlock::ToolResult { content, .. } => assert_eq!(content, "5"),
             other => panic!("expected tool result, got {:?}", other),
         }
+
+        let mut typed_registry = ToolRegistry::new();
+        let names = ["fake".to_string()].into_iter().collect();
+        let reports =
+            register_named_servers_with_reports(&mut typed_registry, &config, &names, |_, _| {})
+                .await;
+        assert_eq!(
+            reports,
+            vec![McpRegistrationReport {
+                server_name: "fake".into(),
+                outcome: McpRegistrationOutcome::Connected {
+                    discovered_tools: 1,
+                    registered_tools: 1,
+                },
+            }]
+        );
+        assert!(typed_registry.has_tool("fake_add"));
     }
 }

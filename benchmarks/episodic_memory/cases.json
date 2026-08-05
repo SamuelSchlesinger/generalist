@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "id": "repo_convention",
+      "user": "Repository convention CONV-AURORA-17: run cargo fmt --all before tests.",
+      "assistant": "Acknowledged CONV-AURORA-17 as a project convention."
+    },
+    {
+      "id": "preference_old",
+      "user": "Formatter preference PREF-CARBON used four spaces effective 2026-01-01.",
+      "assistant": "Recorded the historical four-space PREF-CARBON preference."
+    },
+    {
+      "id": "failed_precondition",
+      "user": "Command failure PRECOND-EMBER-42: deploy failed because registry login must happen first.",
+      "assistant": "PRECOND-EMBER-42 requires registry login before another deploy attempt."
+    },
+    {
+      "id": "unresolved_goal",
+      "user": "Goal trigger GOAL-ORBIT-9: when issue 812 closes, regenerate protocol fixtures.",
+      "assistant": "GOAL-ORBIT-9 remains conditional on issue 812 closing."
+    },
+    {
+      "id": "rare_safety",
+      "user": "Rare safety constraint SAFE-QUARTZ-73: never run migrations against production during dry-run validation.",
+      "assistant": "SAFE-QUARTZ-73 forbids production migrations during that validation."
+    },
+    {
+      "id": "one_off_procedure",
+      "user": "One-off procedure PROC-TIDAL-4 worked only for release 2.1 and must not be generalized.",
+      "assistant": "PROC-TIDAL-4 is historical evidence, not a reusable procedure."
+    },
+    {
+      "id": "preference_new",
+      "user": "Formatter preference PREF-CARBON changed to two spaces effective 2026-07-01 and supersedes the old preference.",
+      "assistant": "The current PREF-CARBON preference is two spaces from 2026-07-01."
+    },
+    {
+      "id": "manual_correction",
+      "user": "Manual correction FIX-LANTERN-6: use branch stable/6, not release/6.",
+      "assistant": "FIX-LANTERN-6 now points to stable/6."
+    }
+  ],
+  "queries": [
+    {
+      "id": "repository_convention",
+      "query": "CONV-AURORA-17",
+      "relevant_record_ids": ["repo_convention"],
+      "kind": "fact"
+    },
+    {
+      "id": "current_preference",
+      "query": "PREF-CARBON",
+      "relevant_record_ids": ["preference_new"],
+      "kind": "current_fact"
+    },
+    {
+      "id": "failed_command_precondition",
+      "query": "PRECOND-EMBER-42",
+      "relevant_record_ids": ["failed_precondition"],
+      "kind": "fact"
+    },
+    {
+      "id": "later_goal_trigger",
+      "query": "GOAL-ORBIT-9",
+      "relevant_record_ids": ["unresolved_goal"],
+      "kind": "prospective"
+    },
+    {
+      "id": "rare_safety_constraint",
+      "query": "SAFE-QUARTZ-73",
+      "relevant_record_ids": ["rare_safety"],
+      "kind": "safety"
+    },
+    {
+      "id": "non_generalizable_procedure",
+      "query": "PROC-TIDAL-4",
+      "relevant_record_ids": ["one_off_procedure"],
+      "kind": "requires_review"
+    },
+    {
+      "id": "manual_correction",
+      "query": "FIX-LANTERN-6",
+      "relevant_record_ids": ["manual_correction"],
+      "kind": "correction"
+    },
+    {
+      "id": "unsupported_answer",
+      "query": "UNSEEN-VIOLET-0",
+      "relevant_record_ids": [],
+      "kind": "abstain"
+    }
+  ],
+  "other_project_record": {
+    "id": "other_project_collision",
+    "user": "Project beta also mentions CONV-AURORA-17, but its convention is unrelated.",
+    "assistant": "Keep the beta convention in beta's scope."
+  }
+}

@@ -143,7 +143,22 @@ async fn storage_runtime_trace() -> Result<ModelTraceSnapshot> {
     state
         .conversation_history
         .push(Message::user_text("conformance needle"));
-    history.save(&state, "saved")?;
+    if history.save_if_absent(&state, "saved")?.is_none() {
+        return Err(Error::Other(
+            "Conformance history did not create a fresh named archive".to_string(),
+        ));
+    }
+    if history.save_if_absent(&state, "saved")?.is_some() {
+        return Err(Error::Other(
+            "Conformance history unexpectedly replaced a named archive".to_string(),
+        ));
+    }
+    history.save(&state, "discarded")?;
+    if !history.forget_current_archive("discarded")? {
+        return Err(Error::Other(
+            "Conformance history did not forget the selected archive".to_string(),
+        ));
+    }
 
     let forgotten = memory
         .record_settled_turn(

@@ -49,7 +49,7 @@ impl Provider for OpenRouterProvider {
     async fn complete_streaming(
         &self,
         request: CompletionRequest<'_>,
-        on_delta: &mut dyn FnMut(CompletionDelta),
+        on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
     ) -> Result<CompletionResponse> {
         self.inner.complete_streaming(request, on_delta).await
     }

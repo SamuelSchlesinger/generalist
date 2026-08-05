@@ -2,15 +2,40 @@
 
 ## Current stop point
 
-Generalist now contains the smallest explicit episodic-memory prototype. It is
-not the full memory/consolidation/collaboration architecture described in the
-research corpus.
+Generalist now contains and has evaluated the smallest explicit
+episodic-memory prototype. It is not the full
+memory/consolidation/collaboration architecture described in the research
+corpus.
 
 The previously completed product baseline remains:
 
 - asynchronous Ratatui interaction, stable queued steering/follow-ups, exact
-  wrapped scrolling, copy mode, reasoning inspection, and durable `/goal`
+  wrapped scrolling, clipboard/native selection, live conversation search,
+  catalog-backed slash completion, reasoning inspection, and durable `/goal`
   autorun through the host-owned `update_goal` completion control;
+- deterministic progressive MCP startup through the sole TUI reactor, with a
+  durable pre-agent queue, live F2 editing, explicit skip, no false steering
+  during background work, typed `/mcp status`, and targeted/all failed-server
+  retry into the live registry;
+- host-owned `/permissions` inspection/reset/clear, deterministic policy
+  display, and deny-first normalization of contradictory remembered state;
+- host-owned `/tools` list/search/show over the finalized bridge catalog, with
+  stable bounded output and no provider, permission, execution, or history
+  effect;
+- host-owned process-local `/usage show|reset`, with per-provider/model attempt
+  counts, explicit missing-report/cache-field coverage, and no cost claim or
+  provider/durable-state effect;
+- host-owned `/history` list/search/show/forget over sanitized current-scope
+  saves, with confirmation-gated durable deletion, direct `/save <name>` and
+  `/load <name>`, race-safe no-clobber creation, confirmed replacement,
+  autosave protection, and no provider request, tool permission, or cross-scope
+  read;
+- no fixed ordinary-completion token ceiling: Anthropic resolves and caches
+  the selected model's advertised maximum, compatible endpoints own their
+  default, and `--max-tokens` is an explicit override. Independent logical
+  byte/block/tool/wire limits reject oversized or malformed completions before
+  history or execution; committed chat/reasoning rendering is capped at 64 Ki
+  characters with full `/copy last|all|reasoning` access;
 - code mode as the only model-facing capability boundary, with native host
   controls kept separate; and
 - OpenRouter `moonshotai/kimi-k3` as the default remote model when
@@ -102,25 +127,74 @@ The reviewed future design remains under
 [agent-memory](research/agent-memory/index.md), but it is an options and safety
 corpus rather than an implementation backlog.
 
+## Evaluation result and decision
+
+`benchmarks/episodic_memory` now makes the prior gate reproducible. The
+authoritative local run is
+`results/20260805T014941Z-local-explicit-memory.jsonl`; it records exact binary,
+evaluator, corpus, Git, platform, Python, and SQLite provenance. One earlier
+JSONL intentionally preserves a probe-classification failure, and the next run
+shows the corrected check; neither was overwritten.
+
+- B0 retained zero episodes. B1 and deliberately named saves both achieved
+  recall `1.0`, mean reciprocal rank `1.0`, and precision `0.875`; ordinary
+  latest autosave achieved recall `1/7`. The one false positive was the older
+  `PREF-CARBON` preference returned after the newer preference, as expected
+  from literal chronological search.
+- On this machine, 200 explicit B1 searches measured p50 `0.097 ms`, p95
+  `0.191 ms`; the serialized eight-episode logical export was 4,892 bytes.
+  SQLite allocation is reported separately because WAL/checkpoint timing makes
+  live file size non-monotonic.
+- Current-scope search excluded a deliberate same-token record in another
+  project. Delete disappeared from live and restarted search while the prior
+  in-memory export still retained it, matching the documented boundary.
+- The worker timed out under `BEGIN IMMEDIATE` after about 2.18 seconds while
+  the current-thread executor advanced 218 ten-millisecond ticks and the
+  setting remained unchanged.
+- Eight abrupt post-enqueue exits produced two absent and six complete rows;
+  three durable acknowledgements produced three complete rows; three children
+  killed behind a writer lock produced three absent rows. No duplicate or
+  partial row appeared, the immutable update failed, and `integrity_check` was
+  `ok`.
+- The exact TUI kept input visible in 80 ms during a stalled provider, 59 ms
+  during the SQLite stall, and 73 ms after 20,000 of 30,000 one-byte provider
+  deltas. The flood's committed tail rendered and the turn settled normally. A
+  real paused-capture turn was answered but not retained; queued B1 turns
+  dispatched later, explicit search found them, and
+  normal exit preserved exactly the expected rows. `/history search` found the
+  B0 fact in ordinary autosave and `/history show autosave` inspected it with
+  zero provider requests and no autosave-content change. Direct named save/load
+  worked; default-Cancel preserved an existing checkpoint byte-for-byte,
+  explicit replacement changed it, and manual `autosave` was refused.
+  Default-Cancel then retained the checkpoint, confirmed deletion removed it,
+  and deleting `autosave` was refused; all lifecycle commands still made zero
+  provider requests. `/usage` then reported the fixture's four attempts and
+  four input/four output tokens with zero-of-four cache-field coverage;
+  `/usage reset` produced an empty ledger. Both commands made zero provider
+  requests and preserved autosave bytes. A fail-once stdio MCP server also
+  moved from visible startup failure through `/mcp retry flaky` to connected
+  status and a live `flaky_ping` bridge with zero provider calls; connected
+  and unknown retry targets were refused.
+
+The measured value is convenient automatic capture across otherwise replaced
+autosaves, not better retrieval than disciplined named saves and not temporal
+truth resolution. Retain explicit Stage 1 capture/search/show/export/forget.
+Do not proceed to automatic retrieval, promotion, or consolidation on this
+evidence.
+
 ## Exact next action
 
-Evaluate the prototype before expanding it:
-
-1. run real multi-session Generalist workflows with capture paused (B0) and
-   explicit episodic search enabled (B1);
-2. measure whether search recovers useful project facts that saved
-   conversation history does not, along with latency, retained volume, false
-   matches, and deletion behavior;
-3. exercise `/memory` during a stalled provider and under a deliberately held
-   SQLite write lock, confirming typing and queue management remain live;
-4. inject process exit around episode enqueue/insert and confirm each attempt
-   is absent or one complete immutable row; and
-5. stop at explicit search unless measured value justifies a separately
-   reviewed next milestone.
-
-Do not proceed directly to automatic retrieval or consolidation. If the
-prototype does not outperform ordinary saved-history workflows, retain only
-the useful inspection/export pieces or remove it.
+Token fragments and maximum committed chat/reasoning snapshots now have bounded
+display projections without making the UI a history authority. Provider output
+length policy is separate from host safety, including sticky callback failures
+and final validation for custom providers. Keep the million-fragment proof, the
+30,000-fragment PTY probe, and the new oversized-response/tool-burst/projection
+tests. Ordered structural events and checkpoints remain lossless. The next
+reliability pass should adversarially measure structural-event volume and decide
+whether backpressure can preserve every tool, permission, and history-boundary
+event without creating a second authority. Keep the saved-session lifecycle and
+Stage 1 memory stable. Any automatic-memory proposal still requires a separately
+reviewed, paired real-model longitudinal study.
 
 ## Validation
 
@@ -128,6 +202,7 @@ Run:
 
 ```sh
 make memory-research
+make memory-evaluation
 make conformance
 make check
 git diff --check
@@ -136,7 +211,7 @@ git diff --check
 The established `AsyncRuntime.tla` baseline is 470,086 generated states,
 117,750 distinct states, and depth 27. The current-handle `MemoryRuntime.tla`
 configuration generates 7,627 states (1,690 distinct, depth 16), and
-`ArchiveScopeRuntime.tla` generates 163,652 states (20,341 distinct, depth 11).
+`ArchiveScopeRuntime.tla` generates 519,516 states (59,725 distinct, depth 13).
 The exact Rust test count can change with dependency and target updates; rely on
 the current `make check` output rather than this handoff. All three base models,
 the three observed implementation traces, and the three deliberately invalid

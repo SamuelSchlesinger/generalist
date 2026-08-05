@@ -1,10 +1,10 @@
 //! Full-screen Ratatui frontend for the interactive agent CLI.
 
 use crate::clipboard::write_osc52;
-use crate::command::COMMAND_SPECS;
+use crate::command::{complete_local_command, CommandCompletion, COMMAND_SPECS};
 use crate::permissions::{PermissionChoice, ToolExecutionRequest};
 use crate::runtime::{DeliveryMode, PromptId, PromptQueue, PromptSource, QueuedPrompt};
-use crate::types::{truncate_middle, ContentBlock, Message};
+use crate::types::{truncate_middle, ContentBlock, Message, Usage};
 use crate::{AgentEvent, ToolCallOutcome};
 use chrono::Local;
 use crossterm::cursor::Show;
@@ -27,7 +27,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Stdout};
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
@@ -36,6 +36,16 @@ use unicode_width::UnicodeWidthChar;
 const TICK_RATE: Duration = Duration::from_millis(100);
 const MAX_ACTIVITY_ITEMS: usize = 100;
 const DEFAULT_MAX_DISPLAY_CHARS: usize = 2_000;
+const MAX_CONVERSATION_DISPLAY_CHARS: usize = 64 * 1024;
+const ASSISTANT_DISPLAY_MARKER: &str =
+    "\n\n[Middle omitted from the UI; use /copy last for the full committed response.]\n\n";
+const USER_DISPLAY_MARKER: &str =
+    "\n\n[Middle omitted from the UI; use /copy all for the full committed prompt.]\n\n";
+const REASONING_DISPLAY_MARKER: &str =
+    "\n\n[Middle omitted from the UI; use /copy reasoning for the full inspectable committed reasoning.]\n\n";
+const LIVE_DISPLAY_MARKER: &str =
+    "\n\n[Live preview capped in the UI; the committed response will replace it.]\n\n";
+const LOCAL_DISPLAY_MARKER: &str = "\n\n[Middle omitted from the UI.]\n\n";
 
 const BG: Color = Color::Rgb(12, 16, 24);
 const PANEL: Color = Color::Rgb(20, 26, 38);
@@ -64,6 +74,7 @@ struct ChatEntry {
     kind: ChatKind,
     timestamp: String,
     body: String,
+    display_capped: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,8 +123,47 @@ impl ChatSearch {
 struct ReasoningEntry {
     timestamp: String,
     body: String,
+    display_capped: bool,
     finished: bool,
     abort_reason: Option<String>,
+}
+
+fn project_display(value: &str, marker: &str) -> (String, bool) {
+    let value = sanitize_terminal_text(value);
+    let count = value.chars().count();
+    if count <= MAX_CONVERSATION_DISPLAY_CHARS {
+        return (value, false);
+    }
+
+    let marker_chars = marker.chars().count();
+    if marker_chars >= MAX_CONVERSATION_DISPLAY_CHARS {
+        return (
+            marker
+                .chars()
+                .take(MAX_CONVERSATION_DISPLAY_CHARS)
+                .collect(),
+            true,
+        );
+    }
+    let retained = MAX_CONVERSATION_DISPLAY_CHARS - marker_chars;
+    let start_chars = retained / 2;
+    let end_chars = retained - start_chars;
+    let start = value.chars().take(start_chars).collect::<String>();
+    let end = value.chars().skip(count - end_chars).collect::<String>();
+    (format!("{start}{marker}{end}"), true)
+}
+
+fn project_chat_display(kind: ChatKind, value: &str) -> (String, bool) {
+    let marker = match kind {
+        ChatKind::Assistant => ASSISTANT_DISPLAY_MARKER,
+        ChatKind::User => USER_DISPLAY_MARKER,
+        ChatKind::Info | ChatKind::Error => LOCAL_DISPLAY_MARKER,
+    };
+    project_display(value, marker)
+}
+
+fn project_reasoning_display(value: &str) -> (String, bool) {
+    project_display(value, REASONING_DISPLAY_MARKER)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,20 +231,80 @@ enum PromptEditorAction {
     Cancel,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProviderUsageTotals {
+    attempts: u64,
+    usage_reports: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_reports: u64,
+    cache_creation_reports: u64,
+}
+
+impl ProviderUsageTotals {
+    fn record_attempt(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    fn record_report(&mut self, usage: &Usage) {
+        self.usage_reports = self.usage_reports.saturating_add(1);
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        if let Some(tokens) = usage.cache_read_input_tokens {
+            self.cache_read_reports = self.cache_read_reports.saturating_add(1);
+            self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(tokens);
+        }
+        if let Some(tokens) = usage.cache_creation_input_tokens {
+            self.cache_creation_reports = self.cache_creation_reports.saturating_add(1);
+            self.cache_creation_input_tokens =
+                self.cache_creation_input_tokens.saturating_add(tokens);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.attempts = self.attempts.saturating_add(other.attempts);
+        self.usage_reports = self.usage_reports.saturating_add(other.usage_reports);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(other.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(other.cache_creation_input_tokens);
+        self.cache_read_reports = self
+            .cache_read_reports
+            .saturating_add(other.cache_read_reports);
+        self.cache_creation_reports = self
+            .cache_creation_reports
+            .saturating_add(other.cache_creation_reports);
+    }
+
+    fn unreported_attempts(&self) -> u64 {
+        self.attempts.saturating_sub(self.usage_reports)
+    }
+}
+
 #[derive(Debug)]
 struct AppState {
     api: String,
     model: String,
     bridge_count: usize,
     context_tokens: u64,
+    provider_usage: BTreeMap<(String, String), ProviderUsageTotals>,
+    active_usage_bucket: Option<(String, String)>,
     goal: Option<String>,
     copy_mode: bool,
     chat: Vec<ChatEntry>,
     reasoning: Vec<ReasoningEntry>,
     active_reasoning: Option<usize>,
+    committing_reasoning: Option<usize>,
     activity: Vec<ActivityEntry>,
     active_tools: Vec<(String, usize)>,
     streaming_chat: Option<usize>,
+    committing_streaming_chat: Option<usize>,
     input: String,
     input_cursor: usize,
     input_history: Vec<String>,
@@ -205,6 +315,7 @@ struct AppState {
     follow_latest: bool,
     pending_chat_jump: Option<usize>,
     busy: bool,
+    turn_active: bool,
     spinner_tick: usize,
     status: String,
     modal: Option<Modal>,
@@ -221,14 +332,18 @@ impl AppState {
             model,
             bridge_count: 0,
             context_tokens: 0,
+            provider_usage: BTreeMap::new(),
+            active_usage_bucket: None,
             goal: None,
             copy_mode: false,
             chat: Vec::new(),
             reasoning: Vec::new(),
             active_reasoning: None,
+            committing_reasoning: None,
             activity: Vec::new(),
             active_tools: Vec::new(),
             streaming_chat: None,
+            committing_streaming_chat: None,
             input: String::new(),
             input_cursor: 0,
             input_history: Vec::new(),
@@ -239,6 +354,7 @@ impl AppState {
             follow_latest: true,
             pending_chat_jump: None,
             busy: false,
+            turn_active: false,
             spinner_tick: 0,
             status: "Ready".to_string(),
             modal: None,
@@ -251,13 +367,109 @@ impl AppState {
         Local::now().format("%H:%M:%S").to_string()
     }
 
+    fn current_usage_bucket(&self) -> (String, String) {
+        (self.api.clone(), self.model.clone())
+    }
+
+    fn provider_usage_report(&self) -> String {
+        if self.provider_usage.is_empty() {
+            return "Provider usage: no API attempts recorded in this process. Provider reports, context estimates, and monetary cost are separate."
+                .to_string();
+        }
+
+        let mut total = ProviderUsageTotals::default();
+        let mut lines = vec![
+            "Provider usage (process-local provider reports; not a cost estimate):".to_string(),
+        ];
+        for ((api, model), usage) in &self.provider_usage {
+            total.merge(usage);
+            lines.push(format!(
+                "- {api} / {model}: {}; {}; {}; {} input; {} output; cache read {}; cache creation {}",
+                counted(usage.attempts, "attempt", "attempts"),
+                counted(usage.usage_reports, "usage report", "usage reports"),
+                counted(
+                    usage.unreported_attempts(),
+                    "unreported attempt",
+                    "unreported attempts",
+                ),
+                usage.input_tokens,
+                usage.output_tokens,
+                optional_usage_total(
+                    usage.cache_read_input_tokens,
+                    usage.cache_read_reports,
+                    usage.usage_reports,
+                ),
+                optional_usage_total(
+                    usage.cache_creation_input_tokens,
+                    usage.cache_creation_reports,
+                    usage.usage_reports,
+                ),
+            ));
+        }
+        lines.push(format!(
+            "Total: {}; {}; {}; {} input; {} output; cache read {}; cache creation {}",
+            counted(total.attempts, "attempt", "attempts"),
+            counted(total.usage_reports, "usage report", "usage reports"),
+            counted(
+                total.unreported_attempts(),
+                "unreported attempt",
+                "unreported attempts",
+            ),
+            total.input_tokens,
+            total.output_tokens,
+            optional_usage_total(
+                total.cache_read_input_tokens,
+                total.cache_read_reports,
+                total.usage_reports,
+            ),
+            optional_usage_total(
+                total.cache_creation_input_tokens,
+                total.cache_creation_reports,
+                total.usage_reports,
+            ),
+        ));
+        lines.push(format!(
+            "Current context estimate: {} tokens (separate from cumulative provider reports).",
+            self.context_tokens
+        ));
+        lines.join("\n")
+    }
+
+    fn reset_provider_usage(&mut self) {
+        let active = self.active_usage_bucket.clone();
+        self.provider_usage.clear();
+        if let Some(bucket) = active {
+            self.provider_usage
+                .entry(bucket)
+                .or_default()
+                .record_attempt();
+        }
+    }
+
     fn push_chat(&mut self, kind: ChatKind, body: impl Into<String>) {
+        let (body, display_capped) = project_chat_display(kind, &body.into());
         self.chat.push(ChatEntry {
             kind,
             timestamp: Self::timestamp(),
-            body: sanitize_terminal_text(&body.into()),
+            body,
+            display_capped,
         });
         self.refresh_chat_search();
+    }
+
+    fn push_chat_delta(&mut self, index: usize, delta: &str) {
+        let Some(entry) = self.chat.get_mut(index) else {
+            return;
+        };
+        if entry.display_capped {
+            return;
+        }
+        entry.body.push_str(&sanitize_terminal_text(delta));
+        if entry.body.chars().count() > MAX_CONVERSATION_DISPLAY_CHARS {
+            let (body, display_capped) = project_display(&entry.body, LIVE_DISPLAY_MARKER);
+            entry.body = body;
+            entry.display_capped = display_capped;
+        }
     }
 
     fn push_user(&mut self, body: impl Into<String>) {
@@ -276,9 +488,11 @@ impl AppState {
         self.chat.clear();
         self.reasoning.clear();
         self.active_reasoning = None;
+        self.committing_reasoning = None;
         self.activity.clear();
         self.active_tools.clear();
         self.streaming_chat = None;
+        self.committing_streaming_chat = None;
         self.chat_scroll = 0;
         self.chat_max_scroll = 0;
         self.follow_latest = true;
@@ -436,9 +650,11 @@ impl AppState {
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 if !reasoning.is_empty() {
+                    let (body, display_capped) = project_reasoning_display(&reasoning);
                     self.reasoning.push(ReasoningEntry {
                         timestamp: "saved".to_string(),
-                        body: sanitize_terminal_text(&reasoning),
+                        body,
+                        display_capped,
                         finished: true,
                         abort_reason: None,
                     });
@@ -613,6 +829,7 @@ impl AppState {
         self.reasoning.push(ReasoningEntry {
             timestamp: Self::timestamp(),
             body: String::new(),
+            display_capped: false,
             finished: false,
             abort_reason: None,
         });
@@ -640,7 +857,15 @@ impl AppState {
             return self.push_reasoning_delta(reasoning);
         };
         if let Some(entry) = self.reasoning.get_mut(index) {
+            if entry.display_capped {
+                return;
+            }
             entry.body.push_str(&reasoning);
+            if entry.body.chars().count() > MAX_CONVERSATION_DISPLAY_CHARS {
+                let (body, display_capped) = project_display(&entry.body, LIVE_DISPLAY_MARKER);
+                entry.body = body;
+                entry.display_capped = display_capped;
+            }
         }
     }
 
@@ -659,14 +884,33 @@ impl AppState {
     fn apply_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::ApiCallStarted => {
+                let bucket = self.current_usage_bucket();
+                self.provider_usage
+                    .entry(bucket.clone())
+                    .or_default()
+                    .record_attempt();
+                self.active_usage_bucket = Some(bucket);
                 self.busy = true;
                 self.streaming_chat = None;
+                self.committing_streaming_chat = None;
+                self.committing_reasoning = None;
                 self.finish_reasoning_attempt();
                 self.start_reasoning_attempt();
                 self.status = "Thinking".to_string();
             }
             AgentEvent::ApiCallFinished { usage } => {
-                self.streaming_chat = None;
+                let bucket = self
+                    .active_usage_bucket
+                    .take()
+                    .unwrap_or_else(|| self.current_usage_bucket());
+                if let Some(usage) = usage.as_ref() {
+                    self.provider_usage
+                        .entry(bucket)
+                        .or_default()
+                        .record_report(usage);
+                }
+                self.committing_streaming_chat = self.streaming_chat.take();
+                self.committing_reasoning = self.active_reasoning;
                 self.finish_reasoning_attempt();
                 self.status = usage
                     .map(|usage| {
@@ -680,33 +924,119 @@ impl AppState {
             }
             AgentEvent::AssistantText(text) => {
                 self.streaming_chat = None;
+                self.committing_streaming_chat = None;
                 self.push_chat(ChatKind::Assistant, text);
             }
             AgentEvent::AssistantTextDelta(text) => {
-                let text = sanitize_terminal_text(&text);
                 if let Some(index) = self.streaming_chat {
-                    if let Some(entry) = self.chat.get_mut(index) {
-                        entry.body.push_str(&text);
-                    }
+                    self.push_chat_delta(index, &text);
                 } else {
-                    self.push_chat(ChatKind::Assistant, text);
+                    let (body, display_capped) = project_display(&text, LIVE_DISPLAY_MARKER);
+                    self.chat.push(ChatEntry {
+                        kind: ChatKind::Assistant,
+                        timestamp: Self::timestamp(),
+                        body,
+                        display_capped,
+                    });
                     self.streaming_chat = self.chat.len().checked_sub(1);
                 }
             }
-            AgentEvent::ReasoningDelta(reasoning) => self.push_reasoning_delta(reasoning),
+            AgentEvent::ReasoningDelta(reasoning) => {
+                if self.active_reasoning.is_none() {
+                    self.committing_reasoning = None;
+                }
+                self.push_reasoning_delta(reasoning);
+            }
+            AgentEvent::StreamCommitted { text, reasoning } => {
+                let chat_index = self
+                    .committing_streaming_chat
+                    .take()
+                    .or_else(|| self.streaming_chat.take());
+                let reasoning_index = self
+                    .committing_reasoning
+                    .take()
+                    .or_else(|| self.active_reasoning.take());
+
+                if let Some(text) = text {
+                    let (text, display_capped) = project_chat_display(ChatKind::Assistant, &text);
+                    if let Some(entry) = chat_index.and_then(|index| self.chat.get_mut(index)) {
+                        entry.body = text;
+                        entry.display_capped = display_capped;
+                    } else if !text.is_empty() {
+                        self.chat.push(ChatEntry {
+                            kind: ChatKind::Assistant,
+                            timestamp: Self::timestamp(),
+                            body: text,
+                            display_capped,
+                        });
+                    }
+                }
+                if let Some(reasoning) = reasoning {
+                    let (reasoning, display_capped) = project_reasoning_display(&reasoning);
+                    if let Some(entry) =
+                        reasoning_index.and_then(|index| self.reasoning.get_mut(index))
+                    {
+                        entry.body = reasoning;
+                        entry.display_capped = display_capped;
+                        entry.finished = true;
+                        entry.abort_reason = None;
+                    } else if !reasoning.is_empty() {
+                        self.reasoning.push(ReasoningEntry {
+                            timestamp: Self::timestamp(),
+                            body: reasoning,
+                            display_capped,
+                            finished: true,
+                            abort_reason: None,
+                        });
+                    }
+                }
+            }
+            AgentEvent::StreamDisplayTruncated {
+                text_bytes,
+                reasoning_bytes,
+            } => {
+                if text_bytes > 0 {
+                    let marker = format!(
+                        "\n\n[Live preview omitted {text_bytes} streamed bytes; awaiting committed response.]"
+                    );
+                    if let Some(index) = self.streaming_chat {
+                        self.push_chat_delta(index, &marker);
+                    } else {
+                        self.push_chat(ChatKind::Assistant, marker);
+                        self.streaming_chat = self.chat.len().checked_sub(1);
+                    }
+                }
+                if reasoning_bytes > 0 {
+                    self.push_reasoning_delta(format!(
+                        "\n\n[Live preview omitted {reasoning_bytes} reasoning bytes; awaiting committed response.]"
+                    ));
+                }
+            }
             AgentEvent::AssistantStreamAborted { reason } => {
                 let reason = sanitize_terminal_text(&reason);
-                if let Some(index) = self.streaming_chat.take() {
+                let index = self
+                    .streaming_chat
+                    .take()
+                    .or_else(|| self.committing_streaming_chat.take());
+                if let Some(index) = index {
                     if let Some(entry) = self.chat.get_mut(index) {
-                        entry
-                            .body
-                            .push_str(&format!("\n\n[Uncommitted stream: {reason}]"));
+                        let status = format!(
+                            "\n\n[Uncommitted stream: {reason}; preview may be incomplete.]"
+                        );
+                        let combined = format!("{}{status}", entry.body);
+                        let (body, display_capped) =
+                            project_display(&combined, LIVE_DISPLAY_MARKER);
+                        entry.body = body;
+                        entry.display_capped = display_capped;
                     }
                 } else {
                     self.push_info(format!("Uncommitted assistant stream: {reason}"));
                 }
             }
-            AgentEvent::ReasoningStreamAborted { reason } => self.abort_reasoning_attempt(reason),
+            AgentEvent::ReasoningStreamAborted { reason } => {
+                self.committing_reasoning = None;
+                self.abort_reasoning_attempt(reason);
+            }
             AgentEvent::ToolCallStarted { name, input } => {
                 let via_code_mode = name != "python"
                     && self
@@ -813,6 +1143,33 @@ impl AppState {
     fn delete_input(&mut self) {
         delete_at_cursor(&mut self.input, self.input_cursor);
         self.history_cursor = None;
+    }
+
+    /// Complete a catalog-backed command only when the cursor is at the end.
+    /// Returning false preserves Tab's ordinary follow-up submission path.
+    fn complete_slash_command(&mut self) -> bool {
+        if self.input_cursor != self.input.chars().count() {
+            return false;
+        }
+        match complete_local_command(&self.input) {
+            Some(CommandCompletion::Replace(replacement)) => {
+                self.input = replacement;
+                self.input_cursor = self.input.chars().count();
+                self.history_cursor = None;
+                self.status = "Completed slash-command prefix".to_string();
+                true
+            }
+            Some(CommandCompletion::Candidates(candidates)) => {
+                self.status = format!("Command matches: {}", candidates.join(" · "));
+                true
+            }
+            Some(CommandCompletion::Complete) => {
+                self.status =
+                    "Command prefix complete · add arguments if needed or press Enter".to_string();
+                true
+            }
+            None => false,
+        }
     }
 
     fn history_previous(&mut self) {
@@ -1060,6 +1417,18 @@ impl TerminalUi {
         self.dirty = true;
     }
 
+    /// Render cumulative provider usage observed since this UI process began.
+    pub fn provider_usage_report(&self) -> String {
+        self.app.provider_usage_report()
+    }
+
+    /// Clear cumulative provider usage. A currently active attempt, if any,
+    /// remains represented so its eventual report cannot exceed its attempts.
+    pub fn reset_provider_usage(&mut self) {
+        self.app.reset_provider_usage();
+        self.dirty = true;
+    }
+
     pub fn set_goal(&mut self, goal: Option<&str>) {
         let goal = goal.map(sanitize_terminal_text);
         if self.app.goal == goal {
@@ -1071,13 +1440,35 @@ impl TerminalUi {
 
     pub fn set_busy(&mut self, busy: bool, status: &str) {
         let status = sanitize_terminal_text(status);
-        let changed = self.app.busy != busy || self.app.status != status;
+        let clear_turn = !busy && self.app.turn_active;
+        let changed = self.app.busy != busy || self.app.status != status || clear_turn;
         self.app.busy = busy;
         self.app.status = status;
         if !busy {
+            self.app.turn_active = false;
             self.app.streaming_chat = None;
+            self.app.committing_streaming_chat = None;
+            self.app.committing_reasoning = None;
         }
         self.dirty |= changed;
+    }
+
+    /// Record whether an agent turn currently owns mutable conversation state.
+    /// Background operations may be busy without accepting steering.
+    pub fn set_turn_active(&mut self, active: bool) {
+        if self.app.turn_active == active {
+            return;
+        }
+        self.app.turn_active = active;
+        self.dirty = true;
+    }
+
+    pub fn set_bridge_count(&mut self, bridge_count: usize) {
+        if self.app.bridge_count == bridge_count {
+            return;
+        }
+        self.app.bridge_count = bridge_count;
+        self.dirty = true;
     }
 
     pub fn status(&mut self, message: &str) {
@@ -1418,7 +1809,12 @@ impl TerminalUi {
             return UiAction::None;
         }
 
-        if let Some(delivery) = submission_delivery(key, self.app.busy) {
+        if key.code == KeyCode::Tab && key.modifiers.is_empty() && self.app.complete_slash_command()
+        {
+            return UiAction::None;
+        }
+
+        if let Some(delivery) = submission_delivery(key, self.app.turn_active) {
             return self.submit(delivery);
         }
 
@@ -1743,7 +2139,7 @@ impl TerminalUi {
             }
             KeyCode::Char('s') => {
                 if let Some(id) = selected_id {
-                    queue_changed = queue.toggle_delivery(id, self.app.busy);
+                    queue_changed = queue.toggle_delivery(id, self.app.turn_active);
                 }
             }
             KeyCode::Char('e') | KeyCode::Enter => {
@@ -2038,16 +2434,22 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         (
             " Command ",
             if app.busy {
-                "Enter queue until idle · /help lists commands"
+                "Tab complete · Enter queue until idle"
             } else {
-                "Enter run · /help lists commands"
+                "Tab complete · Enter run · /help lists commands"
             },
             PURPLE,
+        )
+    } else if app.turn_active {
+        (
+            " Message ",
+            "Enter steer · Tab/Alt+Enter follow-up · Ctrl+J newline",
+            CYAN,
         )
     } else if app.busy {
         (
             " Message ",
-            "Enter steer · Tab/Alt+Enter follow-up · Ctrl+J newline",
+            "Enter queue · background work continues · Ctrl+J newline",
             CYAN,
         )
     } else {
@@ -2091,14 +2493,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let left = if app.copy_mode {
         " F3/Esc resume · select text · use your terminal's copy shortcut"
     } else if app.input.trim_start().starts_with('/') {
-        command_hint = format!(
-            " {}",
-            COMMAND_SPECS
-                .iter()
-                .map(|command| command.name)
-                .collect::<Vec<_>>()
-                .join("  ")
-        );
+        command_hint = command_footer_hint(&app.input);
         command_hint.as_str()
     } else if app.busy {
         " F1 help  F2 queue  F3 copy  F4 reasoning  Ctrl+F find  Esc/Ctrl+C interrupt"
@@ -2124,6 +2519,28 @@ fn render_footer(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             .style(Style::default().fg(MUTED).bg(BG)),
         right_area,
     );
+}
+
+fn command_footer_hint(input: &str) -> String {
+    match complete_local_command(input) {
+        Some(CommandCompletion::Replace(replacement)) => {
+            format!(" Tab → {}", replacement.trim())
+        }
+        Some(CommandCompletion::Candidates(candidates)) => {
+            format!(" {}", candidates.join("  "))
+        }
+        Some(CommandCompletion::Complete) => {
+            " command prefix complete · add arguments if needed or press Enter".to_string()
+        }
+        None => format!(
+            " {}",
+            COMMAND_SPECS
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>()
+                .join("  ")
+        ),
+    }
 }
 
 fn render_modal(
@@ -2291,7 +2708,7 @@ fn chat_search_preview(entry: &ChatEntry, query: &str) -> String {
 }
 
 fn render_help(frame: &mut Frame<'_>) {
-    let area = centered(frame.area(), 88, 84, 70, 20);
+    let area = centered(frame.area(), 94, 84, 70, 20);
     frame.render_widget(Clear, area);
     let block = modal_block(" Help & shortcuts ");
     let inner = block.inner(area);
@@ -2310,7 +2727,7 @@ fn render_help(frame: &mut Frame<'_>) {
     command_lines.extend(COMMAND_SPECS.iter().map(|command| {
         Line::from(vec![
             Span::styled(
-                format!("  {:<9}", command.name),
+                format!("  {:<14}", command.name),
                 Style::default().fg(PURPLE),
             ),
             Span::styled(command.description, Style::default().fg(TEXT)),
@@ -2332,7 +2749,8 @@ fn render_help(frame: &mut Frame<'_>) {
             Style::default().fg(CYAN).bold(),
         )),
         Line::from("  Enter steer at next safe boundary"),
-        Line::from("  Tab or Alt+Enter queue a separate follow-up"),
+        Line::from("  Tab completes slash prefixes; otherwise queues follow-up"),
+        Line::from("  Alt+Enter always queues a separate follow-up"),
         Line::from("  Esc or Ctrl+C interrupt safely"),
         Line::from(""),
         Line::from(Span::styled("Queue", Style::default().fg(CYAN).bold())),
@@ -3062,7 +3480,7 @@ fn copy_mode_toggle_key(copy_mode: bool, key: KeyEvent) -> bool {
     is_key_press(key) && (key.code == KeyCode::F(3) || (copy_mode && key.code == KeyCode::Esc))
 }
 
-fn submission_delivery(key: KeyEvent, busy: bool) -> Option<DeliveryMode> {
+fn submission_delivery(key: KeyEvent, turn_active: bool) -> Option<DeliveryMode> {
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
@@ -3072,7 +3490,7 @@ fn submission_delivery(key: KeyEvent, busy: bool) -> Option<DeliveryMode> {
     match key.code {
         KeyCode::Tab => Some(DeliveryMode::FollowUp),
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => Some(DeliveryMode::FollowUp),
-        KeyCode::Enter => Some(if busy {
+        KeyCode::Enter => Some(if turn_active {
             DeliveryMode::Steer
         } else {
             DeliveryMode::FollowUp
@@ -3121,6 +3539,20 @@ fn compact_number(value: u64) -> String {
     }
 }
 
+fn counted(value: u64, singular: &str, plural: &str) -> String {
+    format!("{} {}", value, if value == 1 { singular } else { plural })
+}
+
+fn optional_usage_total(tokens: u64, field_reports: u64, usage_reports: u64) -> String {
+    if usage_reports == 0 {
+        "unavailable (no usage reports)".to_string()
+    } else if field_reports == 0 {
+        format!("unavailable (0/{usage_reports} reports)")
+    } else {
+        format!("{tokens} ({field_reports}/{usage_reports} reports)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3138,6 +3570,58 @@ mod tests {
         backspace(&mut value, &mut cursor);
         assert_eq!(value, "ac");
         assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn slash_completion_consumes_only_catalog_prefixes_at_the_end() {
+        let mut app = AppState::new("api", "model");
+        app.input = "/to".to_string();
+        app.input_cursor = 3;
+        assert!(app.complete_slash_command());
+        assert_eq!(app.input, "/tools ");
+        assert_eq!(app.input_cursor, 7);
+        assert!(app.status.contains("Completed"));
+
+        app.input = "/tools s".to_string();
+        app.input_cursor = app.input.chars().count();
+        assert!(app.complete_slash_command());
+        assert_eq!(app.input, "/tools s");
+        assert!(app.status.contains("/tools search · /tools show"));
+
+        app.input = "/tools search archive".to_string();
+        app.input_cursor = app.input.chars().count();
+        assert!(!app.complete_slash_command());
+        assert_eq!(app.input, "/tools search archive");
+
+        app.input = "/goal ship 🦀 now".to_string();
+        app.input_cursor = app.input.chars().count();
+        assert!(!app.complete_slash_command());
+
+        app.input = "/tools".to_string();
+        app.input_cursor = 2;
+        assert!(!app.complete_slash_command());
+        assert_eq!(app.input, "/tools");
+    }
+
+    #[test]
+    fn command_footer_derives_stable_unique_and_ambiguous_hints() {
+        assert_eq!(command_footer_hint("/to"), " Tab → /tools");
+        assert_eq!(
+            command_footer_hint("/tools s"),
+            " /tools search  /tools show"
+        );
+        assert!(command_footer_hint("/tools search ").contains("prefix complete"));
+        assert!(command_footer_hint("/goal ship it").contains("/permissions"));
+
+        let mut app = AppState::new("api", "model");
+        app.input = "/tools s".to_string();
+        app.input_cursor = app.input.chars().count();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("/tools search"));
+        assert!(rendered.contains("/tools show"));
     }
 
     #[test]
@@ -3468,14 +3952,205 @@ mod tests {
     fn aborted_stream_is_visibly_marked_uncommitted() {
         let mut app = AppState::new("api", "model");
         app.apply_agent_event(AgentEvent::AssistantTextDelta("partial".into()));
+        app.apply_agent_event(AgentEvent::StreamDisplayTruncated {
+            text_bytes: 42,
+            reasoning_bytes: 0,
+        });
         app.apply_agent_event(AgentEvent::AssistantStreamAborted {
             reason: "interrupted before commit".into(),
         });
         app.apply_agent_event(AgentEvent::ApiCallFinished { usage: None });
 
         assert!(app.chat[0].body.starts_with("partial"));
+        assert!(app.chat[0].body.contains("omitted 42 streamed bytes"));
         assert!(app.chat[0].body.contains("[Uncommitted stream:"));
         assert!(app.streaming_chat.is_none());
+    }
+
+    #[test]
+    fn committed_stream_replaces_a_truncated_preview_exactly() {
+        let mut app = AppState::new("api", "model");
+        app.apply_agent_event(AgentEvent::ApiCallStarted);
+        app.apply_agent_event(AgentEvent::AssistantTextDelta("partial".into()));
+        app.apply_agent_event(AgentEvent::ReasoningDelta("rough".into()));
+        app.apply_agent_event(AgentEvent::StreamDisplayTruncated {
+            text_bytes: 5_000,
+            reasoning_bytes: 7_000,
+        });
+        app.apply_agent_event(AgentEvent::ApiCallFinished { usage: None });
+        app.apply_agent_event(AgentEvent::StreamCommitted {
+            text: Some("complete assistant response".into()),
+            reasoning: Some("complete inspectable reasoning".into()),
+        });
+
+        assert_eq!(app.chat.len(), 1);
+        assert_eq!(app.chat[0].body, "complete assistant response");
+        assert_eq!(app.reasoning.len(), 1);
+        assert_eq!(app.reasoning[0].body, "complete inspectable reasoning");
+        assert!(app.reasoning[0].finished);
+        assert!(app.reasoning[0].abort_reason.is_none());
+        assert!(app.streaming_chat.is_none());
+        assert!(app.committing_streaming_chat.is_none());
+        assert!(app.committing_reasoning.is_none());
+    }
+
+    #[test]
+    fn committed_chat_and_reasoning_use_bounded_exact_projections() {
+        let assistant = format!(
+            "ASSISTANT-HEAD{}ASSISTANT-TAIL",
+            "a".repeat(MAX_CONVERSATION_DISPLAY_CHARS * 2)
+        );
+        let reasoning = format!(
+            "REASONING-HEAD{}REASONING-TAIL",
+            "r".repeat(MAX_CONVERSATION_DISPLAY_CHARS * 2)
+        );
+        let mut app = AppState::new("api", "model");
+        app.apply_agent_event(AgentEvent::ApiCallStarted);
+        app.apply_agent_event(AgentEvent::AssistantTextDelta("preview".into()));
+        app.apply_agent_event(AgentEvent::ReasoningDelta("rough".into()));
+        app.apply_agent_event(AgentEvent::ApiCallFinished { usage: None });
+        app.apply_agent_event(AgentEvent::StreamCommitted {
+            text: Some(assistant),
+            reasoning: Some(reasoning),
+        });
+
+        assert!(app.chat[0].display_capped);
+        assert!(app.chat[0].body.chars().count() <= MAX_CONVERSATION_DISPLAY_CHARS);
+        assert!(app.chat[0].body.starts_with("ASSISTANT-HEAD"));
+        assert!(app.chat[0].body.ends_with("ASSISTANT-TAIL"));
+        assert!(app.chat[0].body.contains("/copy last"));
+
+        assert!(app.reasoning[0].display_capped);
+        assert!(app.reasoning[0].body.chars().count() <= MAX_CONVERSATION_DISPLAY_CHARS);
+        assert!(app.reasoning[0].body.starts_with("REASONING-HEAD"));
+        assert!(app.reasoning[0].body.ends_with("REASONING-TAIL"));
+        assert!(app.reasoning[0].body.contains("/copy reasoning"));
+    }
+
+    #[test]
+    fn live_projection_stops_growing_until_commit_or_abort() {
+        let mut app = AppState::new("api", "model");
+        app.apply_agent_event(AgentEvent::AssistantTextDelta(
+            "x".repeat(MAX_CONVERSATION_DISPLAY_CHARS + 1),
+        ));
+        let capped = app.chat[0].body.clone();
+        app.apply_agent_event(AgentEvent::AssistantTextDelta(
+            "ignored-after-cap".repeat(100),
+        ));
+
+        assert_eq!(app.chat[0].body, capped);
+        assert!(app.chat[0].display_capped);
+        assert!(app.chat[0].body.contains("Live preview capped"));
+
+        app.apply_agent_event(AgentEvent::AssistantStreamAborted {
+            reason: "provider stopped".into(),
+        });
+        assert!(app.chat[0].body.chars().count() <= MAX_CONVERSATION_DISPLAY_CHARS);
+        assert!(app.chat[0].body.contains("Uncommitted stream:"));
+        assert!(app.chat[0].body.ends_with("preview may be incomplete.]"));
+    }
+
+    #[test]
+    fn provider_usage_tracks_reports_missing_data_and_model_buckets() {
+        let mut app = AppState::new("api-a", "model-a");
+        app.context_tokens = 1_234;
+        app.apply_agent_event(AgentEvent::ApiCallStarted);
+        app.apply_agent_event(AgentEvent::ApiCallFinished {
+            usage: Some(Usage {
+                input_tokens: 10,
+                output_tokens: 4,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+        });
+
+        app.api = "api-b".into();
+        app.model = "model-b".into();
+        app.apply_agent_event(AgentEvent::ApiCallStarted);
+        app.apply_agent_event(AgentEvent::ApiCallFinished { usage: None });
+        app.apply_agent_event(AgentEvent::ApiCallStarted);
+        app.apply_agent_event(AgentEvent::ApiCallFinished {
+            usage: Some(Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                cache_read_input_tokens: Some(5),
+                cache_creation_input_tokens: Some(2),
+            }),
+        });
+
+        let report = app.provider_usage_report();
+        assert!(
+            report.contains("api-a / model-a: 1 attempt; 1 usage report; 0 unreported attempts")
+        );
+        assert!(report.contains("cache read unavailable (0/1 reports)"));
+        assert!(
+            report.contains("api-b / model-b: 2 attempts; 1 usage report; 1 unreported attempt")
+        );
+        assert!(report.contains(
+            "Total: 3 attempts; 2 usage reports; 1 unreported attempt; 17 input; 7 output"
+        ));
+        assert!(report.contains("cache read 5 (1/2 reports)"));
+        assert!(report.contains("cache creation 2 (1/2 reports)"));
+        assert!(report.contains("Current context estimate: 1234 tokens"));
+        assert!(report.contains("not a cost estimate"));
+    }
+
+    #[test]
+    fn provider_usage_reset_preserves_only_an_active_attempt() {
+        let mut app = AppState::new("api", "model");
+        app.apply_agent_event(AgentEvent::ApiCallStarted);
+        app.reset_provider_usage();
+        app.apply_agent_event(AgentEvent::ApiCallFinished {
+            usage: Some(Usage {
+                input_tokens: 2,
+                output_tokens: 1,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+        });
+        let report = app.provider_usage_report();
+        assert!(
+            report.contains("1 attempt; 1 usage report; 0 unreported attempts; 2 input; 1 output")
+        );
+
+        app.reset_provider_usage();
+        assert!(app
+            .provider_usage_report()
+            .contains("no API attempts recorded"));
+    }
+
+    #[test]
+    fn provider_usage_counters_saturate_instead_of_wrapping() {
+        let mut totals = ProviderUsageTotals {
+            attempts: u64::MAX,
+            usage_reports: u64::MAX,
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cache_read_input_tokens: u64::MAX,
+            cache_creation_input_tokens: u64::MAX,
+            cache_read_reports: u64::MAX,
+            cache_creation_reports: u64::MAX,
+        };
+        totals.record_attempt();
+        totals.record_report(&Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_input_tokens: Some(1),
+            cache_creation_input_tokens: Some(1),
+        });
+        assert_eq!(
+            totals,
+            ProviderUsageTotals {
+                attempts: u64::MAX,
+                usage_reports: u64::MAX,
+                input_tokens: u64::MAX,
+                output_tokens: u64::MAX,
+                cache_read_input_tokens: u64::MAX,
+                cache_creation_input_tokens: u64::MAX,
+                cache_read_reports: u64::MAX,
+                cache_creation_reports: u64::MAX,
+            }
+        );
     }
 
     #[test]
@@ -3649,12 +4324,13 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Command"));
+        assert!(rendered.contains("Tab complete"));
         assert!(rendered.contains("Enter run"));
         assert!(rendered.contains("/goal"));
     }
 
     #[test]
-    fn help_discovers_goal_edit_from_the_command_catalog() {
+    fn help_discovers_host_controls_from_the_command_catalog() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(render_help).unwrap();
@@ -3662,6 +4338,12 @@ mod tests {
         assert!(rendered.contains("Slash commands"));
         assert!(rendered.contains("/goal"));
         assert!(rendered.contains("run/edit/show/clear objective"));
+        assert!(rendered.contains("/permissions"));
+        assert!(rendered.contains("inspect/reset remembered policy"));
+        assert!(rendered.contains("/tools"));
+        assert!(rendered.contains("inspect tools and schemas"));
+        assert!(rendered.contains("/mcp"));
+        assert!(rendered.contains("inspect/retry MCP connections"));
         assert!(rendered.contains("/exit"));
     }
 
@@ -3776,6 +4458,12 @@ mod tests {
                 selected: 0,
                 editing: None,
             }),
+            Some(Modal::Search(ChatSearch {
+                query: "needle".into(),
+                cursor: 6,
+                matches: Vec::new(),
+                selected: 0,
+            })),
             Some(Modal::Reasoning {
                 scroll: 0,
                 max_scroll: usize::MAX,
@@ -3798,7 +4486,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_keys_distinguish_busy_steering_from_followups() {
+    fn composer_keys_distinguish_turn_steering_from_background_queueing() {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
@@ -3815,6 +4503,30 @@ mod tests {
         );
         assert_eq!(submission_delivery(tab, true), Some(DeliveryMode::FollowUp));
         assert_eq!(submission_delivery(shift_enter, true), None);
+    }
+
+    #[test]
+    fn background_busy_state_does_not_offer_or_create_steering() {
+        let mut app = AppState::new("api", "model");
+        app.busy = true;
+        app.turn_active = false;
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            submission_delivery(enter, app.turn_active),
+            Some(DeliveryMode::FollowUp)
+        );
+
+        let queue = PromptQueue::default();
+        let id = queue.enqueue("later", DeliveryMode::FollowUp);
+        assert!(!queue.toggle_delivery(id, app.turn_active));
+        assert_eq!(queue.snapshot()[0].delivery, DeliveryMode::FollowUp);
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Enter queue"));
+        assert!(!rendered.contains("Enter steer"));
     }
 
     #[test]

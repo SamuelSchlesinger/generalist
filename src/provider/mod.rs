@@ -18,8 +18,8 @@ pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
 pub use openrouter::OpenRouterProvider;
 
-use crate::error::Result;
-use crate::types::{CompletionDelta, CompletionRequest, CompletionResponse};
+use crate::error::{Error, Result};
+use crate::types::{CompletionDelta, CompletionLimits, CompletionRequest, CompletionResponse};
 use async_trait::async_trait;
 
 /// A backend capable of producing one model completion per call.
@@ -54,16 +54,58 @@ pub trait Provider: Send + Sync {
     /// reasoning through `on_delta` as they arrive. Returns the complete
     /// response as if [`Provider::complete`] had been called.
     ///
+    /// Providers must stop producing the completion when `on_delta` returns
+    /// an error. The host uses that path to enforce completion limits before
+    /// an untrusted stream can grow further.
+    ///
     /// The default implementation falls back to non-streaming, so custom
     /// providers work without implementing it.
     async fn complete_streaming(
         &self,
         request: CompletionRequest<'_>,
-        on_delta: &mut dyn FnMut(CompletionDelta),
+        on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
     ) -> Result<CompletionResponse> {
         let _ = on_delta;
         self.complete(request).await
     }
+}
+
+pub(crate) fn account_wire_bytes(
+    limits: CompletionLimits,
+    received: &mut usize,
+    additional: usize,
+) -> Result<()> {
+    let observed = received.saturating_add(additional);
+    let limit = limits.max_wire_bytes();
+    if observed > limit {
+        return Err(Error::Other(format!(
+            "provider response exceeded the host wire limit of {limit} bytes"
+        )));
+    }
+    *received = observed;
+    Ok(())
+}
+
+pub(crate) async fn read_response_body_bounded(
+    mut response: reqwest::Response,
+    limits: CompletionLimits,
+) -> Result<Vec<u8>> {
+    let limit = limits.max_wire_bytes();
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > limit as u64)
+    {
+        return Err(Error::Other(format!(
+            "provider response exceeded the host wire limit of {limit} bytes"
+        )));
+    }
+    let mut body = Vec::new();
+    let mut received = 0usize;
+    while let Some(chunk) = response.chunk().await? {
+        account_wire_bytes(limits, &mut received, chunk.len())?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Build the shared HTTP client used by providers.
@@ -148,5 +190,20 @@ mod tests {
         let events = assembler.push(b"data: [DONE]\n");
         assert!(events.is_empty());
         assert_eq!(assembler.finish(), Some("[DONE]".to_string()));
+    }
+
+    #[test]
+    fn wire_accounting_is_finite_even_for_tiny_payload_limits() {
+        let limits = CompletionLimits {
+            max_response_bytes: 1,
+            ..CompletionLimits::default()
+        };
+        let mut received = 0;
+        account_wire_bytes(limits, &mut received, 64 * 1024).unwrap();
+        let error = account_wire_bytes(limits, &mut received, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wire limit of 65536 bytes"));
+        assert_eq!(received, 64 * 1024);
     }
 }

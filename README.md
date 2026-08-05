@@ -60,8 +60,8 @@ until the model calls the host-owned `update_goal(status="complete")` control.
 objective, and `/goal clear` stops and removes it. Escape, a provider error,
 refusal, or permission denial pauses automatic continuation without discarding
 the objective; edit the goal or send another prompt to resume. Other commands
-are `/save`, `/load`, `/model`, `/compact`, `/clear`, `/memory`, `/help`, and
-`/exit`.
+are `/save [name]`, `/load [name]`, `/history`, `/model`, `/compact`, `/clear`, `/memory`,
+`/help`, `/permissions`, `/tools`, `/mcp`, `/usage`, `/copy`, and `/exit`.
 
 History-valid boundaries, the active goal, queue, named sessions, and remembered
 tool decisions are isolated by default to the canonical Git worktree root (or
@@ -72,6 +72,30 @@ with no queued work, and startup schedules its next automatic continuation. If
 the process exits with queued work, the next run also recovers that queue
 together with its conversation context. Current save files must carry their
 scope explicitly; unscoped state is rejected rather than treated as global.
+`/save <name>` and `/load <name>` address a saved session directly; omitting
+the name preserves the interactive prompt or picker. A fresh manual save uses
+an atomic no-clobber create. Reusing a valid name opens a replacement
+confirmation with Cancel selected, and the live `autosave` name is reserved
+for the controller. `/history` lists
+current-scope saves, `/history search <query>` searches their sanitized
+user/assistant text and tool names, and `/history show <name>` inspects one
+without loading or changing the active conversation. `/history forget <name>`
+deletes one current-scope named save only after an explicit confirmation whose
+default is Cancel. The live `autosave` cannot be forgotten (use `/clear` to
+replace its conversation content), and deletion does not erase prior exports,
+backups, or filesystem snapshots. These are explicit host controls: they do
+not call a provider, ask tool permission, or open another scope. Provider
+reasoning and tool payloads remain omitted.
+
+`/usage` (or `/usage show`) reports API attempts and cumulative token payloads
+observed during the current process, grouped by provider and model. Retries are
+separate attempts; a response without a usage payload remains visible as an
+unreported attempt, and optional cache categories show how many usage payloads
+actually supplied them. `/usage reset` clears only these counters. This is a
+host-only observation: it makes no provider request and changes no
+conversation, context, save, or provider state. The totals are provider
+reported, not a monetary-cost calculation, and are separate from the header's
+approximate current-context size.
 
 Run `generalist --global` to select the explicit cross-project namespace.
 Pre-scoping flat history and the legacy `~/.chatbot_history` and
@@ -80,6 +104,17 @@ stores; there is no implicit migration or compatibility fallback. Set
 `GENERALIST_HOME` to an alternate directory for an isolated profile or
 reproducible harness run; all of the paths above, plus `.generalist.env`, MCP
 configuration, and skills, are then resolved beneath that directory.
+
+Ordinary completions have no fixed 16,000-token default. Anthropic requires a
+numeric `max_tokens`, so Generalist retrieves and caches the selected model's
+advertised maximum from the Models API. OpenAI-compatible endpoints receive no
+token-limit field by default because there is no portable model-limit discovery
+contract across OpenAI, OpenRouter, Ollama, and other compatible servers. Pass
+`--max-tokens N` to request an explicit ceiling on either path. The separate
+host response limits described below remain authoritative if a provider ignores
+the request or returns malformed structure. Explicit official OpenAI requests
+use `max_completion_tokens`; compatible endpoints retain the widely supported
+`max_tokens` field.
 
 ## Terminal UI
 
@@ -93,11 +128,27 @@ tool, while nested bridge activity is shown as `↳ tools.<name>`. While a goal
 is active, the separate permission-free `update_goal` host control is also
 advertised.
 
+Configured MCP servers connect in stable name order through that same terminal
+reactor before the first model turn. Connection reports and the bridge count
+update as each server finishes, while the composer, queue manager, help,
+conversation search, and copy mode remain usable. Work submitted during
+discovery is immediately autosaved as a follow-up and runs once the tool
+registry is finalized. `Esc` skips the remaining servers; tools from servers
+that already finished stay available. `/mcp status` shows each configured
+server's current process state, and `/mcp retry [server]` reconnects all failed
+or skipped servers—or one exact server—without restarting or making a model
+request. Recovered bridges enter the existing registry and are available to
+the next model call.
+
 Keyboard and mouse controls:
 
-- While idle, `Enter` starts a turn. While busy, `Enter` queues a steer for the
-  next history-valid boundary.
-- `Tab` or `Alt+Enter` queues a separate follow-up. `Shift+Enter` or `Ctrl+J`
+- While idle, `Enter` starts a turn. During an active model turn, `Enter` queues
+  a steer for the next history-valid boundary; during background work it
+  queues a follow-up.
+- `Tab` completes a recognized slash-command or subcommand prefix at the end
+  of the composer. Ambiguous prefixes stay in place and list their candidates;
+  otherwise Tab retains its existing separate-follow-up behavior.
+  `Alt+Enter` always queues a separate follow-up. `Shift+Enter` or `Ctrl+J`
   inserts a newline.
 - `Up`/`Down` browse input history. `Ctrl+A`/`Ctrl+E`, `Ctrl+U`, and `Ctrl+W`
   provide familiar shell-style editing.
@@ -115,9 +166,11 @@ Keyboard and mouse controls:
   composer; restore never overwrites an unsent draft.
 - `/copy` or `/copy last` sends the latest committed assistant response to the
   terminal clipboard with OSC 52; `/copy all` sends the committed plain-text
-  conversation. Terminals may disable OSC 52 by policy, so the status message
-  points to native selection rather than claiming that every terminal accepted
-  the request. Clipboard contents are never read by Generalist.
+  conversation, and `/copy reasoning` sends the latest inspectable committed
+  provider reasoning. Signatures and redacted payloads are excluded. Terminals
+  may disable OSC 52 by policy, so the status message points to native selection
+  rather than claiming that every terminal accepted the request. Clipboard
+  contents are never read by Generalist.
 - `F3` or `/copy select` enters native terminal copy mode. Mouse capture and
   redraws pause so you can select text and use the terminal's normal copy
   shortcut. Provider/tool work continues in memory; press `F3` or `Esc` to
@@ -127,6 +180,10 @@ Keyboard and mouse controls:
   reasoning fields actually supplied by the provider, separately from answer
   text, and says so explicitly when a request supplies none. Provider
   signatures and redacted payloads are never displayed.
+- A single committed answer or reasoning entry is projected to at most 64 Ki
+  characters for rendering and search. The projection keeps both ends and
+  names the corresponding `/copy` command; the complete accepted response
+  remains in conversation history.
 - `F1` opens help. With no modal, `Esc`/`Ctrl+C` interrupts a busy turn safely;
   while idle, `Esc` clears the editor and `Ctrl+C` exits. A permission modal
   consumes its own keys first.
@@ -201,12 +258,34 @@ scope routing is modeled in
 before adding automatic retrieval, candidate promotion, consolidation,
 simulation, or collaboration.
 
+The maintained [explicit-memory evaluation](benchmarks/episodic_memory/README.md)
+now measures that gate. On its deterministic eight-session corpus, explicit
+episodic search recovered all seven supported facts while latest autosave
+recovered one; deliberately named saves recovered all seven as well. Episodic
+and named-save search both returned the stale and current formatter preference
+(precision `0.875`), so this is evidence for convenient durable capture, not
+for automatic truth selection. The exact TUI probe also keeps input and queue
+handling live during provider and SQLite stalls. Its stream-flood leg types
+after 20,000 of 30,000 one-byte deltas, requires the input to render within the
+same 750 ms budget, and observes the committed response tail. The crash
+schedules accept only an absent episode or one complete immutable episode.
+These results justify retaining explicit Stage 1 inspection, but not automatic
+retrieval or consolidation.
+
 ## Permissions
 
 New tool calls open a permission modal showing the full input (patches are rendered as
 colored diffs). Choices are allow always, allow once, deny always, and deny once.
 Decisions persist across save/load; remembered decisions are surfaced in the status
 bar while every execution remains visible in the tool-activity panel.
+
+`/permissions` lists remembered decisions in stable tool-name order.
+`/permissions reset <tool>` removes one exact allow/deny decision, and
+`/permissions clear` removes all of them; affected tools ask again on their
+next permissioned use. These are host-only idle commands and their changes are
+included in the next atomic autosave. Loading a named session replaces the
+current remembered policy with that save's policy. Contradictory legacy state
+is resolved fail-closed: deny wins and the next write removes the overlap.
 
 All model, tool, queue, provider, and MCP text is control-character-sanitized at
 the display boundary so untrusted content cannot emit terminal escape commands.
@@ -250,6 +329,12 @@ Follows what pi, opencode, and Claude Code converged on:
   `F4` inspector. Anthropic thinking deltas and common OpenAI-compatible string
   extensions (`reasoning_content`, `reasoning`, or `thinking`) are supported.
   Endpoints that expose no such field produce no invented reasoning.
+- Provider token hints are not trusted as memory-safety controls. Each accepted
+  completion is independently limited to 1 MiB of logical payload, 1,024
+  content blocks, and 256 tool uses; transport framing is bounded separately.
+  Built-in streaming adapters stop as soon as a limit is crossed, and the agent
+  validates custom-provider responses again before history commit or tool
+  execution.
 - When context passes a threshold (default 150k tokens, configurable), older
   history is summarized in place and recent turns stay verbatim. `/compact`
   triggers it manually. Local models with small context windows may want a much
@@ -278,6 +363,15 @@ process megabytes of output, validate the result, and print only the conclusion.
 errors come back as tool results, so the model can fix and re-run. This is the pattern
 from CodeAct, Cloudflare's Code Mode, Anthropic's code-execution-with-MCP, and the
 "Code as Agent Harness" survey (arXiv 2605.18747).
+
+The host-owned `/tools` command inspects this effective surface without calling
+a provider or capability. `/tools` lists registered bridges in stable
+alphabetical order, `/tools search <query>` filters names and descriptions,
+and `/tools show <name>` displays one description and JSON input schema. The
+listing distinguishes progressive schema-on-demand tools (including MCP
+bridges) from definitions preloaded into the `python` runner, and reports the
+currently advertised model-facing controls separately. Catalog and detail
+output are bounded so one unusually large server schema cannot swamp the TUI.
 
 Some OpenAI-compatible models return a bridge expression such as
 `tools.firecrawl_search` as an undeclared native call despite receiving only the
@@ -315,7 +409,13 @@ model-facing `python` description. Full schemas remain in the generated module's
 docstrings (`print(tools.tickerfacts_get_fundamentals.__doc__)`). Context cost scales
 with what a script uses, not what a server offers. Bridged MCP calls pass through the
 permission gate like any other tool. A failed server logs a warning and is skipped.
-`cargo run --example smoke_mcp` verifies the stack live.
+Inspect the retained typed outcome with `/mcp status`; use `/mcp retry` for all
+failed/skipped servers or `/mcp retry <server>` for one. Retry runs only while
+no model turn owns the agent, preserves conversation state, and updates the
+next request's bridge surface. Connection state is process-local, and editing
+the configuration still requires restart. Malformed or unreadable
+configuration is reported explicitly at startup. `cargo run --example
+smoke_mcp` verifies the stack live.
 
 ## Library use
 
@@ -363,7 +463,14 @@ in the working directory is appended to the system prompt at startup.
 
 ## Limits
 
-- The OpenAI provider sends no `max_tokens`, for compatibility across servers.
+- Ordinary completions do not use a universal token ceiling. Anthropic resolves
+  the selected model's advertised maximum; OpenAI-compatible endpoints own
+  their default when `--max-tokens` is absent. An explicit value is still only
+  a provider request, not a host safety boundary.
+- `CompletionLimits` defaults to 1 MiB of retained response payload, 1,024
+  content blocks, and 256 tool calls. Library callers can tune these separately
+  from `Agent::max_tokens`; raising them increases memory and wire-exposure
+  bounds.
 - Compaction uses a chars/4 token estimate between provider measurements; treat
   thresholds as approximate.
 - Code-mode scripts run unsandboxed (see Permissions).

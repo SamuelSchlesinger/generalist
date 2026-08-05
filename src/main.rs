@@ -1,4 +1,5 @@
 use colored::*;
+use generalist::mcp::{McpConfig, McpRegistrationOutcome, McpRegistrationReport};
 use generalist::provider::{
     anthropic, openrouter, AnthropicProvider, OpenAiProvider, OpenRouterProvider, Provider,
 };
@@ -6,27 +7,33 @@ use generalist::tools::*;
 use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
     conversation_transcript, default_memory_path, history_tool_protocol_is_valid, is_local_command,
-    latest_assistant_text, parse_local_command, truncate_middle, Agent, AgentEvent, CopyCommand,
-    DeliveryMode, Episode, EpisodeEvent, EpisodeOutcome, EpisodicMemory, Error, ForgetResult,
-    GoalCommand, HistoryStore, LocalCommand, MemoryCommand, MemoryEvent, MemoryPermissionHandler,
-    MessageOrigin, PermissionBrokerPrompt, PermissionChoice, PermissionRequest, PermissionUiEvent,
-    PromptQueue, PromptSource, Result, SavedState, ToolRegistry, TurnControl, TurnOutcome,
+    latest_assistant_reasoning, latest_assistant_text, parse_local_command, truncate_middle, Agent,
+    AgentEvent, ArchivedConversation, ArchivedConversationEvent, CopyCommand, DeliveryMode,
+    Episode, EpisodeEvent, EpisodeOutcome, EpisodicMemory, Error, ForgetResult, GoalCommand,
+    HistoryCommand, HistoryStore, LocalCommand, McpCommand, MemoryCommand, MemoryEvent,
+    MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt, PermissionChoice,
+    PermissionCommand, PermissionRequest, PermissionUiEvent, PromptQueue, PromptSource, Result,
+    SavedState, ToolDef, ToolRegistry, ToolsCommand, TurnControl, TurnOutcome, UsageCommand,
     WorkspaceScope,
 };
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::MissedTickBehavior;
 
 const AUTOSAVE_NAME: &str = "autosave";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
+const MAX_PENDING_STREAM_BYTES: usize = 16 * 1024;
 
 fn home_dir() -> PathBuf {
     if let Some(path) = env::var_os("GENERALIST_HOME").filter(|path| !path.is_empty()) {
@@ -220,16 +227,90 @@ fn make_saved_state(
     queue: &PromptQueue,
     scope: &WorkspaceScope,
 ) -> SavedState {
+    let policy = handler.remembered_policy();
     SavedState {
         scope: scope.clone(),
         provider: agent.provider().id().to_string(),
         model: agent.provider().model().to_string(),
         goal: agent.goal().map(str::to_string),
         conversation_history: agent.history().to_vec(),
-        always_allow_tools: handler.always_allow().lock().unwrap().clone(),
-        always_deny_tools: handler.always_deny().lock().unwrap().clone(),
+        always_allow_tools: policy.always_allow,
+        always_deny_tools: policy.always_deny,
         queued_prompts: queue.snapshot(),
     }
+}
+
+fn save_named_session(
+    name: &str,
+    agent: &Agent,
+    permission_handler: &MemoryPermissionHandler,
+    queue: &PromptQueue,
+    history_store: &HistoryStore,
+) -> Result<PathBuf> {
+    history_store.save(
+        &make_saved_state(agent, permission_handler, queue, history_store.scope()),
+        name,
+    )
+}
+
+fn save_new_named_session(
+    name: &str,
+    agent: &Agent,
+    permission_handler: &MemoryPermissionHandler,
+    queue: &PromptQueue,
+    history_store: &HistoryStore,
+) -> Result<Option<PathBuf>> {
+    history_store.save_if_absent(
+        &make_saved_state(agent, permission_handler, queue, history_store.scope()),
+        name,
+    )
+}
+
+fn load_named_session(
+    name: &str,
+    agent: &mut Agent,
+    ui: &mut TerminalUi,
+    queue: &PromptQueue,
+    history_store: &HistoryStore,
+    permission_handler: &MemoryPermissionHandler,
+    keys: &ApiKeys,
+) -> Result<usize> {
+    let SavedState {
+        scope: _,
+        provider,
+        model,
+        goal,
+        conversation_history,
+        always_allow_tools,
+        always_deny_tools,
+        queued_prompts,
+    } = history_store.load(name)?;
+    if !history_tool_protocol_is_valid(&conversation_history) {
+        return Err(Error::Other(
+            "Saved conversation has an unpaired tool use/result; refusing to load it".to_string(),
+        ));
+    }
+    match build_provider(keys, &provider, model) {
+        Ok(provider) => agent.set_provider(provider),
+        Err(error) => ui.error(&format!(
+            "Saved API '{provider}' is unavailable ({error}); keeping the current API."
+        )),
+    }
+    permission_handler.replace_remembered_policy(always_allow_tools, always_deny_tools);
+    agent.set_goal(goal);
+    agent.replace_history(conversation_history);
+    queue.replace(queued_prompts);
+    queue.reconcile_goal_continuation(agent.goal().is_some());
+    ui.load_history(agent.history());
+    ui.set_goal(agent.goal());
+    ui.sync_queue(queue);
+    ui.set_session(
+        agent.provider().display_name(),
+        agent.provider().model(),
+        agent.registry.tool_names().len(),
+    );
+    ui.set_context_tokens(agent.context_tokens());
+    Ok(agent.history().len())
 }
 
 struct DurableBoundary {
@@ -249,12 +330,26 @@ impl DurableBoundary {
         }
     }
 
+    fn before_agent(
+        provider: &dyn Provider,
+        goal: Option<String>,
+        history: Vec<generalist::Message>,
+    ) -> Self {
+        Self {
+            provider: provider.id().to_string(),
+            model: provider.model().to_string(),
+            goal,
+            history,
+        }
+    }
+
     fn save(
         &self,
         history_store: &HistoryStore,
         permission_handler: &MemoryPermissionHandler,
         queue: &PromptQueue,
     ) -> Result<()> {
+        let policy = permission_handler.remembered_policy();
         history_store.save(
             &SavedState {
                 scope: history_store.scope().clone(),
@@ -262,14 +357,378 @@ impl DurableBoundary {
                 model: self.model.clone(),
                 goal: self.goal.clone(),
                 conversation_history: self.history.clone(),
-                always_allow_tools: permission_handler.always_allow().lock().unwrap().clone(),
-                always_deny_tools: permission_handler.always_deny().lock().unwrap().clone(),
+                always_allow_tools: policy.always_allow,
+                always_deny_tools: policy.always_deny,
                 queued_prompts: queue.snapshot(),
             },
             AUTOSAVE_NAME,
         )?;
         Ok(())
     }
+}
+
+struct StartupRecoveryPlan {
+    goal: Option<String>,
+    history: Vec<generalist::Message>,
+    always_allow_tools: std::collections::HashSet<String>,
+    always_deny_tools: std::collections::HashSet<String>,
+    queued_prompts: Vec<generalist::runtime::QueuedPrompt>,
+    invalid_queue: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum McpServerState {
+    Configured,
+    Connecting,
+    Connected {
+        discovered_tools: usize,
+        registered_tools: usize,
+    },
+    Failed(String),
+    Skipped,
+}
+
+#[derive(Debug, Clone)]
+struct McpRuntime {
+    config: McpConfig,
+    servers: BTreeMap<String, McpServerState>,
+}
+
+impl McpRuntime {
+    fn new(config: McpConfig) -> Self {
+        let servers = config
+            .servers
+            .keys()
+            .map(|name| (name.clone(), McpServerState::Configured))
+            .collect();
+        Self { config, servers }
+    }
+
+    fn configured_targets(&self) -> BTreeSet<String> {
+        self.servers.keys().cloned().collect()
+    }
+
+    fn retry_targets(&self, requested: Option<&str>) -> Result<BTreeSet<String>> {
+        if let Some(name) = requested {
+            let Some(state) = self.servers.get(name) else {
+                return Err(Error::Other(format!(
+                    "No configured MCP server named '{name}'. Use /mcp status."
+                )));
+            };
+            return match state {
+                McpServerState::Failed(_) | McpServerState::Skipped => {
+                    Ok([name.to_string()].into_iter().collect())
+                }
+                McpServerState::Connected { .. } => Err(Error::Other(format!(
+                    "MCP server '{name}' is already connected."
+                ))),
+                McpServerState::Configured | McpServerState::Connecting => Err(Error::Other(
+                    format!("MCP server '{name}' has not finished its current connection attempt."),
+                )),
+            };
+        }
+
+        let targets = self
+            .servers
+            .iter()
+            .filter_map(|(name, state)| match state {
+                McpServerState::Failed(_) | McpServerState::Skipped => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if targets.is_empty() {
+            Err(Error::Other(
+                "No failed or skipped MCP servers are available to retry.".to_string(),
+            ))
+        } else {
+            Ok(targets)
+        }
+    }
+
+    fn mark_connecting(&mut self, targets: &BTreeSet<String>) {
+        for name in targets {
+            if let Some(state) = self.servers.get_mut(name) {
+                *state = McpServerState::Connecting;
+            }
+        }
+    }
+
+    fn apply_report(&mut self, report: &McpRegistrationReport) {
+        let state = match &report.outcome {
+            McpRegistrationOutcome::Connected {
+                discovered_tools,
+                registered_tools,
+            } => McpServerState::Connected {
+                discovered_tools: *discovered_tools,
+                registered_tools: *registered_tools,
+            },
+            McpRegistrationOutcome::ConnectionFailed { error } => {
+                McpServerState::Failed(format!("connection: {error}"))
+            }
+            McpRegistrationOutcome::ToolListFailed { error } => {
+                McpServerState::Failed(format!("tools/list: {error}"))
+            }
+            McpRegistrationOutcome::RegistrationFailed {
+                discovered_tools,
+                error,
+            } => McpServerState::Failed(format!(
+                "registered 0/{discovered_tools} discovered tool(s): {error}"
+            )),
+        };
+        self.servers.insert(report.server_name.clone(), state);
+    }
+
+    fn mark_skipped(&mut self, targets: &BTreeSet<String>) {
+        for name in targets {
+            if matches!(self.servers.get(name), Some(McpServerState::Connecting)) {
+                self.servers.insert(name.clone(), McpServerState::Skipped);
+            }
+        }
+    }
+
+    fn status(&self) -> String {
+        if self.servers.is_empty() {
+            return "MCP: configuration contains no servers.".to_string();
+        }
+        let connected = self
+            .servers
+            .values()
+            .filter(|state| matches!(state, McpServerState::Connected { .. }))
+            .count();
+        let mut lines = vec![format!(
+            "MCP servers: {connected}/{} connected",
+            self.servers.len()
+        )];
+        for (name, state) in &self.servers {
+            let detail = match state {
+                McpServerState::Configured => "configured · not attempted".to_string(),
+                McpServerState::Connecting => "connecting".to_string(),
+                McpServerState::Connected {
+                    discovered_tools,
+                    registered_tools,
+                } => {
+                    format!("connected · {registered_tools}/{discovered_tools} tool(s) registered")
+                }
+                McpServerState::Failed(error) => {
+                    format!("failed · {}", truncate_middle(error, 300))
+                }
+                McpServerState::Skipped => "skipped · retry available".to_string(),
+            };
+            lines.push(format!("- {name}: {detail}"));
+        }
+        lines.push("Use /mcp retry [server] for failed or skipped servers.".to_string());
+        lines.join("\n")
+    }
+}
+
+/// Classify exactly the state that the existing crash-recovery policy admits.
+/// A goal is independent of queued work and always survives. Conversation
+/// history and remembered permissions are restored only with a non-empty,
+/// protocol-valid queue; otherwise startup begins a fresh conversation.
+fn plan_startup_recovery(state: Option<SavedState>) -> StartupRecoveryPlan {
+    let Some(state) = state else {
+        return StartupRecoveryPlan {
+            goal: None,
+            history: Vec::new(),
+            always_allow_tools: Default::default(),
+            always_deny_tools: Default::default(),
+            queued_prompts: Vec::new(),
+            invalid_queue: false,
+        };
+    };
+    let SavedState {
+        scope: _,
+        provider: _,
+        model: _,
+        goal,
+        conversation_history,
+        always_allow_tools,
+        always_deny_tools,
+        queued_prompts,
+    } = state;
+    if queued_prompts.is_empty() {
+        return StartupRecoveryPlan {
+            goal,
+            history: Vec::new(),
+            always_allow_tools: Default::default(),
+            always_deny_tools: Default::default(),
+            queued_prompts,
+            invalid_queue: false,
+        };
+    }
+    if !history_tool_protocol_is_valid(&conversation_history) {
+        return StartupRecoveryPlan {
+            goal,
+            history: Vec::new(),
+            always_allow_tools: Default::default(),
+            always_deny_tools: Default::default(),
+            queued_prompts: Vec::new(),
+            invalid_queue: true,
+        };
+    }
+    StartupRecoveryPlan {
+        goal,
+        history: conversation_history,
+        always_allow_tools,
+        always_deny_tools,
+        queued_prompts,
+        invalid_queue: false,
+    }
+}
+
+fn recover_startup_runtime(
+    history_store: &HistoryStore,
+    permission_handler: &MemoryPermissionHandler,
+    ui: &mut TerminalUi,
+) -> (Option<String>, Vec<generalist::Message>, PromptQueue) {
+    let plan = plan_startup_recovery(history_store.load(AUTOSAVE_NAME).ok());
+    if plan.invalid_queue {
+        ui.error("Autosave has an unpaired tool use/result; queued work was not recovered.");
+    }
+    let count = plan.queued_prompts.len();
+    if count > 0 {
+        permission_handler
+            .replace_remembered_policy(plan.always_allow_tools, plan.always_deny_tools);
+        ui.load_history(&plan.history);
+        ui.info(&format!(
+            "Recovered {count} queued message(s) with their conversation context."
+        ));
+    }
+    (
+        plan.goal,
+        plan.history,
+        PromptQueue::from_saved(plan.queued_prompts),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_mcp_discovery(
+    registry: &mut ToolRegistry,
+    config: &McpConfig,
+    runtime: &mut McpRuntime,
+    targets: &BTreeSet<String>,
+    ui: &mut TerminalUi,
+    queue: &PromptQueue,
+    history_store: &HistoryStore,
+    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
+    permission_handler: &MemoryPermissionHandler,
+    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
+    durable: &DurableBoundary,
+) -> Result<bool> {
+    runtime.mark_connecting(targets);
+    let base_bridge_count = registry.tool_names().len();
+    ui.set_bridge_count(base_bridge_count);
+    ui.set_busy(true, "Connecting tools · input stays live");
+    ui.info(
+        "MCP discovery is running. Compose or manage queued work now; Esc skips remaining servers.",
+    );
+    ui.status("Connecting tools · input stays live");
+    terminal(ui.draw())?;
+
+    let (progress_tx, mut progress_rx) =
+        mpsc::unbounded_channel::<(McpRegistrationReport, usize)>();
+    let (interrupted, exit_requested, completed_reports) = {
+        let discovery = generalist::mcp::register_named_servers_with_reports(
+            registry,
+            config,
+            targets,
+            move |report, registered_total| {
+                let _ = progress_tx.send((report.clone(), registered_total));
+            },
+        );
+        tokio::pin!(discovery);
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+                Some((report, registered_total)) = progress_rx.recv() => {
+                    runtime.apply_report(&report);
+                    ui.set_bridge_count(base_bridge_count + registered_total);
+                    ui.info(&report.display_line());
+                    ui.status("Connecting tools · input stays live");
+                }
+                reports = &mut discovery => break (false, false, Some(reports)),
+                Some(permission_event) = permission_rx.recv() => {
+                    match permission_event {
+                        PermissionUiEvent::Request(request) => {
+                            let _ = request.reply.send(PermissionChoice::DenyOnce);
+                            ui.error("Ignored a stale permission request with no active turn.");
+                        }
+                        PermissionUiEvent::Automatic { request, allowed } => {
+                            ui.status(&format!(
+                                "{} was {} by remembered policy",
+                                request.tool_name,
+                                if allowed { "auto-allowed" } else { "auto-denied" }
+                            ));
+                        }
+                    }
+                }
+                Some(event) = memory_events.recv() => handle_memory_event(ui, event),
+                _ = ticker.tick() => {
+                    ui.tick();
+                    ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
+                }
+                terminal_event = ui.next_event() => {
+                    let action = terminal(ui.handle_event(terminal(terminal_event)?, queue))?;
+                    let persist_queue = action.requires_queue_persist();
+                    match action {
+                        UiAction::Submit { text, delivery } => {
+                            enqueue_submission(ui, queue, text, delivery, false);
+                        }
+                        UiAction::Interrupt => break (true, false, None),
+                        UiAction::Exit => break (true, true, None),
+                        UiAction::None
+                        | UiAction::QueueChanged
+                        | UiAction::Permission { .. } => {}
+                    }
+                    if persist_queue {
+                        if let Err(error) = durable.save(
+                            history_store,
+                            permission_handler,
+                            queue,
+                        ) {
+                            ui.error(&format!("Failed to persist startup queue: {error}"));
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    while let Ok((report, registered_total)) = progress_rx.try_recv() {
+        runtime.apply_report(&report);
+        ui.set_bridge_count(base_bridge_count + registered_total);
+        ui.info(&report.display_line());
+    }
+    if let Some(reports) = completed_reports {
+        for report in reports {
+            runtime.apply_report(&report);
+        }
+    }
+    if interrupted {
+        runtime.mark_skipped(targets);
+    }
+
+    // The discovery future no longer owns the registry here, so this is the
+    // authoritative count even if cancellation retained only earlier servers.
+    ui.set_bridge_count(registry.tool_names().len());
+    if interrupted && !exit_requested {
+        ui.info(
+            "MCP discovery skipped; tools connected before the interrupt remain available. Use /mcp retry to reconnect skipped servers.",
+        );
+    }
+    ui.set_busy(
+        false,
+        if interrupted {
+            "Discovery skipped"
+        } else {
+            "Ready"
+        },
+    );
+    terminal(ui.draw())?;
+    Ok(exit_requested)
 }
 
 fn apply_runtime_event(
@@ -301,13 +760,193 @@ fn apply_runtime_event(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamPreviewKind {
+    Text,
+    Reasoning,
+}
+
+#[derive(Debug, Default)]
+struct PendingStreamPreview {
+    text: String,
+    reasoning: String,
+    omitted_text_bytes: usize,
+    omitted_reasoning_bytes: usize,
+    first: Option<StreamPreviewKind>,
+}
+
+impl PendingStreamPreview {
+    fn append(&mut self, kind: StreamPreviewKind, fragment: String) {
+        self.first.get_or_insert(kind);
+        let available = MAX_PENDING_STREAM_BYTES.saturating_sub(self.retained_bytes());
+        let mut keep = available.min(fragment.len());
+        while !fragment.is_char_boundary(keep) {
+            keep -= 1;
+        }
+
+        let omitted = fragment.len() - keep;
+        match kind {
+            StreamPreviewKind::Text => {
+                self.text.push_str(&fragment[..keep]);
+                self.omitted_text_bytes = self.omitted_text_bytes.saturating_add(omitted);
+            }
+            StreamPreviewKind::Reasoning => {
+                self.reasoning.push_str(&fragment[..keep]);
+                self.omitted_reasoning_bytes = self.omitted_reasoning_bytes.saturating_add(omitted);
+            }
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.text.len() + self.reasoning.len()
+    }
+
+    fn into_events(self) -> Vec<AgentEvent> {
+        let Self {
+            text,
+            reasoning,
+            omitted_text_bytes,
+            omitted_reasoning_bytes,
+            first,
+        } = self;
+        let mut events = Vec::with_capacity(3);
+        match first {
+            Some(StreamPreviewKind::Text) => {
+                if !text.is_empty() {
+                    events.push(AgentEvent::AssistantTextDelta(text));
+                }
+                if !reasoning.is_empty() {
+                    events.push(AgentEvent::ReasoningDelta(reasoning));
+                }
+            }
+            Some(StreamPreviewKind::Reasoning) => {
+                if !reasoning.is_empty() {
+                    events.push(AgentEvent::ReasoningDelta(reasoning));
+                }
+                if !text.is_empty() {
+                    events.push(AgentEvent::AssistantTextDelta(text));
+                }
+            }
+            None => {}
+        }
+        if omitted_text_bytes > 0 || omitted_reasoning_bytes > 0 {
+            events.push(AgentEvent::StreamDisplayTruncated {
+                text_bytes: omitted_text_bytes,
+                reasoning_bytes: omitted_reasoning_bytes,
+            });
+        }
+        events
+    }
+}
+
+#[derive(Debug)]
+enum BufferedAgentEvent {
+    Event(AgentEvent),
+    Stream(PendingStreamPreview),
+}
+
+#[derive(Clone)]
+struct AgentDisplaySender {
+    queue: Rc<RefCell<VecDeque<BufferedAgentEvent>>>,
+    notify: Rc<Notify>,
+}
+
+struct AgentDisplayReceiver {
+    queue: Rc<RefCell<VecDeque<BufferedAgentEvent>>>,
+    notify: Rc<Notify>,
+}
+
+fn agent_display_channel() -> (AgentDisplaySender, AgentDisplayReceiver) {
+    let queue = Rc::new(RefCell::new(VecDeque::new()));
+    let notify = Rc::new(Notify::new());
+    (
+        AgentDisplaySender {
+            queue: Rc::clone(&queue),
+            notify: Rc::clone(&notify),
+        },
+        AgentDisplayReceiver { queue, notify },
+    )
+}
+
+impl AgentDisplaySender {
+    fn send(&self, event: AgentEvent) {
+        let mut queue = self.queue.borrow_mut();
+        match event {
+            AgentEvent::AssistantTextDelta(text) => {
+                Self::append_delta(&mut queue, StreamPreviewKind::Text, text)
+            }
+            AgentEvent::ReasoningDelta(reasoning) => {
+                Self::append_delta(&mut queue, StreamPreviewKind::Reasoning, reasoning)
+            }
+            event => queue.push_back(BufferedAgentEvent::Event(event)),
+        }
+        drop(queue);
+        self.notify.notify_one();
+    }
+
+    fn append_delta(
+        queue: &mut VecDeque<BufferedAgentEvent>,
+        kind: StreamPreviewKind,
+        fragment: String,
+    ) {
+        if !matches!(queue.back(), Some(BufferedAgentEvent::Stream(_))) {
+            queue.push_back(BufferedAgentEvent::Stream(PendingStreamPreview::default()));
+        }
+        let Some(BufferedAgentEvent::Stream(preview)) = queue.back_mut() else {
+            unreachable!("a stream preview was just appended")
+        };
+        preview.append(kind, fragment);
+    }
+}
+
+impl AgentDisplayReceiver {
+    async fn recv_batch(&self) -> Vec<AgentEvent> {
+        loop {
+            let notify = Rc::clone(&self.notify);
+            let notified = notify.notified();
+            if let Some(events) = self.try_recv_batch() {
+                return events;
+            }
+            notified.await;
+        }
+    }
+
+    fn try_recv_batch(&self) -> Option<Vec<AgentEvent>> {
+        self.queue
+            .borrow_mut()
+            .pop_front()
+            .map(|event| match event {
+                BufferedAgentEvent::Event(event) => vec![event],
+                BufferedAgentEvent::Stream(preview) => preview.into_events(),
+            })
+    }
+
+    #[cfg(test)]
+    fn buffered_records(&self) -> usize {
+        self.queue.borrow().len()
+    }
+
+    #[cfg(test)]
+    fn pending_preview_bytes(&self) -> usize {
+        self.queue
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                BufferedAgentEvent::Stream(preview) => Some(preview.retained_bytes()),
+                BufferedAgentEvent::Event(_) => None,
+            })
+            .sum()
+    }
+}
+
 struct CliArgs {
     local_model: Option<String>,
     global_scope: bool,
+    max_tokens: Option<u32>,
 }
 
 fn print_usage() {
-    println!("Usage: generalist [--global] [--local [model]]");
+    println!("Usage: generalist [--global] [--local [model]] [--max-tokens <count>]");
     println!();
     println!("  --global          Use the explicit cross-project history/memory scope");
     println!("                    (default: project scope discovered from the working directory)");
@@ -320,12 +959,25 @@ fn print_usage() {
         "                    Model defaults to {} if omitted.",
         DEFAULT_LOCAL_MODEL
     );
+    println!("  --max-tokens N    Request at most N output tokens per ordinary completion");
+    println!("                    (default: Anthropic model maximum; provider default elsewhere)");
     println!("  -h, --help        Show this help");
+}
+
+fn parse_max_tokens(value: &str) -> std::result::Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid --max-tokens value '{value}'"))?;
+    if parsed == 0 {
+        return Err("--max-tokens must be greater than zero".to_string());
+    }
+    Ok(parsed)
 }
 
 fn parse_args() -> CliArgs {
     let mut local_model = None;
     let mut global_scope = false;
+    let mut max_tokens = None;
     let mut args = env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -339,6 +991,26 @@ fn parse_args() -> CliArgs {
             }
             value if value.starts_with("--local=") => {
                 local_model = Some(value["--local=".len()..].to_string());
+            }
+            "--max-tokens" => {
+                let Some(value) = args.next() else {
+                    eprintln!("{} missing value", "Invalid argument:".red());
+                    print_usage();
+                    std::process::exit(1);
+                };
+                max_tokens = Some(parse_max_tokens(&value).unwrap_or_else(|error| {
+                    eprintln!("{} {error}", "Invalid argument:".red());
+                    print_usage();
+                    std::process::exit(1);
+                }));
+            }
+            value if value.starts_with("--max-tokens=") => {
+                let value = &value["--max-tokens=".len()..];
+                max_tokens = Some(parse_max_tokens(value).unwrap_or_else(|error| {
+                    eprintln!("{} {error}", "Invalid argument:".red());
+                    print_usage();
+                    std::process::exit(1);
+                }));
             }
             "-h" | "--help" => {
                 print_usage();
@@ -354,6 +1026,7 @@ fn parse_args() -> CliArgs {
     CliArgs {
         local_model,
         global_scope,
+        max_tokens,
     }
 }
 
@@ -454,10 +1127,11 @@ async fn drive_started_turn(
     let episode_provider = agent.provider().id().to_string();
     let episode_model = agent.provider().model().to_string();
     let (cancel_handle, mut control) = TurnControl::for_turn(queue.clone());
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = agent_display_channel();
     let (checkpoint_tx, mut checkpoint_rx) = mpsc::unbounded_channel();
     let mut exit_requested = false;
 
+    ui.set_turn_active(true);
     ui.set_busy(true, "Thinking");
     ui.draw().map_err(|error| Error::Other(error.to_string()))?;
 
@@ -466,7 +1140,7 @@ async fn drive_started_turn(
             if matches!(&event, AgentEvent::HistoryCheckpoint { .. }) {
                 let _ = checkpoint_tx.send(event);
             } else {
-                let _ = event_tx.send(event);
+                event_tx.send(event);
             }
         };
         let turn = agent.run_started_turn(&mut on_event, &mut control);
@@ -561,18 +1235,20 @@ async fn drive_started_turn(
                         }
                     }
                 }
-                // Keep ordinary display events last in this biased reactor:
-                // an unbounded stream of deltas must not starve frame ticks,
-                // terminal input, or a live permission decision.
-                Some(event) = event_rx.recv() => {
-                    apply_runtime_event(
-                        ui,
-                        queue,
-                        history_store,
-                        permission_handler,
-                        &mut durable,
-                        event,
-                    );
+                // Keep ordinary display events last in this biased reactor.
+                // Consecutive fragments are one bounded preview batch, so
+                // provider chunking cannot amplify pending queue records.
+                events = event_rx.recv_batch() => {
+                    for event in events {
+                        apply_runtime_event(
+                            ui,
+                            queue,
+                            history_store,
+                            permission_handler,
+                            &mut durable,
+                            event,
+                        );
+                    }
                 }
             }
         }
@@ -588,15 +1264,17 @@ async fn drive_started_turn(
             event,
         );
     }
-    while let Ok(event) = event_rx.try_recv() {
-        apply_runtime_event(
-            ui,
-            queue,
-            history_store,
-            permission_handler,
-            &mut durable,
-            event,
-        );
+    while let Some(events) = event_rx.try_recv_batch() {
+        for event in events {
+            apply_runtime_event(
+                ui,
+                queue,
+                history_store,
+                permission_handler,
+                &mut durable,
+                event,
+            );
+        }
     }
     queue.normalize_steers();
     let continue_goal = should_continue_goal(agent.goal().is_some(), exit_requested, &outcome);
@@ -682,7 +1360,7 @@ async fn drive_compaction(
 ) -> Result<bool> {
     let mut durable = DurableBoundary::from_agent(agent);
     let before = agent.context_tokens();
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, event_rx) = agent_display_channel();
     let (checkpoint_tx, mut checkpoint_rx) = mpsc::unbounded_channel();
     let mut exit_requested = false;
     ui.set_busy(true, "Compacting context");
@@ -692,7 +1370,7 @@ async fn drive_compaction(
             if matches!(&event, AgentEvent::HistoryCheckpoint { .. }) {
                 let _ = checkpoint_tx.send(event);
             } else {
-                let _ = event_tx.send(event);
+                event_tx.send(event);
             }
         };
         let operation = agent.compact(&mut on_event);
@@ -760,16 +1438,20 @@ async fn drive_compaction(
                         }
                     }
                 }
-                // See the active-turn reactor above: display backlog is lower
-                // priority than interaction and bounded frame progress.
-                Some(event) = event_rx.recv() => apply_runtime_event(
-                    ui,
-                    queue,
-                    history_store,
-                    permission_handler,
-                    &mut durable,
-                    event,
-                ),
+                // See the active-turn reactor above: fragment-amplified
+                // display backlog is coalesced before this branch wakes.
+                events = event_rx.recv_batch() => {
+                    for event in events {
+                        apply_runtime_event(
+                            ui,
+                            queue,
+                            history_store,
+                            permission_handler,
+                            &mut durable,
+                            event,
+                        );
+                    }
+                },
             }
         }
     };
@@ -784,15 +1466,17 @@ async fn drive_compaction(
             event,
         );
     }
-    while let Ok(event) = event_rx.try_recv() {
-        apply_runtime_event(
-            ui,
-            queue,
-            history_store,
-            permission_handler,
-            &mut durable,
-            event,
-        );
+    while let Some(events) = event_rx.try_recv_batch() {
+        for event in events {
+            apply_runtime_event(
+                ui,
+                queue,
+                history_store,
+                permission_handler,
+                &mut durable,
+                event,
+            );
+        }
     }
     if let Err(error) = history_store.save(
         &make_saved_state(agent, permission_handler, queue, history_store.scope()),
@@ -844,6 +1528,369 @@ fn should_continue_goal(
             outcome,
             Ok(TurnOutcome::Completed | TurnOutcome::MaxIterationsReached)
         )
+}
+
+fn run_permission_command(
+    command: PermissionCommand<'_>,
+    handler: &MemoryPermissionHandler,
+) -> String {
+    match command {
+        PermissionCommand::List => {
+            let policy = handler.remembered_policy();
+            let mut always_allow = policy.always_allow.into_iter().collect::<Vec<_>>();
+            let mut always_deny = policy.always_deny.into_iter().collect::<Vec<_>>();
+            always_allow.sort_unstable();
+            always_deny.sort_unstable();
+            if always_allow.is_empty() && always_deny.is_empty() {
+                return "No remembered tool permissions; the next permissioned use of each tool will ask."
+                    .to_string();
+            }
+            let mut lines = vec!["Remembered tool permissions:".to_string()];
+            lines.push("Always allow:".to_string());
+            if always_allow.is_empty() {
+                lines.push("  (none)".to_string());
+            } else {
+                lines.extend(always_allow.into_iter().map(|tool| format!("  {tool}")));
+            }
+            lines.push("Always deny:".to_string());
+            if always_deny.is_empty() {
+                lines.push("  (none)".to_string());
+            } else {
+                lines.extend(always_deny.into_iter().map(|tool| format!("  {tool}")));
+            }
+            lines.join("\n")
+        }
+        PermissionCommand::Reset(tool) => {
+            if handler.reset_remembered_tool(tool) {
+                format!(
+                    "Reset the remembered permission for '{tool}'; its next permissioned use will ask."
+                )
+            } else {
+                format!("No remembered permission exists for '{tool}'.")
+            }
+        }
+        PermissionCommand::Clear => {
+            let count = handler.clear_remembered_policy();
+            if count == 0 {
+                "No remembered tool permissions to clear.".to_string()
+            } else {
+                format!(
+                    "Cleared {count} remembered tool permission(s); their next permissioned use will ask."
+                )
+            }
+        }
+    }
+}
+
+const TOOL_LIST_LIMIT: usize = 60;
+const TOOL_SUMMARY_CHARS: usize = 180;
+const TOOL_DETAIL_CHARS: usize = 30_000;
+const HISTORY_LIST_LIMIT: usize = 60;
+const HISTORY_DETAIL_CHARS: usize = 30_000;
+
+fn one_line_tool_summary(description: &str) -> String {
+    let flattened = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_middle(&flattened, TOOL_SUMMARY_CHARS)
+}
+
+fn bounded_tool_detail(detail: String) -> String {
+    let count = detail.chars().count();
+    if count <= TOOL_DETAIL_CHARS {
+        return detail;
+    }
+    let kept = detail.chars().take(TOOL_DETAIL_CHARS).collect::<String>();
+    format!(
+        "{kept}\n\n[{} characters omitted; this display is bounded]",
+        count - TOOL_DETAIL_CHARS
+    )
+}
+
+fn advertised_interface(agent: &Agent) -> String {
+    let names = agent
+        .advertised_tool_defs()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "Model-facing tools: (none)".to_string()
+    } else {
+        format!("Model-facing tools: {}", names.join(", "))
+    }
+}
+
+fn sorted_bridge_catalog(agent: &Agent) -> (Vec<ToolDef>, HashSet<String>) {
+    let mut definitions = agent.registry.get_bridge_tool_defs();
+    definitions.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let progressive = agent
+        .registry
+        .code_only_tool_defs()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    (definitions, progressive)
+}
+
+fn find_named_tool<'a>(definitions: &'a [ToolDef], name: &str) -> Result<Option<&'a ToolDef>> {
+    if let Some(definition) = definitions
+        .iter()
+        .find(|definition| definition.name == name)
+    {
+        return Ok(Some(definition));
+    }
+    let matches = definitions
+        .iter()
+        .filter(|definition| definition.name.eq_ignore_ascii_case(name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [definition] => Ok(Some(*definition)),
+        _ => Err(Error::Other(format!(
+            "Tool name '{name}' is ambiguous; use exact case: {}",
+            matches
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+fn render_tool_definition(name: &str, exposure: &str, definition: &ToolDef) -> String {
+    let schema = serde_json::to_string_pretty(&definition.input_schema)
+        .unwrap_or_else(|_| definition.input_schema.to_string());
+    bounded_tool_detail(format!(
+        "Tool {name}\nExposure: {exposure}\n\nDescription:\n{}\n\nInput schema:\n{schema}",
+        definition.description
+    ))
+}
+
+fn run_tools_command(command: ToolsCommand<'_>, agent: &Agent) -> String {
+    let (bridges, progressive) = sorted_bridge_catalog(agent);
+    match command {
+        ToolsCommand::List | ToolsCommand::Search(_) => {
+            let query = match command {
+                ToolsCommand::Search(query) => Some(query),
+                ToolsCommand::List => None,
+                ToolsCommand::Show(_) => unreachable!(),
+            };
+            let normalized_query = query.map(|query| query.to_lowercase());
+            let matches = bridges
+                .iter()
+                .filter(|definition| {
+                    normalized_query.as_ref().is_none_or(|query| {
+                        definition.name.to_lowercase().contains(query)
+                            || definition.description.to_lowercase().contains(query)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let progressive_count = bridges
+                .iter()
+                .filter(|definition| progressive.contains(&definition.name))
+                .count();
+            let mut lines = vec![advertised_interface(agent)];
+            lines.push(if let Some(query) = query {
+                format!(
+                    "Registered bridge tools matching '{query}': {} of {}",
+                    matches.len(),
+                    bridges.len()
+                )
+            } else {
+                format!(
+                    "Registered bridge tools: {} total ({progressive_count} schema-on-demand)",
+                    bridges.len()
+                )
+            });
+            if matches.is_empty() {
+                lines.push("  (no matches)".to_string());
+            } else {
+                lines.extend(matches.iter().take(TOOL_LIST_LIMIT).map(|definition| {
+                    let qualifier = if progressive.contains(&definition.name) {
+                        " [schema on demand]"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "  tools.{}{qualifier} — {}",
+                        definition.name,
+                        one_line_tool_summary(&definition.description)
+                    )
+                }));
+                if matches.len() > TOOL_LIST_LIMIT {
+                    lines.push(format!(
+                        "  … {} more omitted; narrow the list with /tools search <query>",
+                        matches.len() - TOOL_LIST_LIMIT
+                    ));
+                }
+            }
+            lines.push("Use /tools show <name> for one description and input schema.".to_string());
+            lines.join("\n")
+        }
+        ToolsCommand::Show(name) => {
+            match find_named_tool(&bridges, name) {
+                Ok(Some(definition)) => {
+                    let exposure = if progressive.contains(&definition.name) {
+                        "bridge capability; full schema is available to scripts on demand via __doc__"
+                    } else if agent.uses_builtin_code_mode() {
+                        "bridge capability; compact signature and description are preloaded in the python runner"
+                    } else {
+                        "registered model-facing capability"
+                    };
+                    return render_tool_definition(
+                        &format!("tools.{}", definition.name),
+                        exposure,
+                        definition,
+                    );
+                }
+                Err(error) => return error.to_string(),
+                Ok(None) => {}
+            }
+
+            let advertised = agent.advertised_tool_defs();
+            match find_named_tool(&advertised, name) {
+                Ok(Some(definition)) => {
+                    let exposure = if definition.name == "python" && agent.uses_builtin_code_mode()
+                    {
+                        "model-facing built-in runner; registered capabilities are called through tools.<name> inside its script"
+                    } else if definition.name == generalist::UPDATE_GOAL_TOOL_NAME {
+                        "model-facing host control while an objective is active; permission-free and not a bridge capability"
+                    } else {
+                        "model-facing capability"
+                    };
+                    render_tool_definition(&definition.name, exposure, definition)
+                }
+                Err(error) => error.to_string(),
+                Ok(None) if name.eq_ignore_ascii_case(generalist::UPDATE_GOAL_TOOL_NAME) => {
+                    "Tool 'update_goal' is advertised only while an active goal exists.".to_string()
+                }
+                Ok(None) => format!(
+                    "No registered or currently advertised tool named '{name}'. Use /tools search <query>."
+                ),
+            }
+        }
+    }
+}
+
+fn bounded_history_detail(detail: String) -> String {
+    let count = detail.chars().count();
+    if count <= HISTORY_DETAIL_CHARS {
+        return detail;
+    }
+    let kept = detail
+        .chars()
+        .take(HISTORY_DETAIL_CHARS)
+        .collect::<String>();
+    format!(
+        "{kept}\n\n[{} characters omitted; inspect the saved session file for the complete sanitized view]",
+        count - HISTORY_DETAIL_CHARS
+    )
+}
+
+fn render_archived_conversation(conversation: &ArchivedConversation) -> String {
+    let mut lines = vec![
+        format!("Saved session {}", conversation.name),
+        format!(
+            "{} · {} · {} / {}",
+            conversation.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            conversation.scope,
+            conversation.provider,
+            conversation.model
+        ),
+    ];
+    if let Some(goal) = &conversation.goal {
+        lines.push(format!(
+            "prospective goal (not a past event):\n{}",
+            truncate_middle(goal, 1_200)
+        ));
+    }
+    for event in &conversation.events {
+        match event {
+            ArchivedConversationEvent::UserText { text } => {
+                lines.push(format!("user:\n{}", truncate_middle(text, 1_200)));
+            }
+            ArchivedConversationEvent::AssistantText { text } => {
+                lines.push(format!("assistant:\n{}", truncate_middle(text, 1_200)));
+            }
+            ArchivedConversationEvent::ToolCall { name } => {
+                lines.push(format!("tool: {name} (input omitted)"));
+            }
+            ArchivedConversationEvent::ToolResult { is_error } => {
+                lines.push(format!(
+                    "tool result: {} (content omitted)",
+                    if *is_error { "error" } else { "success" }
+                ));
+            }
+        }
+    }
+    bounded_history_detail(lines.join("\n\n"))
+}
+
+fn run_history_command(command: HistoryCommand<'_>, history: &HistoryStore) -> Result<String> {
+    match command {
+        HistoryCommand::List => {
+            let names = history.list();
+            let mut lines = vec![format!(
+                "Saved sessions in {}: {}",
+                history.scope().display_name(),
+                names.len()
+            )];
+            if names.is_empty() {
+                lines.push("  (none)".to_string());
+            } else {
+                lines.extend(
+                    names
+                        .iter()
+                        .take(HISTORY_LIST_LIMIT)
+                        .map(|name| format!("  {name}")),
+                );
+                if names.len() > HISTORY_LIST_LIMIT {
+                    lines.push(format!(
+                        "  … {} more omitted; narrow the list with /history search <query>",
+                        names.len() - HISTORY_LIST_LIMIT
+                    ));
+                }
+            }
+            lines.push("Use /history show <name> to inspect without loading.".to_string());
+            Ok(lines.join("\n"))
+        }
+        HistoryCommand::Search(query) => {
+            let matches = history.search_current_archives(query)?;
+            if matches.is_empty() {
+                return Ok(format!(
+                    "No current-scope saved sessions matched ‘{query}’."
+                ));
+            }
+            let mut lines = vec![format!(
+                "{} current-scope saved session(s) matched ‘{query}’:",
+                matches.len()
+            )];
+            lines.extend(matches.into_iter().map(|conversation| {
+                format!(
+                    "{} · {} · {} / {} · {}",
+                    conversation.name,
+                    conversation.updated_at.format("%Y-%m-%d %H:%M"),
+                    conversation.provider,
+                    conversation.model,
+                    conversation.preview
+                )
+            }));
+            lines.push("Use /history show <name> to inspect without loading.".to_string());
+            Ok(lines.join("\n"))
+        }
+        HistoryCommand::Show(name) => match history.inspect_current_archive(name)? {
+            Some(conversation) => Ok(render_archived_conversation(&conversation)),
+            None => Ok(format!(
+                "No current-scope saved session named '{name}'. Use /history list."
+            )),
+        },
+        HistoryCommand::Forget(_) => Err(Error::Other(
+            "Forgetting a saved session requires interactive host confirmation".to_string(),
+        )),
+    }
 }
 
 fn handle_memory_event(ui: &mut TerminalUi, event: MemoryEvent) {
@@ -1091,6 +2138,7 @@ async fn execute_command(
     permission_handler: &MemoryPermissionHandler,
     memory: Option<&EpisodicMemory>,
     memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
+    mcp_runtime: &mut Option<McpRuntime>,
     keys: &ApiKeys,
     available: &[&'static str],
 ) -> Result<CommandFlow> {
@@ -1119,65 +2167,99 @@ async fn execute_command(
             ui.set_context_tokens(0);
             ui.info("Conversation cleared. The active goal was preserved.");
         }
-        LocalCommand::Save => {
-            let default = format!("chat_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-            if let Some(name) = terminal(ui.prompt("Save conversation as", &default).await)? {
-                match history_store.save(
-                    &make_saved_state(agent, permission_handler, queue, history_store.scope()),
-                    &name,
-                ) {
-                    Ok(path) => ui.info(&format!("Saved to {}", path.display())),
-                    Err(error) => ui.error(&format!("Failed to save: {error}")),
+        LocalCommand::Save(name) => {
+            let prompted_name = if name.is_none() {
+                let default = format!("chat_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+                terminal(ui.prompt("Save conversation as", &default).await)?
+            } else {
+                None
+            };
+            if let Some(name) = name
+                .map(str::to_string)
+                .or(prompted_name)
+                .map(|name| name.trim().to_string())
+            {
+                if name == AUTOSAVE_NAME {
+                    ui.error(
+                        "The live autosave name is reserved; choose another name for a durable checkpoint.",
+                    );
+                } else {
+                    match save_new_named_session(
+                        &name,
+                        agent,
+                        permission_handler,
+                        queue,
+                        history_store,
+                    ) {
+                        Ok(Some(path)) => {
+                            ui.info(&format!("Saved session '{name}' to {}", path.display()))
+                        }
+                        Err(error) => ui.error(&format!("Failed to save '{name}': {error}")),
+                        Ok(None) => match history_store.inspect_current_archive(&name) {
+                            Err(error) => {
+                                ui.error(&format!("Saved-session replacement refused: {error}"))
+                            }
+                            Ok(None) => ui.error(&format!(
+                                "A path for saved session '{name}' already exists but is not a valid current-scope save; refusing to overwrite it."
+                            )),
+                            Ok(Some(_)) => {
+                                let choices =
+                                    vec!["Cancel".to_string(), format!("Replace '{name}'")];
+                                let title = format!(
+                                    "Replace saved session '{name}'? The prior checkpoint will be overwritten."
+                                );
+                                if terminal(ui.select(&title, &choices).await)? == Some(1) {
+                                    match save_named_session(
+                                        &name,
+                                        agent,
+                                        permission_handler,
+                                        queue,
+                                        history_store,
+                                    ) {
+                                        Ok(path) => ui.info(&format!(
+                                            "Replaced saved session '{name}' at {}",
+                                            path.display()
+                                        )),
+                                        Err(error) => ui.error(&format!(
+                                            "Failed to replace saved session '{name}': {error}"
+                                        )),
+                                    }
+                                } else {
+                                    ui.info(&format!("Kept existing saved session '{name}'."));
+                                }
+                            }
+                        },
+                    }
                 }
             }
         }
-        LocalCommand::Load => {
-            let saved = history_store.list();
-            if saved.is_empty() {
-                ui.info("No saved conversations found.");
-            } else if let Some(index) = terminal(ui.select("Load conversation", &saved).await)? {
-                match history_store.load(&saved[index]) {
-                    Ok(state) => {
-                        let SavedState {
-                            scope: _,
-                            provider,
-                            model,
-                            goal,
-                            conversation_history,
-                            always_allow_tools,
-                            always_deny_tools,
-                            queued_prompts,
-                        } = state;
-                        if !history_tool_protocol_is_valid(&conversation_history) {
-                            ui.error(
-                                "Saved conversation has an unpaired tool use/result; refusing to load it.",
-                            );
-                            return Ok(CommandFlow::Continue);
-                        }
-                        match build_provider(keys, &provider, model) {
-                            Ok(provider) => agent.set_provider(provider),
-                            Err(error) => ui.error(&format!(
-                                "Saved API '{provider}' is unavailable ({error}); keeping the current API."
-                            )),
-                        }
-                        permission_handler.set_always_allow(always_allow_tools);
-                        permission_handler.set_always_deny(always_deny_tools);
-                        agent.set_goal(goal);
-                        agent.replace_history(conversation_history);
-                        queue.replace(queued_prompts);
-                        queue.reconcile_goal_continuation(agent.goal().is_some());
-                        ui.load_history(agent.history());
-                        ui.set_goal(agent.goal());
-                        ui.sync_queue(queue);
-                        ui.set_session(
-                            agent.provider().display_name(),
-                            agent.provider().model(),
-                            agent.registry.tool_names().len(),
-                        );
-                        ui.set_context_tokens(agent.context_tokens());
-                        ui.info(&format!("Loaded {} messages", agent.history().len()));
-                    }
-                    Err(error) => ui.error(&format!("Failed to load: {error}")),
+        LocalCommand::Load(name) => {
+            let selected_name = if let Some(name) = name {
+                Some(name.to_string())
+            } else {
+                let saved = history_store.list();
+                if saved.is_empty() {
+                    ui.info("No saved conversations found.");
+                    None
+                } else {
+                    terminal(ui.select("Load conversation", &saved).await)?
+                        .map(|index| saved[index].clone())
+                }
+            };
+            if let Some(name) = selected_name {
+                match load_named_session(
+                    &name,
+                    agent,
+                    ui,
+                    queue,
+                    history_store,
+                    permission_handler,
+                    keys,
+                ) {
+                    Ok(count) => ui.info(&format!(
+                        "Loaded saved session '{name}' ({count} messages)."
+                    )),
+                    Err(error) => ui.error(&format!("Failed to load '{name}': {error}")),
                 }
             }
         }
@@ -1199,6 +2281,50 @@ async fn execute_command(
                 }
             }
         }
+        LocalCommand::Mcp(McpCommand::Status) => {
+            if let Some(runtime) = mcp_runtime {
+                ui.info(&runtime.status());
+            } else {
+                ui.info(
+                    "MCP: no configuration was loaded. Add .generalist/mcp.json under GENERALIST_HOME and restart.",
+                );
+            }
+        }
+        LocalCommand::Mcp(McpCommand::Retry(requested)) => {
+            let Some(runtime) = mcp_runtime else {
+                ui.error("MCP retry is unavailable because no configuration was loaded.");
+                return Ok(CommandFlow::Continue);
+            };
+            match runtime.retry_targets(requested) {
+                Err(error) => ui.error(&format!("MCP retry refused: {error}")),
+                Ok(targets) => {
+                    let config = runtime.config.clone();
+                    let durable = DurableBoundary::from_agent(agent);
+                    if drive_mcp_discovery(
+                        &mut agent.registry,
+                        &config,
+                        runtime,
+                        &targets,
+                        ui,
+                        queue,
+                        history_store,
+                        permission_rx,
+                        permission_handler,
+                        memory_events,
+                        &durable,
+                    )
+                    .await?
+                    {
+                        return Ok(CommandFlow::Exit);
+                    }
+                    ui.set_session(
+                        agent.provider().display_name(),
+                        agent.provider().model(),
+                        agent.registry.tool_names().len(),
+                    );
+                }
+            }
+        }
         LocalCommand::Copy(CopyCommand::Select) => terminal(ui.enter_copy_mode())?,
         LocalCommand::Copy(copy) => {
             let (payload, empty_message) = match copy {
@@ -1209,6 +2335,10 @@ async fn execute_command(
                 CopyCommand::All => (
                     conversation_transcript(agent.history()),
                     "No committed conversation text to copy.",
+                ),
+                CopyCommand::Reasoning => (
+                    latest_assistant_reasoning(agent.history()),
+                    "No inspectable committed provider reasoning to copy.",
                 ),
                 CopyCommand::Select => unreachable!("selection copy handled above"),
             };
@@ -1225,6 +2355,59 @@ async fn execute_command(
                 ui.info(empty_message);
             }
         }
+        LocalCommand::Permissions(command) => {
+            ui.info(&run_permission_command(command, permission_handler));
+        }
+        LocalCommand::Tools(command) => {
+            ui.info(&run_tools_command(command, agent));
+        }
+        LocalCommand::Usage(UsageCommand::Show) => {
+            let report = ui.provider_usage_report();
+            ui.info(&report);
+        }
+        LocalCommand::Usage(UsageCommand::Reset) => {
+            ui.reset_provider_usage();
+            ui.info("Provider usage counters reset. Conversation, context, and provider state were unchanged.");
+        }
+        LocalCommand::History(HistoryCommand::Forget(name)) => {
+            if name == AUTOSAVE_NAME {
+                ui.error(
+                    "The active autosave cannot be forgotten; use /clear to replace its conversation content.",
+                );
+            } else {
+                match history_store.inspect_current_archive(name) {
+                    Ok(None) => ui.info(&format!(
+                        "No current-scope saved session named '{name}'. Use /history list."
+                    )),
+                    Err(error) => ui.error(&format!("History deletion refused: {error}")),
+                    Ok(Some(_)) => {
+                        let choices = vec!["Cancel".to_string(), format!("Delete '{name}'")];
+                        let title = format!(
+                            "Forget saved session '{name}'? Backups and prior copies remain."
+                        );
+                        if terminal(ui.select(&title, &choices).await)? == Some(1) {
+                            match history_store.forget_current_archive(name) {
+                                Ok(true) => ui.info(&format!(
+                                    "Deleted current-scope saved session '{name}'. Prior copies, backups, and filesystem snapshots are not erased."
+                                )),
+                                Ok(false) => ui.info(&format!(
+                                    "Saved session '{name}' disappeared before deletion."
+                                )),
+                                Err(error) => {
+                                    ui.error(&format!("History deletion failed: {error}"))
+                                }
+                            }
+                        } else {
+                            ui.info(&format!("Kept saved session '{name}'."));
+                        }
+                    }
+                }
+            }
+        }
+        LocalCommand::History(command) => match run_history_command(command, history_store) {
+            Ok(output) => ui.info(&output),
+            Err(error) => ui.error(&format!("History inspection failed: {error}")),
+        },
         LocalCommand::Goal(GoalCommand::Edit) => {
             let current = agent.goal().unwrap_or_default();
             if let Some(goal) = terminal(ui.prompt("Active goal (empty clears)", current).await)? {
@@ -1336,16 +2519,51 @@ async fn main() -> Result<()> {
     let permission_handler = MemoryPermissionHandler::with_prompt(permission_prompt);
     let mut registry = build_registry(&permission_handler, &history_store, memory.as_ref())?;
 
-    ui.set_busy(true, "Connecting tools");
-    terminal(ui.draw())?;
-    if let Some(config) =
-        generalist::mcp::McpConfig::load(&generalist_home.join(".generalist/mcp.json"))
-    {
-        for line in generalist::mcp::register_servers(&mut registry, &config).await {
-            ui.info(&line);
+    let (startup_goal, startup_history, queue) =
+        recover_startup_runtime(&history_store, &permission_handler, &mut ui);
+    queue.normalize_steers();
+    queue.reconcile_goal_continuation(startup_goal.is_some());
+    ui.sync_queue(&queue);
+    ui.set_goal(startup_goal.as_deref());
+    ui.set_session(
+        provider.display_name(),
+        provider.model(),
+        registry.tool_names().len(),
+    );
+    let startup_durable = DurableBoundary::before_agent(
+        provider.as_ref(),
+        startup_goal.clone(),
+        startup_history.clone(),
+    );
+    let mcp_config_path = generalist_home.join(".generalist/mcp.json");
+    let mut mcp_runtime = match McpConfig::load_checked(&mcp_config_path) {
+        Ok(config) => config.map(McpRuntime::new),
+        Err(error) => {
+            ui.error(&error.to_string());
+            None
+        }
+    };
+    if let Some(runtime) = mcp_runtime.as_mut() {
+        let config = runtime.config.clone();
+        let targets = runtime.configured_targets();
+        if drive_mcp_discovery(
+            &mut registry,
+            &config,
+            runtime,
+            &targets,
+            &mut ui,
+            &queue,
+            &history_store,
+            &mut permission_rx,
+            &permission_handler,
+            &mut memory_event_rx,
+            &startup_durable,
+        )
+        .await?
+        {
+            return Ok(());
         }
     }
-    ui.set_busy(false, "Ready");
 
     let mut system_prompt = include_str!("../SYSTEM_PROMPT.md").to_string();
     system_prompt.push_str(&format!(
@@ -1374,42 +2592,11 @@ async fn main() -> Result<()> {
     }
 
     let mut agent = Agent::new(provider, registry, system_prompt);
-    let queue = match history_store.load(AUTOSAVE_NAME) {
-        Ok(mut state) => {
-            // The active goal is independent of crash recovery: preserve it
-            // across restarts even when there is no queued turn to resume.
-            agent.set_goal(state.goal.take());
-            if state.queued_prompts.is_empty() {
-                PromptQueue::default()
-            } else if history_tool_protocol_is_valid(&state.conversation_history) {
-                let SavedState {
-                    scope: _,
-                    conversation_history,
-                    always_allow_tools,
-                    always_deny_tools,
-                    queued_prompts,
-                    ..
-                } = state;
-                let count = queued_prompts.len();
-                permission_handler.set_always_allow(always_allow_tools);
-                permission_handler.set_always_deny(always_deny_tools);
-                agent.replace_history(conversation_history);
-                ui.load_history(agent.history());
-                ui.info(&format!(
-                    "Recovered {count} queued message(s) with their conversation context."
-                ));
-                PromptQueue::from_saved(queued_prompts)
-            } else {
-                ui.error(
-                    "Autosave has an unpaired tool use/result; queued work was not recovered.",
-                );
-                PromptQueue::default()
-            }
-        }
-        _ => PromptQueue::default(),
-    };
-    queue.normalize_steers();
-    queue.reconcile_goal_continuation(agent.goal().is_some());
+    agent.max_tokens = cli.max_tokens;
+    agent.set_goal(startup_goal);
+    if !startup_history.is_empty() {
+        agent.replace_history(startup_history);
+    }
     ui.sync_queue(&queue);
     ui.set_goal(agent.goal());
     ui.set_session(
@@ -1446,6 +2633,7 @@ async fn main() -> Result<()> {
                         &permission_handler,
                         memory.as_ref(),
                         &mut memory_event_rx,
+                        &mut mcp_runtime,
                         &keys,
                         &available,
                     )
@@ -1562,8 +2750,159 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use generalist::{ContentBlock, Message};
+
+    #[test]
+    fn max_tokens_parser_accepts_explicit_positive_values_only() {
+        assert_eq!(parse_max_tokens("32000").unwrap(), 32_000);
+        assert!(parse_max_tokens("0")
+            .unwrap_err()
+            .contains("greater than zero"));
+        assert!(parse_max_tokens("unbounded")
+            .unwrap_err()
+            .contains("invalid"));
+    }
+    use generalist::mcp::McpServerConfig;
+    use generalist::{ContentBlock, Message, Tool};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn million_fragment_burst_has_one_hard_bounded_preview_record() {
+        let (sender, receiver) = agent_display_channel();
+        sender.send(AgentEvent::ApiCallStarted);
+        for index in 0..1_000_000 {
+            if index % 2 == 0 {
+                sender.send(AgentEvent::AssistantTextDelta("x".to_string()));
+            } else {
+                sender.send(AgentEvent::ReasoningDelta("r".to_string()));
+            }
+        }
+        sender.send(AgentEvent::ApiCallFinished { usage: None });
+
+        assert_eq!(receiver.buffered_records(), 3);
+        assert_eq!(receiver.pending_preview_bytes(), MAX_PENDING_STREAM_BYTES);
+        assert!(matches!(
+            receiver.try_recv_batch().unwrap().as_slice(),
+            [AgentEvent::ApiCallStarted]
+        ));
+
+        let preview = receiver.try_recv_batch().unwrap();
+        assert!(matches!(
+            preview.first(),
+            Some(AgentEvent::AssistantTextDelta(_))
+        ));
+        let retained = preview
+            .iter()
+            .map(|event| match event {
+                AgentEvent::AssistantTextDelta(text) | AgentEvent::ReasoningDelta(text) => {
+                    text.len()
+                }
+                _ => 0,
+            })
+            .sum::<usize>();
+        let omitted = preview
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::StreamDisplayTruncated {
+                    text_bytes,
+                    reasoning_bytes,
+                } => Some(text_bytes + reasoning_bytes),
+                _ => None,
+            })
+            .expect("the bounded preview must disclose omitted bytes");
+        assert_eq!(retained, MAX_PENDING_STREAM_BYTES);
+        assert_eq!(omitted, 1_000_000 - MAX_PENDING_STREAM_BYTES);
+        assert!(matches!(
+            receiver.try_recv_batch().unwrap().as_slice(),
+            [AgentEvent::ApiCallFinished { usage: None }]
+        ));
+        assert!(receiver.try_recv_batch().is_none());
+    }
+
+    #[test]
+    fn structural_events_split_stream_batches_without_reordering() {
+        let (sender, receiver) = agent_display_channel();
+        sender.send(AgentEvent::AssistantTextDelta("before".to_string()));
+        sender.send(AgentEvent::Notice("boundary".to_string()));
+        sender.send(AgentEvent::AssistantTextDelta("after".to_string()));
+
+        assert_eq!(receiver.buffered_records(), 3);
+        assert!(matches!(
+            receiver.try_recv_batch().unwrap().as_slice(),
+            [AgentEvent::AssistantTextDelta(text)] if text == "before"
+        ));
+        assert!(matches!(
+            receiver.try_recv_batch().unwrap().as_slice(),
+            [AgentEvent::Notice(message)] if message == "boundary"
+        ));
+        assert!(matches!(
+            receiver.try_recv_batch().unwrap().as_slice(),
+            [AgentEvent::AssistantTextDelta(text)] if text == "after"
+        ));
+    }
+
+    struct CatalogTool {
+        name: String,
+        description: String,
+        code_only: bool,
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CatalogTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            &self.description
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, _input: serde_json::Value) -> Result<String> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok("executed".to_string())
+        }
+
+        fn code_only(&self) -> bool {
+            self.code_only
+        }
+    }
+
+    fn catalog_agent(executions: Arc<AtomicUsize>) -> Agent {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(CatalogTool {
+                name: "zeta_search".to_string(),
+                description: "Search remote records\nwith a stable query.".to_string(),
+                code_only: true,
+                executions: executions.clone(),
+            }))
+            .unwrap();
+        registry
+            .register(Arc::new(CatalogTool {
+                name: "alpha_read".to_string(),
+                description: "Read one local record.".to_string(),
+                code_only: false,
+                executions,
+            }))
+            .unwrap();
+        let provider = OpenAiProvider::new(
+            "unused".to_string(),
+            generalist::provider::openai::DEFAULT_BASE_URL.to_string(),
+            "test-model".to_string(),
+        )
+        .unwrap();
+        Agent::new(Box::new(provider), registry, "test")
+    }
 
     #[test]
     fn structured_state_does_not_collide_with_legacy_input_history_file() {
@@ -1580,6 +2919,306 @@ mod tests {
         let autosave = store.save(&state, AUTOSAVE_NAME).unwrap();
         assert!(autosave.starts_with(store.directory()));
         assert_eq!(store.load(AUTOSAVE_NAME).unwrap().model, "model-v2");
+    }
+
+    #[test]
+    fn startup_recovery_keeps_a_goal_but_admits_context_only_with_queued_work() {
+        let mut goal_only =
+            SavedState::new(WorkspaceScope::Global, "openai".into(), "model".into());
+        goal_only.goal = Some("finish the work".into());
+        goal_only
+            .conversation_history
+            .push(Message::user_text("settled old context"));
+        goal_only.always_allow_tools.insert("bash".into());
+
+        let plan = plan_startup_recovery(Some(goal_only));
+        assert_eq!(plan.goal.as_deref(), Some("finish the work"));
+        assert!(plan.history.is_empty());
+        assert!(plan.always_allow_tools.is_empty());
+        assert!(plan.queued_prompts.is_empty());
+        assert!(!plan.invalid_queue);
+
+        let mut queued = SavedState::new(WorkspaceScope::Global, "openai".into(), "model".into());
+        queued.goal = Some("finish the work".into());
+        queued
+            .conversation_history
+            .push(Message::user_text("committed context"));
+        queued.always_allow_tools.insert("bash".into());
+        queued.queued_prompts.push(generalist::QueuedPrompt {
+            id: 9,
+            text: "resume me".into(),
+            delivery: DeliveryMode::FollowUp,
+            source: PromptSource::User,
+        });
+
+        let plan = plan_startup_recovery(Some(queued));
+        assert_eq!(plan.history[0].text(), "committed context");
+        assert!(plan.always_allow_tools.contains("bash"));
+        assert_eq!(plan.queued_prompts[0].id, 9);
+        assert!(!plan.invalid_queue);
+    }
+
+    #[test]
+    fn startup_recovery_rejects_a_queued_invalid_tool_boundary() {
+        let mut state = SavedState::new(WorkspaceScope::Global, "openai".into(), "model".into());
+        state.goal = Some("preserve this goal".into());
+        state
+            .conversation_history
+            .push(Message::assistant(vec![ContentBlock::ToolUse {
+                name: "python".into(),
+                input: json!({}),
+                id: "dangling".into(),
+            }]));
+        state.queued_prompts.push(generalist::QueuedPrompt {
+            id: 4,
+            text: "must not recover".into(),
+            delivery: DeliveryMode::FollowUp,
+            source: PromptSource::User,
+        });
+
+        let plan = plan_startup_recovery(Some(state));
+        assert_eq!(plan.goal.as_deref(), Some("preserve this goal"));
+        assert!(plan.invalid_queue);
+        assert!(plan.history.is_empty());
+        assert!(plan.queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn mcp_runtime_retries_only_failed_or_skipped_servers() {
+        let config = McpConfig {
+            servers: ["alpha", "beta", "gamma"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        McpServerConfig::Http {
+                            url: format!("https://{name}.example/mcp"),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let mut runtime = McpRuntime::new(config);
+        let targets = runtime.configured_targets();
+        runtime.mark_connecting(&targets);
+        runtime.apply_report(&McpRegistrationReport {
+            server_name: "alpha".into(),
+            outcome: McpRegistrationOutcome::Connected {
+                discovered_tools: 2,
+                registered_tools: 2,
+            },
+        });
+        runtime.apply_report(&McpRegistrationReport {
+            server_name: "beta".into(),
+            outcome: McpRegistrationOutcome::ConnectionFailed {
+                error: "offline".into(),
+            },
+        });
+        runtime.mark_skipped(&targets);
+
+        assert_eq!(
+            runtime.retry_targets(None).unwrap(),
+            ["beta".to_string(), "gamma".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            runtime.retry_targets(Some("beta")).unwrap(),
+            ["beta".to_string()].into_iter().collect()
+        );
+        assert!(runtime
+            .retry_targets(Some("alpha"))
+            .unwrap_err()
+            .to_string()
+            .contains("already connected"));
+        assert!(runtime
+            .retry_targets(Some("missing"))
+            .unwrap_err()
+            .to_string()
+            .contains("No configured MCP server"));
+
+        let status = runtime.status();
+        assert!(status.contains("MCP servers: 1/3 connected"));
+        assert!(status.find("- alpha:").unwrap() < status.find("- beta:").unwrap());
+        assert!(status.contains("alpha: connected · 2/2 tool(s) registered"));
+        assert!(status.contains("beta: failed"));
+        assert!(status.contains("gamma: skipped · retry available"));
+    }
+
+    #[test]
+    fn permission_commands_render_sorted_policy_and_revoke_it() {
+        let handler = MemoryPermissionHandler::new();
+        handler.replace_remembered_policy(
+            ["z_tool".to_string(), "a_tool".to_string()].into(),
+            ["m_tool".to_string()].into(),
+        );
+
+        assert_eq!(
+            run_permission_command(PermissionCommand::List, &handler),
+            "Remembered tool permissions:\nAlways allow:\n  a_tool\n  z_tool\nAlways deny:\n  m_tool"
+        );
+        assert!(
+            run_permission_command(PermissionCommand::Reset("a_tool"), &handler)
+                .contains("next permissioned use will ask")
+        );
+        assert!(!handler.remembered_policy().always_allow.contains("a_tool"));
+        assert_eq!(
+            run_permission_command(PermissionCommand::Clear, &handler),
+            "Cleared 2 remembered tool permission(s); their next permissioned use will ask."
+        );
+        assert_eq!(
+            run_permission_command(PermissionCommand::List, &handler),
+            "No remembered tool permissions; the next permissioned use of each tool will ask."
+        );
+    }
+
+    #[test]
+    fn tool_catalog_is_stable_searchable_and_never_executes_capabilities() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut agent = catalog_agent(executions.clone());
+
+        let list = run_tools_command(ToolsCommand::List, &agent);
+        assert!(list.contains("Model-facing tools: python"));
+        assert!(list.contains("2 total (1 schema-on-demand)"));
+        assert!(list.find("tools.alpha_read").unwrap() < list.find("tools.zeta_search").unwrap());
+        assert!(list.contains("tools.zeta_search [schema on demand]"));
+        assert!(!list.contains("records\nwith"));
+
+        let search = run_tools_command(ToolsCommand::Search("REMOTE records"), &agent);
+        assert!(search.contains("1 of 2"));
+        assert!(search.contains("tools.zeta_search"));
+        assert!(!search.contains("tools.alpha_read"));
+
+        let detail = run_tools_command(ToolsCommand::Show("ALPHA_READ"), &agent);
+        assert!(detail.contains("Tool tools.alpha_read"));
+        assert!(detail.contains("compact signature and description are preloaded"));
+        assert!(detail.contains("\"required\": ["));
+        assert!(detail.contains("\"query\""));
+
+        assert_eq!(
+            run_tools_command(ToolsCommand::Show("update_goal"), &agent),
+            "Tool 'update_goal' is advertised only while an active goal exists."
+        );
+        agent.set_goal(Some("finish catalog test".to_string()));
+        let control = run_tools_command(ToolsCommand::Show("update_goal"), &agent);
+        assert!(control.contains("model-facing host control"));
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(agent.history().is_empty());
+    }
+
+    #[test]
+    fn tool_catalog_caps_lists_and_oversized_details() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut agent = catalog_agent(executions.clone());
+        for index in 0..TOOL_LIST_LIMIT {
+            agent
+                .registry
+                .register(Arc::new(CatalogTool {
+                    name: format!("bulk_{index:03}"),
+                    description: "bulk catalog entry".to_string(),
+                    code_only: false,
+                    executions: executions.clone(),
+                }))
+                .unwrap();
+        }
+        agent
+            .registry
+            .register(Arc::new(CatalogTool {
+                name: "oversized".to_string(),
+                description: "x".repeat(TOOL_DETAIL_CHARS + 500),
+                code_only: false,
+                executions: executions.clone(),
+            }))
+            .unwrap();
+
+        let list = run_tools_command(ToolsCommand::List, &agent);
+        assert_eq!(
+            list.lines()
+                .filter(|line| line.starts_with("  tools."))
+                .count(),
+            TOOL_LIST_LIMIT
+        );
+        assert!(list.contains("more omitted; narrow the list"));
+
+        let detail = run_tools_command(ToolsCommand::Show("oversized"), &agent);
+        assert!(detail.contains("characters omitted; this display is bounded"));
+        assert!(detail.chars().count() < TOOL_DETAIL_CHARS + 200);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(agent.history().is_empty());
+    }
+
+    #[test]
+    fn history_catalog_is_sorted_searchable_sanitized_and_non_mutating() {
+        let home = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(home.path().to_path_buf(), WorkspaceScope::Global).unwrap();
+        let mut alpha = SavedState::new(WorkspaceScope::Global, "openai".into(), "model-a".into());
+        alpha
+            .conversation_history
+            .push(Message::user_text("ordinary alpha session"));
+        store.save(&alpha, "alpha").unwrap();
+
+        let mut zeta = SavedState::new(WorkspaceScope::Global, "openai".into(), "model-z".into());
+        zeta.goal = Some("prospective archive goal".into());
+        zeta.conversation_history.push(Message::user_text(
+            "saved-session-search-needle from the user",
+        ));
+        zeta.conversation_history.push(Message::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "private reasoning".into(),
+                signature: "private signature".into(),
+            },
+            ContentBlock::ToolUse {
+                name: "bash".into(),
+                input: json!({"secret": "private input"}),
+                id: "private-id".into(),
+            },
+            ContentBlock::Text {
+                text: "sanitized assistant text".into(),
+            },
+        ]));
+        zeta.conversation_history
+            .push(Message::user(vec![ContentBlock::ToolResult {
+                content: "private output".into(),
+                tool_use_id: "private-id".into(),
+                is_error: Some(false),
+            }]));
+        let path = store.save(&zeta, "zeta").unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let list = run_history_command(HistoryCommand::List, &store).unwrap();
+        assert!(list.find("  alpha").unwrap() < list.find("  zeta").unwrap());
+        let search = run_history_command(HistoryCommand::Search("SEARCH-NEEDLE"), &store).unwrap();
+        assert!(search.contains("1 current-scope saved session(s)"));
+        assert!(search.contains("zeta"));
+        assert!(!search.contains("alpha"));
+        let show = run_history_command(HistoryCommand::Show("zeta"), &store).unwrap();
+        for included in [
+            "Saved session zeta",
+            "prospective archive goal",
+            "saved-session-search-needle",
+            "sanitized assistant text",
+            "tool: bash (input omitted)",
+            "tool result: success (content omitted)",
+        ] {
+            assert!(show.contains(included), "missing {included}");
+        }
+        for excluded in [
+            "private reasoning",
+            "private signature",
+            "private input",
+            "private output",
+            "private-id",
+        ] {
+            assert!(!show.contains(excluded), "displayed {excluded}");
+        }
+        assert!(run_history_command(HistoryCommand::Show("missing"), &store)
+            .unwrap()
+            .contains("No current-scope saved session"));
+        assert!(run_history_command(HistoryCommand::Forget("zeta"), &store)
+            .unwrap_err()
+            .to_string()
+            .contains("interactive host confirmation"));
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]

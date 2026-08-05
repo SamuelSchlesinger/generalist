@@ -3,12 +3,14 @@
 use crate::error::{Error, Result};
 use crate::provider::Provider;
 use crate::types::{
-    CompletionDelta, CompletionRequest, CompletionResponse, ContentBlock, StopReason, Usage,
+    json_payload_bytes, CompletionDelta, CompletionLimits, CompletionRequest, CompletionResponse,
+    ContentBlock, StopReason, Usage,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
+const MODELS_ENDPOINT: &str = "https://api.anthropic.com/v1/models/";
 const API_VERSION: &str = "2023-06-01";
 
 /// Models offered in the CLI picker. The first entry is the default.
@@ -18,6 +20,7 @@ pub struct AnthropicProvider {
     api_key: String,
     model: String,
     client: reqwest::Client,
+    model_max_tokens: tokio::sync::OnceCell<u32>,
 }
 
 impl AnthropicProvider {
@@ -26,7 +29,85 @@ impl AnthropicProvider {
             api_key,
             model,
             client: super::http_client()?,
+            model_max_tokens: tokio::sync::OnceCell::new(),
         })
+    }
+
+    async fn discover_model_max_tokens(&self) -> Result<u32> {
+        let mut url = reqwest::Url::parse(MODELS_ENDPOINT)
+            .map_err(|error| Error::Other(format!("invalid Anthropic Models URL: {error}")))?;
+        url.path_segments_mut()
+            .map_err(|_| Error::Other("Anthropic Models URL cannot contain a model ID".into()))?
+            .push(&self.model);
+        let response = self
+            .client
+            .get(url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION)
+            .send()
+            .await?;
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::error::Error::parse_retry_after);
+        let body = crate::provider::read_response_body_bounded(
+            response,
+            CompletionLimits {
+                max_response_bytes: 256 * 1024,
+                max_content_blocks: 1,
+                max_tool_uses: 0,
+            },
+        )
+        .await?;
+        if !status.is_success() {
+            let message = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+            return Err(Error::Api {
+                status: status.as_u16(),
+                message: format!(
+                    "could not discover the model output limit ({message}); pass --max-tokens to bypass discovery"
+                ),
+                retry_after,
+            });
+        }
+        Self::parse_model_max_tokens(&serde_json::from_slice(&body)?)
+    }
+
+    fn parse_model_max_tokens(model: &Value) -> Result<u32> {
+        let value = model
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                Error::Other(
+                    "Anthropic model metadata omitted a positive max_tokens value; pass --max-tokens explicitly"
+                        .into(),
+                )
+            })?;
+        u32::try_from(value).map_err(|_| {
+            Error::Other(format!(
+                "Anthropic model max_tokens value {value} does not fit this client"
+            ))
+        })
+    }
+
+    async fn resolve_max_tokens(&self, requested: Option<u32>) -> Result<u32> {
+        if let Some(requested) = requested {
+            return Ok(requested);
+        }
+        Ok(*self
+            .model_max_tokens
+            .get_or_try_init(|| self.discover_model_max_tokens())
+            .await?)
     }
 
     /// Whether the model accepts `thinking: {type: "adaptive"}`.
@@ -52,7 +133,7 @@ impl AnthropicProvider {
     /// prompt (which also covers the tool definitions rendered before it) and
     /// the last block of the last message, so each turn extends the cached
     /// prefix instead of re-reading the whole conversation at full price.
-    fn build_body(&self, req: &CompletionRequest<'_>) -> Result<Value> {
+    fn build_body(&self, req: &CompletionRequest<'_>, max_tokens: u32) -> Result<Value> {
         let mut messages = Vec::with_capacity(req.messages.len());
         for message in req.messages {
             let content: Vec<Value> = message
@@ -91,7 +172,7 @@ impl AnthropicProvider {
 
         let mut body = json!({
             "model": self.model,
-            "max_tokens": req.max_tokens,
+            "max_tokens": max_tokens,
             "messages": messages,
         });
 
@@ -159,11 +240,48 @@ struct StreamState {
     output_tokens: u64,
     cache_read: Option<u64>,
     cache_creation: Option<u64>,
+    retained_bytes: usize,
+    tool_uses: usize,
 }
 
 impl StreamState {
+    fn initial_block_bytes(block: &Value) -> usize {
+        match block.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => block
+                .get("text")
+                .and_then(Value::as_str)
+                .map_or(0, str::len),
+            "thinking" => block
+                .get("thinking")
+                .and_then(Value::as_str)
+                .map_or(0, str::len)
+                .saturating_add(
+                    block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map_or(0, str::len),
+                ),
+            "redacted_thinking" => block
+                .get("data")
+                .and_then(Value::as_str)
+                .map_or(0, str::len),
+            "tool_use" => block
+                .get("id")
+                .and_then(Value::as_str)
+                .map_or(0, str::len)
+                .saturating_add(
+                    block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map_or(0, str::len),
+                )
+                .saturating_add(block.get("input").map_or(0, json_payload_bytes)),
+            _ => 0,
+        }
+    }
+
     /// Apply one SSE event; returns every inspectable delta it contains.
-    fn apply(&mut self, event: &Value) -> Result<Vec<CompletionDelta>> {
+    fn apply(&mut self, event: &Value, limits: CompletionLimits) -> Result<Vec<CompletionDelta>> {
         let mut emitted = Vec::new();
         match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "message_start" => {
@@ -182,25 +300,58 @@ impl StreamState {
             }
             "content_block_start" => {
                 let block = event.get("content_block").cloned().unwrap_or(Value::Null);
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let index = usize::try_from(index).map_err(|_| {
+                    Error::Other("provider content-block index does not fit this host".to_string())
+                })?;
+                if index != self.blocks.len() {
+                    return Err(Error::Other(format!(
+                        "provider content-block index {index} was out of sequence; expected {}",
+                        self.blocks.len()
+                    )));
+                }
+                if self.blocks.len() >= limits.max_content_blocks {
+                    return Err(Error::Other(format!(
+                        "provider completion exceeded the host limit of {} blocks",
+                        limits.max_content_blocks
+                    )));
+                }
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if self.tool_uses >= limits.max_tool_uses {
+                        return Err(Error::Other(format!(
+                            "provider completion exceeded the host limit of {} tool calls",
+                            limits.max_tool_uses
+                        )));
+                    }
+                    self.tool_uses += 1;
+                }
+                self.retained_bytes = limits.checked_response_bytes(
+                    self.retained_bytes,
+                    Self::initial_block_bytes(&block),
+                )?;
                 self.blocks.push(block);
                 self.partial_json.push(String::new());
             }
             "content_block_delta" => {
-                let index = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let index = usize::try_from(index).map_err(|_| {
+                    Error::Other("provider content-block index does not fit this host".to_string())
+                })?;
                 let Some(delta) = event.get("delta") else {
                     return Ok(emitted);
                 };
                 if index >= self.blocks.len() {
-                    return Ok(emitted);
+                    return Err(Error::Other(format!(
+                        "provider delta referenced unknown content-block index {index}"
+                    )));
                 }
                 match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                     "text_delta" => {
                         let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                        if let Some(existing) = self.blocks[index]
-                            .get_mut("text")
-                            .and_then(|t| t.as_str().map(String::from))
-                        {
-                            self.blocks[index]["text"] = json!(existing + text);
+                        self.retained_bytes =
+                            limits.checked_response_bytes(self.retained_bytes, text.len())?;
+                        if let Some(Value::String(existing)) = self.blocks[index].get_mut("text") {
+                            existing.push_str(text);
                         }
                         if !text.is_empty() {
                             emitted.push(CompletionDelta::Text(text.to_string()));
@@ -211,15 +362,18 @@ impl StreamState {
                             .get("partial_json")
                             .and_then(|t| t.as_str())
                             .unwrap_or("");
+                        self.retained_bytes =
+                            limits.checked_response_bytes(self.retained_bytes, fragment.len())?;
                         self.partial_json[index].push_str(fragment);
                     }
                     "thinking_delta" => {
                         let fragment = delta.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-                        if let Some(existing) = self.blocks[index]
-                            .get_mut("thinking")
-                            .and_then(|t| t.as_str().map(String::from))
+                        self.retained_bytes =
+                            limits.checked_response_bytes(self.retained_bytes, fragment.len())?;
+                        if let Some(Value::String(existing)) =
+                            self.blocks[index].get_mut("thinking")
                         {
-                            self.blocks[index]["thinking"] = json!(existing + fragment);
+                            existing.push_str(fragment);
                         }
                         if !fragment.is_empty() {
                             emitted.push(CompletionDelta::Reasoning(fragment.to_string()));
@@ -230,11 +384,12 @@ impl StreamState {
                             .get("signature")
                             .and_then(|t| t.as_str())
                             .unwrap_or("");
-                        if let Some(existing) = self.blocks[index]
-                            .get_mut("signature")
-                            .and_then(|t| t.as_str().map(String::from))
+                        self.retained_bytes =
+                            limits.checked_response_bytes(self.retained_bytes, fragment.len())?;
+                        if let Some(Value::String(existing)) =
+                            self.blocks[index].get_mut("signature")
                         {
-                            self.blocks[index]["signature"] = json!(existing + fragment);
+                            existing.push_str(fragment);
                         }
                     }
                     _ => {}
@@ -310,7 +465,9 @@ impl Provider for AnthropicProvider {
     }
 
     async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse> {
-        let body = self.build_body(&request)?;
+        let limits = request.limits;
+        let max_tokens = self.resolve_max_tokens(request.max_tokens).await?;
+        let body = self.build_body(&request, max_tokens)?;
         let response = self
             .client
             .post(MESSAGES_ENDPOINT)
@@ -327,9 +484,9 @@ impl Provider for AnthropicProvider {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(crate::error::Error::parse_retry_after);
-        let text = response.text().await?;
+        let response_body = crate::provider::read_response_body_bounded(response, limits).await?;
         if !status.is_success() {
-            let message = serde_json::from_str::<Value>(&text)
+            let message = serde_json::from_slice::<Value>(&response_body)
                 .ok()
                 .and_then(|v| {
                     v.get("error")
@@ -337,7 +494,7 @@ impl Provider for AnthropicProvider {
                         .and_then(|m| m.as_str())
                         .map(str::to_string)
                 })
-                .unwrap_or(text);
+                .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
@@ -345,15 +502,19 @@ impl Provider for AnthropicProvider {
             });
         }
 
-        Self::parse_response(serde_json::from_str(&text)?)
+        let response = Self::parse_response(serde_json::from_slice(&response_body)?)?;
+        limits.validate_response(&response)?;
+        Ok(response)
     }
 
     async fn complete_streaming(
         &self,
         request: CompletionRequest<'_>,
-        on_delta: &mut dyn FnMut(CompletionDelta),
+        on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
     ) -> Result<CompletionResponse> {
-        let mut body = self.build_body(&request)?;
+        let limits = request.limits;
+        let max_tokens = self.resolve_max_tokens(request.max_tokens).await?;
+        let mut body = self.build_body(&request, max_tokens)?;
         body["stream"] = json!(true);
 
         let response = self
@@ -374,15 +535,16 @@ impl Provider for AnthropicProvider {
             .and_then(|v| v.to_str().ok())
             .and_then(crate::error::Error::parse_retry_after);
         if !status.is_success() {
-            let text = response.text().await?;
-            let message = serde_json::from_str::<Value>(&text)
+            let response_body =
+                crate::provider::read_response_body_bounded(response, limits).await?;
+            let message = serde_json::from_slice::<Value>(&response_body)
                 .ok()
                 .and_then(|v| {
                     v.pointer("/error/message")
                         .and_then(|m| m.as_str())
                         .map(str::to_string)
                 })
-                .unwrap_or(text);
+                .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
@@ -394,14 +556,16 @@ impl Provider for AnthropicProvider {
         let mut assembler = crate::provider::SseAssembler::default();
         let mut state = StreamState::default();
         let mut saw_message_stop = false;
+        let mut received = 0usize;
         while let Some(chunk) = response.chunk().await? {
+            crate::provider::account_wire_bytes(limits, &mut received, chunk.len())?;
             for payload in assembler.push(&chunk) {
                 if let Ok(event) = serde_json::from_str::<Value>(&payload) {
                     if event.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
                         saw_message_stop = true;
                     }
-                    for delta in state.apply(&event)? {
-                        on_delta(delta);
+                    for delta in state.apply(&event, limits)? {
+                        on_delta(delta)?;
                     }
                 }
             }
@@ -411,8 +575,8 @@ impl Provider for AnthropicProvider {
                 if event.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
                     saw_message_stop = true;
                 }
-                for delta in state.apply(&event)? {
-                    on_delta(delta);
+                for delta in state.apply(&event, limits)? {
+                    on_delta(delta)?;
                 }
             }
         }
@@ -426,7 +590,9 @@ impl Provider for AnthropicProvider {
                 retry_after: None,
             });
         }
-        Ok(state.into_response())
+        let response = state.into_response();
+        limits.validate_response(&response)?;
+        Ok(response)
     }
 }
 
@@ -446,11 +612,59 @@ mod tests {
             system: None,
             messages: &messages,
             tools: &[],
-            max_tokens: 100,
+            max_tokens: Some(100),
+            limits: CompletionLimits::default(),
         };
-        let body = provider().build_body(&req).unwrap();
+        let body = provider().build_body(&req, 100).unwrap();
         assert!(body.get("system").is_none());
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn body_uses_resolved_model_max_or_explicit_token_override() {
+        let messages = vec![Message::user_text("hi")];
+        let delegated = CompletionRequest {
+            system: None,
+            messages: &messages,
+            tools: &[],
+            max_tokens: None,
+            limits: CompletionLimits::default(),
+        };
+        assert_eq!(
+            provider().build_body(&delegated, 128_000).unwrap()["max_tokens"],
+            128_000
+        );
+
+        let explicit = CompletionRequest {
+            max_tokens: Some(32_000),
+            ..delegated
+        };
+        assert_eq!(
+            provider().build_body(&explicit, 32_000).unwrap()["max_tokens"],
+            32_000
+        );
+    }
+
+    #[test]
+    fn model_metadata_requires_a_positive_client_sized_maximum() {
+        assert_eq!(
+            AnthropicProvider::parse_model_max_tokens(&json!({"max_tokens": 128000})).unwrap(),
+            128_000
+        );
+        assert!(AnthropicProvider::parse_model_max_tokens(&json!({"max_tokens": 0})).is_err());
+        assert!(AnthropicProvider::parse_model_max_tokens(&json!({})).is_err());
+        assert!(AnthropicProvider::parse_model_max_tokens(
+            &json!({"max_tokens": u64::from(u32::MAX) + 1})
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_token_override_bypasses_model_discovery() {
+        assert_eq!(
+            provider().resolve_max_tokens(Some(32_000)).await.unwrap(),
+            32_000
+        );
     }
 
     #[test]
@@ -482,9 +696,10 @@ mod tests {
             system: Some("be helpful"),
             messages: &messages,
             tools: &tools,
-            max_tokens: 100,
+            max_tokens: Some(100),
+            limits: CompletionLimits::default(),
         };
-        let body = provider().build_body(&req).unwrap();
+        let body = provider().build_body(&req, 100).unwrap();
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 2);
@@ -508,9 +723,10 @@ mod tests {
             system: None,
             messages: &messages,
             tools: &[],
-            max_tokens: 10,
+            max_tokens: Some(10),
+            limits: CompletionLimits::default(),
         };
-        let body = p.build_body(&req).unwrap();
+        let body = p.build_body(&req, 10).unwrap();
         assert!(body.get("thinking").is_none());
     }
 
@@ -534,7 +750,7 @@ mod tests {
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
         for event in &events {
-            for delta in state.apply(event).unwrap() {
+            for delta in state.apply(event, CompletionLimits::default()).unwrap() {
                 match delta {
                     CompletionDelta::Text(text) => streamed_text.push_str(&text),
                     CompletionDelta::Reasoning(reasoning) => {
@@ -575,8 +791,44 @@ mod tests {
     #[test]
     fn stream_error_events_surface_as_errors() {
         let mut state = StreamState::default();
-        let result = state.apply(&json!({"type": "error", "error": {"message": "overloaded"}}));
+        let result = state.apply(
+            &json!({"type": "error", "error": {"message": "overloaded"}}),
+            CompletionLimits::default(),
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn stream_state_rejects_unknown_indexes_and_payload_overflow_before_append() {
+        let mut state = StreamState::default();
+        let unknown = state
+            .apply(
+                &json!({"type": "content_block_delta", "index": 500, "delta": {"type": "text_delta", "text": "x"}}),
+                CompletionLimits::default(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("unknown content-block index 500"));
+        assert!(state.blocks.is_empty());
+
+        state
+            .apply(
+                &json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+                CompletionLimits::default(),
+            )
+            .unwrap();
+        let overflow = state
+            .apply(
+                &json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "four"}}),
+                CompletionLimits {
+                    max_response_bytes: 3,
+                    ..CompletionLimits::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(overflow.contains("payload limit of 3 bytes"));
+        assert_eq!(state.blocks[0]["text"], "");
     }
 
     #[test]
