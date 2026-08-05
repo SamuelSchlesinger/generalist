@@ -131,3 +131,18 @@ at a provider-reported cost of $0.048652. On `argv_no_shell` and
 Kimi profile passed 9/10 in its first sample, suggesting that explicit tool
 selection may improve call propensity, but one repetition per profile is not
 enough to estimate that effect.
+
+`20260804T234714Z-...jsonl` adds two Qwen implicit-tool repetitions. It passed
+18/20, with output-limit failures on `unified_diff` and
+`delimiter_collision`. Across all three complete Qwen repetitions, implicit
+JSON passed 28/30 (93.3%).
+
+`20260804T234712Z-...jsonl` planned two additional Kimi repetitions of forced
+and implicit JSON, but was deliberately interrupted after 25/40 attempts when
+provider latency became extreme. Its first repetition is complete: forced JSON
+passed 6/10 with four output limits, while implicit JSON passed 8/10 with one
+ignored tool call and one argument mismatch. Five completed attempts from the
+second repetition all passed but are not treated as a full replicate. Combining
+only complete repetitions with the earlier baseline gives 15/20 for forced
+JSON and 15/20 for implicit JSON. The data therefore do not support adding a
+Kimi-specific forced-tool policy.
