@@ -1,6 +1,6 @@
-//! Live OpenRouter/Kimi K3 smoke test.
+//! Live OpenRouter streaming smoke test.
 //!
-//! Run with: `cargo run --example smoke_openrouter`
+//! Run with: `cargo run --example smoke_openrouter [model]`
 //! Requires `OPENROUTER_API_KEY` in the environment or `~/.generalist.env`.
 
 use generalist::provider::{openrouter, OpenRouterProvider};
@@ -13,8 +13,11 @@ async fn main() -> generalist::Result<()> {
     if env_path.exists() {
         dotenv::from_path(&env_path).ok();
     }
+    let model = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| openrouter::DEFAULT_MODEL.to_string());
     let api_key = std::env::var("OPENROUTER_API_KEY").expect("set OPENROUTER_API_KEY");
-    let provider = OpenRouterProvider::new(api_key, openrouter::DEFAULT_MODEL.into())?;
+    let provider = OpenRouterProvider::new(api_key, model.clone())?;
     assert_eq!(provider.id(), "openrouter");
 
     let mut agent = Agent::new(
@@ -34,16 +37,16 @@ async fn main() -> generalist::Result<()> {
 
     let outcome = agent
         .run_turn(
-            "Reply with exactly KIMI_OK and do not call any tools.",
+            "Reply with exactly OPENROUTER_OK and do not call any tools.",
             &mut on_event,
         )
         .await?;
     assert_eq!(outcome, TurnOutcome::Completed);
     assert!(
-        answer.borrow().contains("KIMI_OK"),
+        answer.borrow().contains("OPENROUTER_OK"),
         "unexpected answer: {}",
         answer.borrow()
     );
-    println!("SMOKE OK — OpenRouter/{}", openrouter::DEFAULT_MODEL);
+    println!("SMOKE OK — OpenRouter/{model}");
     Ok(())
 }

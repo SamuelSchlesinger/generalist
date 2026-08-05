@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_MODEL: &str = "moonshotai/kimi-k3";
-pub const SUGGESTED_MODELS: &[&str] = &[DEFAULT_MODEL];
+pub const SUGGESTED_MODELS: &[&str] = &[DEFAULT_MODEL, "qwen/qwen3.8-max"];
 
 /// OpenRouter gets its own stable provider ID so saved sessions reload with
 /// `OPENROUTER_API_KEY`, rather than whichever key backs the generic OpenAI
@@ -67,5 +67,10 @@ mod tests {
         assert_eq!(provider.id(), "openrouter");
         assert_eq!(provider.display_name(), "OpenRouter");
         assert_eq!(provider.model(), "moonshotai/kimi-k3");
+    }
+
+    #[test]
+    fn suggests_the_benchmarked_qwen_model_without_changing_the_default() {
+        assert_eq!(SUGGESTED_MODELS, &[DEFAULT_MODEL, "qwen/qwen3.8-max"]);
     }
 }
