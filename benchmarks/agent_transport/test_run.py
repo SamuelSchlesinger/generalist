@@ -3,6 +3,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("run.py")
@@ -281,6 +282,35 @@ class WireFormatTests(unittest.TestCase):
                 benchmark.sha256_file(path),
                 "985bfe71d0f386c5bbce96722eb5dece3b132953561da58d05fc5bf093c0f466",
             )
+
+    def test_interrupted_run_records_partial_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "interrupted.jsonl"
+            with mock.patch.object(
+                benchmark, "run_attempt", side_effect=KeyboardInterrupt
+            ):
+                exit_code = benchmark.main(
+                    [
+                        "--provider",
+                        "ollama",
+                        "--model",
+                        "fixture",
+                        "--task",
+                        "simple_ascii",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 130)
+            records = [
+                json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(records[0]["expected_attempts"], 1)
+            self.assertEqual(records[-1]["record_type"], "run_end")
+            self.assertEqual(records[-1]["status"], "interrupted")
+            self.assertEqual(records[-1]["attempts"], 0)
+            self.assertEqual(records[-1]["expected_attempts"], 1)
 
 
 if __name__ == "__main__":

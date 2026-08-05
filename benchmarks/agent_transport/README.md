@@ -49,6 +49,9 @@ Every attempt records the sanitized request, full provider response, extracted
 source, checker result, latency, token usage, and model-argument byte overhead.
 No authorization header or API key is written. JSONL records are flushed and
 synced after every attempt, and an interrupted file remains summarizable.
+The final record states whether the planned matrix completed and records both
+expected and completed attempt counts; Ctrl-C exits with status 130 after
+closing that evidence cleanly.
 Treat result files as append-only evidence: start a new file for a changed
 corpus, prompt, provider route, or implementation rather than rewriting an old
 run.

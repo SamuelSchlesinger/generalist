@@ -848,6 +848,8 @@ def main(argv: list[str] | None = None) -> int:
     attempts = 0
     passed = 0
     failures: dict[str, int] = {}
+    expected_attempts = args.repeat * len(tasks) * len(args.transports)
+    interrupted = False
     writer.write(
         {
             "schema_version": 1,
@@ -860,6 +862,7 @@ def main(argv: list[str] | None = None) -> int:
             "transports": args.transports,
             "task_ids": [task["id"] for task in tasks],
             "repeat": args.repeat,
+            "expected_attempts": expected_attempts,
             "max_output_tokens": args.max_output_tokens,
             "reasoning_effort": args.reasoning_effort,
             "temperature": args.temperature,
@@ -903,6 +906,8 @@ def main(argv: list[str] | None = None) -> int:
                         f"{task['id']:<24} {transport:<16} {classification}",
                         flush=True,
                     )
+    except KeyboardInterrupt:
+        interrupted = True
     finally:
         writer.write(
             {
@@ -910,6 +915,10 @@ def main(argv: list[str] | None = None) -> int:
                 "record_type": "run_end",
                 "run_id": run_id,
                 "finished_at": utc_now(),
+                "status": "interrupted"
+                if interrupted or attempts != expected_attempts
+                else "complete",
+                "expected_attempts": expected_attempts,
                 "attempts": attempts,
                 "passed": passed,
                 "failed": attempts - passed,
@@ -917,6 +926,9 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         writer.close()
+    if interrupted:
+        print(f"interrupted; saved {attempts}/{expected_attempts} attempts to {output}")
+        return 130
     print(f"saved {attempts} attempts ({passed} passed) to {output}")
     return 1 if args.require_pass and passed != attempts else 0
 
