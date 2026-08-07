@@ -18,6 +18,9 @@ pub struct Todo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoList {
+    /// Tolerate a missing/`{}` file (e.g. after a truncated or partial write)
+    /// by defaulting to an empty list instead of failing to parse.
+    #[serde(default)]
     pub todos: Vec<Todo>,
 }
 
@@ -101,8 +104,12 @@ impl TodoTool {
         let content = fs::read_to_string(&path)
             .map_err(|e| Error::Other(format!("Failed to read todo file: {}", e)))?;
 
-        serde_json::from_str(&content)
-            .map_err(|e| Error::Other(format!("Failed to parse todo file: {}", e)))
+        // A corrupted or partially-written todo file should not wedge the tool:
+        // the list is ephemeral UX state, so fall back to an empty list rather
+        // than failing every subsequent call. (The `#[serde(default)]` on the
+        // field already covers the `{}` / missing-field case; this covers
+        // malformed JSON or a wrong top-level shape.)
+        Ok(serde_json::from_str(&content).unwrap_or_else(|_| TodoList::new()))
     }
 
     fn save_todos(todos: &TodoList) -> Result<()> {
