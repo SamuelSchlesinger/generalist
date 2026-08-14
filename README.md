@@ -19,6 +19,9 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 
 ./target/release/generalist
 
+# Gemini through OpenRouter (requires OPENROUTER_API_KEY):
+./target/release/generalist --gemini                  # google/gemini-3.7-flash
+
 # Local models need no key:
 ./target/release/generalist --local                    # qwen3.6:35b-a3b
 ./target/release/generalist --local qwen2.5-coder:32b  # or name one
@@ -26,7 +29,9 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 
 When `OPENROUTER_API_KEY` is configured, normal remote startup defaults to
 OpenRouter's `moonshotai/kimi-k3`. Use `/model` to switch to another configured
-API. `--local` always takes precedence and keeps the local-model behavior.
+API. `--gemini` bypasses selection and uses OpenRouter's
+`google/gemini-3.7-flash`. `--local` always takes precedence and keeps the
+local-model behavior.
 
 `--local [model]` skips provider selection and uses `http://localhost:11434/v1`; set
 `OPENAI_BASE_URL` for other local servers. Tool calling requires a tool-capable model
@@ -274,10 +279,14 @@ retrieval or consolidation.
 
 ## Permissions
 
-New tool calls open a permission modal showing the full input (patches are rendered as
-colored diffs). Choices are allow always, allow once, deny always, and deny once.
-Decisions persist across save/load; remembered decisions are surfaced in the status
-bar while every execution remains visible in the tool-activity panel.
+New tool calls open a permission modal showing the full input. Python scripts are
+rendered as syntax-highlighted, numbered source, bash commands as numbered command
+text, and neither is buried in a JSON-escaped string. Patches are rendered as colored
+diffs; other inputs remain pretty-printed JSON.
+Choices are allow always, allow once, deny always, and deny once. Decisions persist
+across save/load; remembered decisions are surfaced in the status bar while every
+execution remains visible in the tool-activity panel. The activity preview keeps the
+first source or command lines visible after completion alongside the result summary.
 
 `/permissions` lists remembered decisions in stable tool-name order.
 `/permissions reset <tool>` removes one exact allow/deny decision, and

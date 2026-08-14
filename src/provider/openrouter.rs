@@ -7,7 +7,8 @@ use async_trait::async_trait;
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_MODEL: &str = "moonshotai/kimi-k3";
-pub const SUGGESTED_MODELS: &[&str] = &[DEFAULT_MODEL, "qwen/qwen3.8-max"];
+pub const GEMINI_3_7_FLASH_MODEL: &str = "google/gemini-3.7-flash";
+pub const SUGGESTED_MODELS: &[&str] = &[DEFAULT_MODEL, GEMINI_3_7_FLASH_MODEL, "qwen/qwen3.8-max"];
 
 /// OpenRouter gets its own stable provider ID so saved sessions reload with
 /// `OPENROUTER_API_KEY`, rather than whichever key backs the generic OpenAI
@@ -70,7 +71,10 @@ mod tests {
     }
 
     #[test]
-    fn suggests_the_benchmarked_qwen_model_without_changing_the_default() {
-        assert_eq!(SUGGESTED_MODELS, &[DEFAULT_MODEL, "qwen/qwen3.8-max"]);
+    fn suggests_gemini_and_the_benchmarked_qwen_model_without_changing_the_default() {
+        assert_eq!(
+            SUGGESTED_MODELS,
+            [DEFAULT_MODEL, GEMINI_3_7_FLASH_MODEL, "qwen/qwen3.8-max"]
+        );
     }
 }

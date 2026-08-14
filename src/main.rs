@@ -941,15 +941,18 @@ impl AgentDisplayReceiver {
 
 struct CliArgs {
     local_model: Option<String>,
+    gemini: bool,
     global_scope: bool,
     max_tokens: Option<u32>,
 }
 
 fn print_usage() {
-    println!("Usage: generalist [--global] [--local [model]] [--max-tokens <count>]");
+    println!("Usage: generalist [--global] [--gemini] [--local [model]] [--max-tokens <count>]");
     println!();
     println!("  --global          Use the explicit cross-project history/memory scope");
     println!("                    (default: project scope discovered from the working directory)");
+    println!("  --gemini          Use Gemini 3.7 Flash through OpenRouter");
+    println!("                    (requires OPENROUTER_API_KEY; --local takes precedence)");
     println!("  --local [model]   Run against a local OpenAI-compatible server");
     println!(
         "                    (default {}, override with OPENAI_BASE_URL).",
@@ -974,14 +977,16 @@ fn parse_max_tokens(value: &str) -> std::result::Result<u32, String> {
     Ok(parsed)
 }
 
-fn parse_args() -> CliArgs {
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
     let mut local_model = None;
+    let mut gemini = false;
     let mut global_scope = false;
     let mut max_tokens = None;
-    let mut args = env::args().skip(1).peekable();
+    let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--global" => global_scope = true,
+            "--gemini" => gemini = true,
             "--local" => {
                 let model = match args.peek() {
                     Some(next) if !next.starts_with('-') => args.next().unwrap(),
@@ -1025,8 +1030,26 @@ fn parse_args() -> CliArgs {
     }
     CliArgs {
         local_model,
+        gemini,
         global_scope,
         max_tokens,
+    }
+}
+
+fn parse_args() -> CliArgs {
+    parse_args_from(env::args().skip(1))
+}
+
+fn forced_provider_and_model(cli: &CliArgs) -> Option<(String, String)> {
+    if let Some(model) = &cli.local_model {
+        Some(("openai".to_string(), model.clone()))
+    } else if cli.gemini {
+        Some((
+            "openrouter".to_string(),
+            openrouter::GEMINI_3_7_FLASH_MODEL.to_string(),
+        ))
+    } else {
+        None
     }
 }
 
@@ -2466,13 +2489,22 @@ async fn main() -> Result<()> {
         }
         keys.openai.get_or_insert_with(|| "unused".to_string());
     }
+    if cli.gemini && cli.local_model.is_none() && keys.openrouter.is_none() {
+        eprintln!(
+            "{} --gemini requires OPENROUTER_API_KEY (in the environment or ~/.generalist.env).",
+            "Configuration error:".red()
+        );
+        std::process::exit(1);
+    }
     let available = keys.available_providers();
     if available.is_empty() {
         eprintln!("{}", "No API key found.".red());
         eprintln!("Set at least one of these (in the environment or ~/.generalist.env):");
         eprintln!("  ANTHROPIC_API_KEY=...   for Anthropic models");
         eprintln!("  OPENAI_API_KEY=...      for OpenAI or a compatible server");
-        eprintln!("  OPENROUTER_API_KEY=...  for OpenRouter (defaults to Kimi K3)");
+        eprintln!(
+            "  OPENROUTER_API_KEY=...  for OpenRouter (Kimi K3 by default; --gemini selects Gemini 3.7 Flash)"
+        );
         eprintln!("  OPENAI_BASE_URL=...     optional, e.g. {OLLAMA_BASE_URL} for Ollama");
         eprintln!("Or run against a local model directly: generalist --local <model>");
         std::process::exit(1);
@@ -2501,8 +2533,8 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let provider_and_model = match cli.local_model {
-        Some(model) => Some(("openai".to_string(), model)),
+    let provider_and_model = match forced_provider_and_model(&cli) {
+        Some(requested) => Some(requested),
         None => match default_remote_provider_and_model(&keys) {
             Some(default) => Some(default),
             None => choose_provider_and_model(&mut ui, &keys, &available).await?,
@@ -2750,6 +2782,40 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_flag_selects_gemini_3_7_flash_through_openrouter() {
+        let cli = parse_args_from(
+            ["--gemini", "--global", "--max-tokens=4096"]
+                .into_iter()
+                .map(str::to_string),
+        );
+
+        assert!(cli.gemini);
+        assert!(cli.global_scope);
+        assert_eq!(cli.max_tokens, Some(4096));
+        assert_eq!(
+            forced_provider_and_model(&cli),
+            Some((
+                "openrouter".to_string(),
+                "google/gemini-3.7-flash".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn local_model_keeps_precedence_over_gemini_shortcut() {
+        let cli = parse_args_from(
+            ["--gemini", "--local", "custom-local-model"]
+                .into_iter()
+                .map(str::to_string),
+        );
+
+        assert_eq!(
+            forced_provider_and_model(&cli),
+            Some(("openai".to_string(), "custom-local-model".to_string()))
+        );
+    }
 
     #[test]
     fn max_tokens_parser_accepts_explicit_positive_values_only() {

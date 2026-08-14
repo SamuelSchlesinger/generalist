@@ -403,6 +403,17 @@ matches is ignored. Interrupting a turn resolves or drops its pending request
 before closing the modal. Remembered allow/deny decisions emit lightweight
 status events without opening a modal.
 
+The modal renders `python.code` as control-sanitized, line-numbered,
+Python-highlighted source and `bash.command` as line-numbered command text instead
+of JSON strings with escaped newlines. The lightweight Python lexer distinguishes
+keywords, definition and call names, builtins, strings (including multiline triple
+strings), comments, numbers, decorators, and operators without changing the source.
+Explicit options remain visible below the source, patches retain their colored diff
+view, and other tool inputs use pretty JSON. The activity panel applies the same
+Python highlighting to its first two source lines after completion and adds the
+result as a separate summary, so execution does not erase the invocation being
+reviewed.
+
 The remembered policy is host-owned, inspectable, and revocable while idle.
 `/permissions` renders both sets in stable tool-name order;
 `/permissions reset <tool>` removes one exact decision and

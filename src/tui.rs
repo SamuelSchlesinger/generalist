@@ -186,6 +186,382 @@ struct ActivityEntry {
     output: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SourceToolInput<'a> {
+    field: &'static str,
+    title: &'static str,
+    source: &'a str,
+}
+
+fn source_tool_spec(tool_name: &str) -> Option<(&'static str, &'static str)> {
+    match tool_name {
+        "python" => Some(("code", "Python source")),
+        "bash" => Some(("command", "Shell command")),
+        _ => None,
+    }
+}
+
+fn source_tool_input<'a>(tool_name: &str, input: &'a Value) -> Option<SourceToolInput<'a>> {
+    let (field, title) = source_tool_spec(tool_name)?;
+    let source = input.get(field)?.as_str()?;
+    Some(SourceToolInput {
+        field,
+        title,
+        source,
+    })
+}
+
+fn tool_input_preview(tool_name: &str, input: &Value, max_chars: usize) -> String {
+    let preview = if let Some(source) = source_tool_input(tool_name, input) {
+        let source_text = sanitize_terminal_text(source.source);
+        if source_text.is_empty() {
+            format!("<empty {}>", source.field)
+        } else {
+            source_text
+        }
+    } else {
+        sanitize_terminal_text(&serde_json::to_string(input).unwrap_or_default())
+    };
+    truncate_middle(&preview, max_chars)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PythonStringState {
+    TripleSingle,
+    TripleDouble,
+}
+
+fn highlight_python_source(source: &str) -> Vec<Vec<Span<'static>>> {
+    let source = sanitize_terminal_text(source);
+    let mut string_state = None;
+    source
+        .split('\n')
+        .map(|line| highlight_python_line(line, &mut string_state))
+        .collect()
+}
+
+fn highlight_python_line(
+    line: &str,
+    string_state: &mut Option<PythonStringState>,
+) -> Vec<Span<'static>> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    let mut expects_definition_name = false;
+
+    if let Some(state) = *string_state {
+        let quote = match state {
+            PythonStringState::TripleSingle => '\'',
+            PythonStringState::TripleDouble => '"',
+        };
+        if let Some(end) = find_triple_quote_end(&chars, 0, quote) {
+            push_python_span(&mut spans, &chars[0..end], python_string_style());
+            index = end;
+            *string_state = None;
+        } else {
+            push_python_span(&mut spans, &chars, python_string_style());
+            return spans;
+        }
+    }
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() {
+            let end = take_while(&chars, index, char::is_whitespace);
+            push_python_span(&mut spans, &chars[index..end], python_plain_style());
+            index = end;
+            continue;
+        }
+        if ch == '#' {
+            push_python_span(&mut spans, &chars[index..], python_comment_style());
+            break;
+        }
+        if ch == '@' && chars[..index].iter().all(|ch| ch.is_whitespace()) {
+            let mut end = index + 1;
+            while end < chars.len()
+                && (is_python_identifier_continue(chars[end]) || chars[end] == '.')
+            {
+                end += 1;
+            }
+            push_python_span(&mut spans, &chars[index..end], python_decorator_style());
+            index = end;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            let (end, state) = scan_python_string(&chars, index);
+            push_python_span(&mut spans, &chars[index..end], python_string_style());
+            *string_state = state;
+            index = end;
+            continue;
+        }
+        if is_python_identifier_start(ch) {
+            let end = take_while(&chars, index + 1, is_python_identifier_continue);
+            let token = chars[index..end].iter().collect::<String>();
+            if is_python_string_prefix(&token)
+                && end < chars.len()
+                && matches!(chars[end], '\'' | '"')
+            {
+                let (string_end, state) = scan_python_string(&chars, end);
+                push_python_span(&mut spans, &chars[index..string_end], python_string_style());
+                *string_state = state;
+                index = string_end;
+                continue;
+            }
+
+            let style = if expects_definition_name {
+                expects_definition_name = false;
+                python_definition_style()
+            } else if is_python_keyword(&token) {
+                if matches!(token.as_str(), "def" | "class") {
+                    expects_definition_name = true;
+                }
+                python_keyword_style()
+            } else if is_python_builtin(&token) || next_non_space_is_call(&chars, end) {
+                python_builtin_style()
+            } else {
+                python_plain_style()
+            };
+            push_python_span(&mut spans, &chars[index..end], style);
+            index = end;
+            continue;
+        }
+        if ch.is_ascii_digit()
+            || (ch == '.'
+                && chars
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_digit()))
+        {
+            let end = scan_python_number(&chars, index);
+            push_python_span(&mut spans, &chars[index..end], python_number_style());
+            index = end;
+            continue;
+        }
+        if is_python_operator(ch) {
+            let end = take_while(&chars, index + 1, is_python_operator);
+            push_python_span(&mut spans, &chars[index..end], python_operator_style());
+            index = end;
+            continue;
+        }
+
+        push_python_span(&mut spans, std::slice::from_ref(&ch), python_plain_style());
+        index += 1;
+    }
+    spans
+}
+
+fn take_while(chars: &[char], mut index: usize, predicate: fn(char) -> bool) -> usize {
+    while index < chars.len() && predicate(chars[index]) {
+        index += 1;
+    }
+    index
+}
+
+fn scan_python_string(chars: &[char], quote_index: usize) -> (usize, Option<PythonStringState>) {
+    let quote = chars[quote_index];
+    let triple =
+        chars.get(quote_index + 1) == Some(&quote) && chars.get(quote_index + 2) == Some(&quote);
+    if triple {
+        if let Some(end) = find_triple_quote_end(chars, quote_index + 3, quote) {
+            return (end, None);
+        }
+        let state = if quote == '\'' {
+            PythonStringState::TripleSingle
+        } else {
+            PythonStringState::TripleDouble
+        };
+        return (chars.len(), Some(state));
+    }
+
+    let mut index = quote_index + 1;
+    while index < chars.len() {
+        if chars[index] == quote && !python_quote_is_escaped(chars, index) {
+            return (index + 1, None);
+        }
+        index += 1;
+    }
+    (chars.len(), None)
+}
+
+fn find_triple_quote_end(chars: &[char], mut index: usize, quote: char) -> Option<usize> {
+    while index + 2 < chars.len() {
+        if chars[index] == quote
+            && chars[index + 1] == quote
+            && chars[index + 2] == quote
+            && !python_quote_is_escaped(chars, index)
+        {
+            return Some(index + 3);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn python_quote_is_escaped(chars: &[char], index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut cursor = index;
+    while cursor > 0 && chars[cursor - 1] == '\\' {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+fn scan_python_number(chars: &[char], mut index: usize) -> usize {
+    index += 1;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_ascii_alphanumeric()
+            || matches!(ch, '_' | '.')
+            || (matches!(ch, '+' | '-') && index > 0 && matches!(chars[index - 1], 'e' | 'E'))
+        {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    index
+}
+
+fn next_non_space_is_call(chars: &[char], mut index: usize) -> bool {
+    while chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+        index += 1;
+    }
+    chars.get(index) == Some(&'(')
+}
+
+fn is_python_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_alphabetic()
+}
+
+fn is_python_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+fn is_python_string_prefix(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "r" | "u" | "b" | "f" | "br" | "rb" | "fr" | "rf"
+    )
+}
+
+fn is_python_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "case"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "match"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "type"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+fn is_python_builtin(token: &str) -> bool {
+    matches!(
+        token,
+        "bool"
+            | "bytes"
+            | "dict"
+            | "enumerate"
+            | "filter"
+            | "float"
+            | "int"
+            | "len"
+            | "list"
+            | "map"
+            | "open"
+            | "print"
+            | "range"
+            | "set"
+            | "str"
+            | "super"
+            | "tools"
+            | "tuple"
+            | "zip"
+    )
+}
+
+fn is_python_operator(ch: char) -> bool {
+    matches!(
+        ch,
+        '+' | '-' | '*' | '/' | '%' | '@' | '&' | '|' | '^' | '~' | '<' | '>' | '=' | '!' | ':'
+    )
+}
+
+fn push_python_span(spans: &mut Vec<Span<'static>>, chars: &[char], style: Style) {
+    if !chars.is_empty() {
+        spans.push(Span::styled(chars.iter().collect::<String>(), style));
+    }
+}
+
+fn python_plain_style() -> Style {
+    Style::default().fg(TEXT)
+}
+
+fn python_keyword_style() -> Style {
+    Style::default().fg(PURPLE).bold()
+}
+
+fn python_definition_style() -> Style {
+    Style::default().fg(CYAN).bold()
+}
+
+fn python_builtin_style() -> Style {
+    Style::default().fg(CYAN)
+}
+
+fn python_string_style() -> Style {
+    Style::default().fg(GREEN)
+}
+
+fn python_comment_style() -> Style {
+    Style::default().fg(MUTED).italic()
+}
+
+fn python_number_style() -> Style {
+    Style::default().fg(CYAN)
+}
+
+fn python_decorator_style() -> Style {
+    Style::default().fg(YELLOW).bold()
+}
+
+fn python_operator_style() -> Style {
+    Style::default().fg(YELLOW)
+}
+
 #[derive(Debug, Clone)]
 enum Modal {
     Help,
@@ -670,10 +1046,7 @@ impl AppState {
                             via_code_mode: false,
                             status: ActivityStatus::Running,
                             timestamp: "saved".to_string(),
-                            input: truncate_middle(
-                                &serde_json::to_string(input).unwrap_or_default(),
-                                self.max_display_chars,
-                            ),
+                            input: tool_input_preview(name, input, self.max_display_chars),
                             output: String::new(),
                         });
                     }
@@ -1049,10 +1422,7 @@ impl AppState {
                     via_code_mode,
                     status: ActivityStatus::Running,
                     timestamp: Self::timestamp(),
-                    input: truncate_middle(
-                        &serde_json::to_string(&input).unwrap_or_default(),
-                        self.max_display_chars,
-                    ),
+                    input: tool_input_preview(&name, &input, self.max_display_chars),
                     output: String::new(),
                 });
                 self.active_tools.push((name, index));
@@ -2412,16 +2782,55 @@ fn render_activity(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
             Span::styled(name, Style::default().fg(YELLOW).bold()),
             Span::styled(format!("  {}", item.timestamp), Style::default().fg(MUTED)),
         ])];
-        let detail = if item.output.is_empty() {
-            &item.input
+        if source_tool_spec(&item.name).is_some() {
+            let source_lines = if item.name == "python" {
+                item.input
+                    .split('\n')
+                    .zip(highlight_python_source(&item.input))
+                    .filter(|(line, _)| !line.trim().is_empty())
+                    .map(|(_, spans)| spans)
+                    .collect::<Vec<_>>()
+            } else {
+                item.input
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| vec![Span::styled(line.to_string(), python_plain_style())])
+                    .collect::<Vec<_>>()
+            };
+            for (index, source_spans) in source_lines.iter().take(2).enumerate() {
+                let prefix = if item.name == "bash" && index == 0 {
+                    "  $ "
+                } else {
+                    "  │ "
+                };
+                let mut highlighted = vec![Span::styled(prefix, Style::default().fg(MUTED))];
+                highlighted.extend(source_spans.iter().cloned());
+                lines.push(Line::from(highlighted));
+            }
+            if source_lines.len() > 2 {
+                lines.push(Line::from(Span::styled(
+                    "  │ …",
+                    Style::default().fg(MUTED),
+                )));
+            }
+            if let Some(first) = item.output.lines().find(|line| !line.trim().is_empty()) {
+                lines.push(Line::from(Span::styled(
+                    format!("  ↳ {}", truncate_middle(first, 116)),
+                    Style::default().fg(MUTED),
+                )));
+            }
         } else {
-            &item.output
-        };
-        if let Some(first) = detail.lines().find(|line| !line.trim().is_empty()) {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", truncate_middle(first, 120)),
-                Style::default().fg(MUTED),
-            )));
+            let detail = if item.output.is_empty() {
+                &item.input
+            } else {
+                &item.output
+            };
+            if let Some(first) = detail.lines().find(|line| !line.trim().is_empty()) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", truncate_middle(first, 120)),
+                    Style::default().fg(MUTED),
+                )));
+            }
         }
         ListItem::new(lines).style(Style::default().bg(PANEL))
     }));
@@ -3045,7 +3454,7 @@ fn render_permission(
                 Block::new()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(BORDER))
-                    .title(" Input "),
+                    .title(format!(" {} ", permission_detail_title(request))),
             )
             .style(Style::default().fg(TEXT).bg(PANEL)),
         detail_area,
@@ -3219,6 +3628,9 @@ fn reasoning_text(entries: &[ReasoningEntry]) -> Text<'static> {
 }
 
 fn permission_detail(request: &ToolExecutionRequest) -> Text<'static> {
+    if let Some(source) = source_tool_input(&request.tool_name, &request.input) {
+        return source_permission_detail(source, &request.input);
+    }
     let diff = (request.tool_name == "patch_file")
         .then(|| request.input.get("diff").and_then(Value::as_str))
         .flatten();
@@ -3254,6 +3666,82 @@ fn permission_detail(request: &ToolExecutionRequest) -> Text<'static> {
                 .unwrap_or_else(|_| request.input.to_string()),
         ))
     }
+}
+
+fn permission_detail_title(request: &ToolExecutionRequest) -> &'static str {
+    source_tool_input(&request.tool_name, &request.input)
+        .map(|source| source.title)
+        .unwrap_or(if request.tool_name == "patch_file" {
+            "Proposed changes"
+        } else {
+            "Input"
+        })
+}
+
+fn source_permission_detail(source: SourceToolInput<'_>, input: &Value) -> Text<'static> {
+    let source_text = sanitize_terminal_text(source.source);
+    let source_lines = if source.field == "code" {
+        highlight_python_source(&source_text)
+    } else {
+        source_text
+            .split('\n')
+            .map(|line| vec![Span::styled(line.to_string(), python_plain_style())])
+            .collect::<Vec<_>>()
+    };
+    let number_width = source_lines.len().max(1).to_string().len();
+    let mut lines = Vec::new();
+    if source.source.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("(empty {})", source.field),
+            Style::default().fg(RED),
+        )));
+    } else {
+        for (index, source_spans) in source_lines.into_iter().enumerate() {
+            let mut highlighted = vec![Span::styled(
+                format!("{:>number_width$} │ ", index + 1),
+                Style::default().fg(MUTED),
+            )];
+            highlighted.extend(source_spans);
+            lines.push(Line::from(highlighted));
+        }
+    }
+
+    let option_lines = source_option_lines(input, source.field);
+    if !option_lines.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Options",
+            Style::default().fg(PURPLE).bold(),
+        )));
+        lines.extend(option_lines.into_iter().map(|line| {
+            Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(MUTED),
+            ))
+        }));
+    }
+    Text::from(lines)
+}
+
+fn source_option_lines(input: &Value, source_field: &str) -> Vec<String> {
+    let Some(input) = input.as_object() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for (key, value) in input.iter().filter(|(key, _)| key.as_str() != source_field) {
+        let key = sanitize_terminal_text(key);
+        let rendered = match value {
+            Value::String(value) => sanitize_terminal_text(value),
+            _ => sanitize_terminal_text(
+                &serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+            ),
+        };
+        let mut rendered_lines = rendered.split('\n');
+        let first = rendered_lines.next().unwrap_or_default();
+        lines.push(format!("{key}: {first}"));
+        lines.extend(rendered_lines.map(|line| format!("  {line}")));
+    }
+    lines
 }
 
 fn panel_block<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
@@ -3558,6 +4046,40 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use serde_json::json;
+
+    fn plain_text(text: &Text<'_>) -> String {
+        text.lines
+            .iter()
+            .map(|line| {
+                line.spans.iter().fold(String::new(), |mut text, span| {
+                    text.push_str(span.content.as_ref());
+                    text
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn highlighted_plain(lines: &[Vec<Span<'static>>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.iter().fold(String::new(), |mut text, span| {
+                    text.push_str(span.content.as_ref());
+                    text
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn highlighted_span<'a>(lines: &'a [Vec<Span<'static>>], content: &str) -> &'a Span<'static> {
+        lines
+            .iter()
+            .flatten()
+            .find(|span| span.content.as_ref() == content)
+            .unwrap_or_else(|| panic!("missing highlighted token {content:?}"))
+    }
 
     #[test]
     fn editor_operations_are_unicode_safe() {
@@ -4255,6 +4777,132 @@ mod tests {
         assert!(copy_mode_toggle_key(true, escape));
         assert!(!copy_mode_toggle_key(false, escape));
         assert!(!copy_mode_toggle_key(true, ordinary));
+    }
+
+    #[test]
+    fn executable_inputs_are_reviewed_as_sanitized_source_instead_of_json() {
+        let python_input = json!({
+            "code": "import tools\nprint(\"ok\")\nprint(\"\u{1b}[31m\")",
+            "timeout_seconds": 45
+        });
+        let preview = tool_input_preview("python", &python_input, 2_000);
+        assert!(preview.starts_with("import tools\nprint(\"ok\")"));
+        assert!(preview.contains("␛[31m"));
+        assert!(!preview.contains('\u{1b}'));
+        assert!(!preview.contains("\\n"));
+        assert!(!preview.contains("\"code\""));
+
+        let request = ToolExecutionRequest {
+            tool_use_id: "python-call".into(),
+            tool_name: "python".into(),
+            input: python_input,
+            tool_description: "run code".into(),
+        };
+        assert_eq!(permission_detail_title(&request), "Python source");
+        let detail = plain_text(&permission_detail(&request));
+        assert!(detail.contains("1 │ import tools"));
+        assert!(detail.contains("2 │ print(\"ok\")"));
+        assert!(detail.contains("3 │ print(\"␛[31m\")"));
+        assert!(detail.contains("Options\n  timeout_seconds: 45"));
+        assert!(!detail.contains("\\n"));
+
+        let bash_input = json!({"command": "cargo test --locked\necho done"});
+        assert_eq!(
+            tool_input_preview("bash", &bash_input, 2_000),
+            "cargo test --locked\necho done"
+        );
+        let request = ToolExecutionRequest {
+            tool_use_id: "bash-call".into(),
+            tool_name: "bash".into(),
+            input: bash_input,
+            tool_description: "run command".into(),
+        };
+        assert_eq!(permission_detail_title(&request), "Shell command");
+        let detail = plain_text(&permission_detail(&request));
+        assert!(detail.contains("1 │ cargo test --locked"));
+        assert!(detail.contains("2 │ echo done"));
+    }
+
+    #[test]
+    fn python_highlighting_preserves_source_and_styles_lexical_roles() {
+        let source = "@cached\nasync def greet(name: str = \"world\"):\n    # explain\n    return print(f\"hello {name}\", 3.14)\ntext = '''alpha\nreturn remains string\n''' + \"done\"";
+        let highlighted = highlight_python_source(source);
+
+        assert_eq!(highlighted_plain(&highlighted), source);
+        let decorator = highlighted_span(&highlighted, "@cached");
+        assert_eq!(decorator.style.fg, Some(YELLOW));
+        assert!(decorator.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            highlighted_span(&highlighted, "async").style.fg,
+            Some(PURPLE)
+        );
+        assert_eq!(highlighted_span(&highlighted, "def").style.fg, Some(PURPLE));
+        let definition = highlighted_span(&highlighted, "greet");
+        assert_eq!(definition.style.fg, Some(CYAN));
+        assert!(definition.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(highlighted_span(&highlighted, "print").style.fg, Some(CYAN));
+        assert_eq!(
+            highlighted_span(&highlighted, "\"world\"").style.fg,
+            Some(GREEN)
+        );
+        assert_eq!(
+            highlighted_span(&highlighted, "f\"hello {name}\"").style.fg,
+            Some(GREEN)
+        );
+        let comment = highlighted_span(&highlighted, "# explain");
+        assert_eq!(comment.style.fg, Some(MUTED));
+        assert!(comment.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(highlighted_span(&highlighted, "3.14").style.fg, Some(CYAN));
+        assert_eq!(highlighted_span(&highlighted, "=").style.fg, Some(YELLOW));
+        assert_eq!(
+            highlighted_span(&highlighted, "return remains string")
+                .style
+                .fg,
+            Some(GREEN)
+        );
+        assert_eq!(
+            highlighted_span(&highlighted, "'''alpha").style.fg,
+            Some(GREEN)
+        );
+        assert_eq!(highlighted_span(&highlighted, "'''").style.fg, Some(GREEN));
+    }
+
+    #[test]
+    fn activity_keeps_source_previews_visible_after_tools_finish() {
+        let mut app = AppState::new("api", "model");
+        app.apply_agent_event(AgentEvent::ToolCallStarted {
+            name: "python".into(),
+            input: json!({"code": "import tools\nprint(\"ok\")\nprint(\"later\")"}),
+        });
+        app.apply_agent_event(AgentEvent::ToolCallFinished {
+            name: "python".into(),
+            outcome: ToolCallOutcome::Success,
+            content: "script done".into(),
+        });
+        app.apply_agent_event(AgentEvent::ToolCallStarted {
+            name: "bash".into(),
+            input: json!({"command": "cargo test --locked"}),
+        });
+        app.apply_agent_event(AgentEvent::ToolCallFinished {
+            name: "bash".into(),
+            outcome: ToolCallOutcome::Success,
+            content: "tests passed".into(),
+        });
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_activity(frame, &app, frame.area()))
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("$ cargo test --locked"));
+        assert!(rendered.contains("↳ tests passed"));
+        assert!(rendered.contains("│ import tools"));
+        assert!(rendered.contains("│ print(\"ok\")"));
+        assert!(rendered.contains("│ …"));
+        assert!(rendered.contains("↳ script done"));
+        assert!(!rendered.contains("{\"code\""));
+        assert!(!rendered.contains("{\"command\""));
     }
 
     #[test]
