@@ -402,6 +402,16 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
 /// The caller should invoke this only when the cursor is at the end of the
 /// composer. Inputs containing a newline or a complete value-bearing argument
 /// return `None`, preserving the caller's ordinary Tab behavior. Leading
+/// Split a subcommand's arguments into its leading action word and the
+/// trimmed remainder — the one whitespace rule the subcommand grammar
+/// depends on.
+fn split_action(arguments: &str) -> (&str, &str) {
+    let action_end = arguments
+        .find(char::is_whitespace)
+        .unwrap_or(arguments.len());
+    (&arguments[..action_end], arguments[action_end..].trim())
+}
+
 /// horizontal whitespace is retained; canonical command/subcommand spelling
 /// is lowercase.
 pub fn complete_local_command(text: &str) -> Option<CommandCompletion> {
@@ -545,11 +555,7 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
         CommandKind::Load => LocalCommand::Load((!arguments.is_empty()).then_some(arguments)),
         CommandKind::Model => LocalCommand::Model,
         CommandKind::Mcp => {
-            let argument_end = arguments
-                .find(char::is_whitespace)
-                .unwrap_or(arguments.len());
-            let action = &arguments[..argument_end];
-            let value = arguments[argument_end..].trim();
+            let (action, value) = split_action(arguments);
             let mcp = if arguments.is_empty() || action.eq_ignore_ascii_case("status") {
                 value.is_empty().then_some(McpCommand::Status)
             } else if action.eq_ignore_ascii_case("retry") {
@@ -593,11 +599,7 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
             }
         }
         CommandKind::Permissions => {
-            let argument_end = arguments
-                .find(char::is_whitespace)
-                .unwrap_or(arguments.len());
-            let action = &arguments[..argument_end];
-            let value = arguments[argument_end..].trim();
+            let (action, value) = split_action(arguments);
             let permission = if arguments.is_empty() || action.eq_ignore_ascii_case("list") {
                 value.is_empty().then_some(PermissionCommand::List)
             } else if action.eq_ignore_ascii_case("clear") {
@@ -616,11 +618,7 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
             }
         }
         CommandKind::Tools => {
-            let argument_end = arguments
-                .find(char::is_whitespace)
-                .unwrap_or(arguments.len());
-            let action = &arguments[..argument_end];
-            let value = arguments[argument_end..].trim();
+            let (action, value) = split_action(arguments);
             let tools = if arguments.is_empty() || action.eq_ignore_ascii_case("list") {
                 value.is_empty().then_some(ToolsCommand::List)
             } else if action.eq_ignore_ascii_case("search") && !value.is_empty() {
@@ -639,11 +637,7 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
             }
         }
         CommandKind::History => {
-            let argument_end = arguments
-                .find(char::is_whitespace)
-                .unwrap_or(arguments.len());
-            let action = &arguments[..argument_end];
-            let value = arguments[argument_end..].trim();
+            let (action, value) = split_action(arguments);
             let history = if arguments.is_empty() || action.eq_ignore_ascii_case("list") {
                 value.is_empty().then_some(HistoryCommand::List)
             } else if action.eq_ignore_ascii_case("search") && !value.is_empty() {
@@ -673,11 +667,7 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
             LocalCommand::Goal(goal)
         }
         CommandKind::Memory => {
-            let argument_end = arguments
-                .find(char::is_whitespace)
-                .unwrap_or(arguments.len());
-            let action = &arguments[..argument_end];
-            let value = arguments[argument_end..].trim();
+            let (action, value) = split_action(arguments);
             let memory = if arguments.is_empty() || action.eq_ignore_ascii_case("status") {
                 if value.is_empty() {
                     Some(MemoryCommand::Status)

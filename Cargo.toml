@@ -16,7 +16,7 @@ categories = ["command-line-utilities"]
 reqwest = { version = "0.13", features = ["json", "query"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 dialoguer = { version = "0.12", default-features = false }
@@ -26,6 +26,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 unicode-width = "0.2"
 dotenvy = "0.15.7"
 exmex = "0.21"
+libc = "0.2"
 uuid = { version = "1.24.0", features = ["v4", "v5"] }
 tempfile = "3.27"
 firecrawl = "2.12.1"

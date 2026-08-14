@@ -8,32 +8,32 @@ use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
     conversation_transcript, history_tool_protocol_is_valid, is_local_command,
     latest_assistant_reasoning, latest_assistant_text, parse_local_command, truncate_middle, Agent,
-    AgentEvent, ArchivedConversation, ArchivedConversationEvent, CopyCommand, DeliveryMode,
-    Episode, EpisodeEvent, EpisodeOutcome, EpisodicMemory, Error, ForgetResult, GoalCommand,
+    AgentEvent, CopyCommand, DeliveryMode, EpisodeOutcome, EpisodicMemory, Error, GoalCommand,
     HistoryCommand, HistoryStore, LocalCommand, McpCommand, MemoryCommand, MemoryEvent,
     MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt, PermissionChoice,
-    PermissionCommand, PermissionRequest, PermissionUiEvent, ProfilePaths, PromptQueue,
-    PromptSource, Result, SavedState, ToolDef, ToolRegistry, ToolsCommand, TurnControl,
-    TurnOutcome, UsageCommand, WorkspaceScope,
+    PermissionRequest, PermissionUiEvent, ProfilePaths, PromptQueue, PromptSource, Result,
+    SavedState, ToolRegistry, TurnControl, TurnOutcome, UsageCommand, WorkspaceScope,
 };
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+
+mod commands;
+mod display_channel;
+
+use commands::*;
+use display_channel::*;
 
 const AUTOSAVE_NAME: &str = "autosave";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
-const MAX_PENDING_STREAM_BYTES: usize = 16 * 1024;
 const THIRD_PARTY_LICENSES: &str = include_str!("../THIRD_PARTY_LICENSES.txt");
 
 fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
@@ -58,37 +58,6 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| Error::Other(format!("Failed to flush {}: {error}", parent.display())))
-}
-
-fn write_memory_export(directory: &Path, episodes: &[Episode]) -> Result<PathBuf> {
-    fs::create_dir_all(directory).map_err(|error| {
-        Error::Other(format!(
-            "Failed to create export directory {}: {error}",
-            directory.display()
-        ))
-    })?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
-        Error::Other(format!(
-            "Failed to restrict export directory {}: {error}",
-            directory.display()
-        ))
-    })?;
-    let export_id = uuid::Uuid::new_v4().to_string();
-    let path = directory.join(format!(
-        "episodes-{}-{}.json",
-        chrono::Local::now().format("%Y%m%d-%H%M%S"),
-        &export_id[..8]
-    ));
-    let contents = serde_json::to_vec_pretty(episodes)
-        .map_err(|error| Error::Other(format!("Failed to serialize episode export: {error}")))?;
-    write_atomically(&path, &contents)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-        Error::Other(format!(
-            "Failed to restrict episode export {}: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(path)
 }
 
 struct ApiKeys {
@@ -233,41 +202,134 @@ fn make_saved_state(
     }
 }
 
-fn save_named_session(
+async fn save_named_session(
     name: &str,
     agent: &Agent,
     permission_handler: &MemoryPermissionHandler,
     queue: &PromptQueue,
     history_store: &HistoryStore,
 ) -> Result<PathBuf> {
-    history_store.save(
-        &make_saved_state(agent, permission_handler, queue, history_store.scope()),
-        name,
-    )
+    let state = make_saved_state(agent, permission_handler, queue, history_store.scope());
+    let name = name.to_string();
+    with_history_store(history_store, move |store| store.save(&state, &name)).await?
 }
 
-fn save_new_named_session(
+async fn save_new_named_session(
     name: &str,
     agent: &Agent,
     permission_handler: &MemoryPermissionHandler,
     queue: &PromptQueue,
     history_store: &HistoryStore,
 ) -> Result<Option<PathBuf>> {
-    history_store.save_if_absent(
-        &make_saved_state(agent, permission_handler, queue, history_store.scope()),
-        name,
-    )
+    let state = make_saved_state(agent, permission_handler, queue, history_store.scope());
+    let name = name.to_string();
+    with_history_store(history_store, move |store| {
+        store.save_if_absent(&state, &name)
+    })
+    .await?
 }
 
-fn load_named_session(
+/// The `/save` flow: resolve a name (prompting when absent), refuse the
+/// reserved autosave name, and confirm before replacing an existing save.
+async fn run_save_command(
+    ctx: &mut ReactorCtx<'_>,
+    agent: &Agent,
+    name: Option<&str>,
+) -> Result<()> {
+    let prompted_name = if name.is_none() {
+        let default = format!("chat_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+        terminal(ctx.ui.prompt("Save conversation as", &default).await)?
+    } else {
+        None
+    };
+    let Some(name) = name
+        .map(str::to_string)
+        .or(prompted_name)
+        .map(|name| name.trim().to_string())
+    else {
+        return Ok(());
+    };
+    if name == AUTOSAVE_NAME {
+        ctx.ui.error(
+            "The live autosave name is reserved; choose another name for a durable checkpoint.",
+        );
+        return Ok(());
+    }
+    match save_new_named_session(
+        &name,
+        agent,
+        ctx.permission_handler,
+        ctx.queue,
+        ctx.history_store,
+    )
+    .await
+    {
+        Ok(Some(path)) => {
+            ctx.ui
+                .info(&format!("Saved session '{name}' to {}", path.display()));
+            return Ok(());
+        }
+        Err(error) => {
+            ctx.ui.error(&format!("Failed to save '{name}': {error}"));
+            return Ok(());
+        }
+        Ok(None) => {}
+    }
+
+    // The name is taken: confirm replacement of a valid current-scope save.
+    let requested = name.clone();
+    let existing = with_history_store(ctx.history_store, move |store| {
+        store.inspect_current_archive(&requested)
+    })
+    .await
+    .and_then(|result| result);
+    match existing {
+        Err(error) => ctx
+            .ui
+            .error(&format!("Saved-session replacement refused: {error}")),
+        Ok(None) => ctx.ui.error(&format!(
+            "A path for saved session '{name}' already exists but is not a valid current-scope \
+             save; refusing to overwrite it."
+        )),
+        Ok(Some(_)) => {
+            let choices = vec!["Cancel".to_string(), format!("Replace '{name}'")];
+            let title = format!(
+                "Replace saved session '{name}'? The prior checkpoint will be overwritten."
+            );
+            if terminal(ctx.ui.select(&title, &choices).await)? == Some(1) {
+                match save_named_session(
+                    &name,
+                    agent,
+                    ctx.permission_handler,
+                    ctx.queue,
+                    ctx.history_store,
+                )
+                .await
+                {
+                    Ok(path) => ctx.ui.info(&format!(
+                        "Replaced saved session '{name}' at {}",
+                        path.display()
+                    )),
+                    Err(error) => ctx.ui.error(&format!(
+                        "Failed to replace saved session '{name}': {error}"
+                    )),
+                }
+            } else {
+                ctx.ui
+                    .info(&format!("Kept existing saved session '{name}'."));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn load_named_session(
+    ctx: &mut ReactorCtx<'_>,
     name: &str,
     agent: &mut Agent,
-    ui: &mut TerminalUi,
-    queue: &PromptQueue,
-    history_store: &HistoryStore,
-    permission_handler: &MemoryPermissionHandler,
     keys: &ApiKeys,
 ) -> Result<usize> {
+    let requested = name.to_string();
     let SavedState {
         scope: _,
         provider,
@@ -277,7 +339,7 @@ fn load_named_session(
         always_allow_tools,
         always_deny_tools,
         queued_prompts,
-    } = history_store.load(name)?;
+    } = with_history_store(ctx.history_store, move |store| store.load(&requested)).await??;
     if !history_tool_protocol_is_valid(&conversation_history) {
         return Err(Error::Other(
             "Saved conversation has an unpaired tool use/result; refusing to load it".to_string(),
@@ -285,24 +347,26 @@ fn load_named_session(
     }
     match build_provider(keys, &provider, model) {
         Ok(provider) => agent.set_provider(provider),
-        Err(error) => ui.error(&format!(
+        Err(error) => ctx.ui.error(&format!(
             "Saved API '{provider}' is unavailable ({error}); keeping the current API."
         )),
     }
-    permission_handler.replace_remembered_policy(always_allow_tools, always_deny_tools);
+    ctx.permission_handler
+        .replace_remembered_policy(always_allow_tools, always_deny_tools);
     agent.set_goal(goal);
     agent.replace_history(conversation_history);
-    queue.replace(queued_prompts);
-    queue.reconcile_goal_continuation(agent.goal().is_some());
-    ui.load_history(agent.history());
-    ui.set_goal(agent.goal());
-    ui.sync_queue(queue);
-    ui.set_session(
+    ctx.queue.replace(queued_prompts);
+    ctx.queue
+        .reconcile_goal_continuation(agent.goal().is_some());
+    ctx.ui.load_history(agent.history());
+    ctx.ui.set_goal(agent.goal());
+    ctx.ui.sync_queue(ctx.queue);
+    ctx.ui.set_session(
         agent.provider().display_name(),
         agent.provider().model(),
         agent.registry.tool_names().len(),
     );
-    ui.set_context_tokens(agent.context_tokens());
+    ctx.ui.set_context_tokens(agent.context_tokens());
     Ok(agent.history().len())
 }
 
@@ -336,28 +400,202 @@ impl DurableBoundary {
         }
     }
 
-    fn save(
+    /// The complete autosave state as of this boundary.
+    fn snapshot(
         &self,
         history_store: &HistoryStore,
         permission_handler: &MemoryPermissionHandler,
         queue: &PromptQueue,
-    ) -> Result<()> {
+    ) -> SavedState {
         let policy = permission_handler.remembered_policy();
-        history_store.save(
-            &SavedState {
-                scope: history_store.scope().clone(),
-                provider: self.provider.clone(),
-                model: self.model.clone(),
-                goal: self.goal.clone(),
-                conversation_history: self.history.clone(),
-                always_allow_tools: policy.always_allow,
-                always_deny_tools: policy.always_deny,
-                queued_prompts: queue.snapshot(),
-            },
-            AUTOSAVE_NAME,
-        )?;
-        Ok(())
+        SavedState {
+            scope: history_store.scope().clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            goal: self.goal.clone(),
+            conversation_history: self.history.clone(),
+            always_allow_tools: policy.always_allow,
+            always_deny_tools: policy.always_deny,
+            queued_prompts: queue.snapshot(),
+        }
     }
+}
+
+enum AutosaveMessage {
+    Save(Box<SavedState>),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// Writes autosave snapshots on a dedicated thread so their fsyncs never
+/// stall the single-threaded UI reactor.
+///
+/// Saves are coalesced: when the writer falls behind, only the newest queued
+/// snapshot is written — each snapshot is the complete autosave state, so a
+/// later one strictly supersedes an earlier one. Write failures surface
+/// through [`AutosaveWriter::drain_errors`] at the next reactor tick.
+struct AutosaveWriter {
+    sender: std::sync::mpsc::Sender<AutosaveMessage>,
+    errors: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl AutosaveWriter {
+    fn spawn(store: HistoryStore) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<AutosaveMessage>();
+        let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let worker_errors = Arc::clone(&errors);
+        let spawned = std::thread::Builder::new()
+            .name("generalist-autosave".to_string())
+            .spawn(move || {
+                while let Ok(message) = receiver.recv() {
+                    let mut latest = None;
+                    let mut flushes = Vec::new();
+                    let mut pending = Some(message);
+                    while let Some(message) = pending.take() {
+                        match message {
+                            AutosaveMessage::Save(state) => latest = Some(state),
+                            AutosaveMessage::Flush(done) => flushes.push(done),
+                        }
+                        pending = receiver.try_recv().ok();
+                    }
+                    if let Some(state) = latest {
+                        if let Err(error) = store.save(&state, AUTOSAVE_NAME) {
+                            worker_errors
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(format!("Failed to persist autosave: {error}"));
+                        }
+                    }
+                    for done in flushes {
+                        let _ = done.send(());
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!(
+                    "Autosave writer failed to start; conversation autosave is disabled: {error}"
+                ));
+        }
+        Self { sender, errors }
+    }
+
+    /// Queue the newest snapshot; never blocks the reactor.
+    fn save(&self, state: SavedState) {
+        if self
+            .sender
+            .send(AutosaveMessage::Save(Box::new(state)))
+            .is_err()
+        {
+            let message = "Autosave writer stopped; conversation autosave is disabled.";
+            let mut errors = self
+                .errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !errors.iter().any(|error| error == message) {
+                errors.push(message.to_string());
+            }
+        }
+    }
+
+    /// Surface any accumulated writer errors through the UI.
+    fn drain_errors(&self, ui: &mut TerminalUi) {
+        for error in self.take_errors() {
+            ui.error(&error);
+        }
+    }
+
+    fn take_errors(&self) -> Vec<String> {
+        let mut errors = self
+            .errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        errors.drain(..).collect()
+    }
+
+    /// Wait until every snapshot queued before this call reached disk.
+    fn flush(&self) -> Result<()> {
+        let (done, wait) = std::sync::mpsc::sync_channel(1);
+        if self.sender.send(AutosaveMessage::Flush(done)).is_err() {
+            let mut errors = self.take_errors();
+            errors.push("Autosave writer stopped before shutdown flush.".to_string());
+            return Err(Error::Other(errors.join("\n")));
+        }
+        match wait.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(Error::Other(
+                    "Timed out waiting for the autosave shutdown flush.".to_string(),
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Other(
+                    "Autosave writer stopped during the shutdown flush.".to_string(),
+                ));
+            }
+        }
+        let errors = self.take_errors();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Other(errors.join("\n")))
+        }
+    }
+}
+
+/// Deny a stale interactive permission request and surface automatic
+/// decisions. Used by every reactor that has no active turn to route
+/// permission requests to.
+fn handle_stale_permission_event(ui: &mut TerminalUi, event: PermissionUiEvent) {
+    match event {
+        PermissionUiEvent::Request(request) => {
+            let _ = request.reply.send(PermissionChoice::DenyOnce);
+            ui.error("Ignored a stale permission request with no active turn.");
+        }
+        PermissionUiEvent::Automatic { request, allowed } => {
+            note_automatic_permission(ui, &request.tool_name, allowed);
+        }
+    }
+}
+
+/// One shared wording for "a remembered policy decided this without a
+/// prompt", so every reactor reports it identically.
+fn note_automatic_permission(ui: &mut TerminalUi, tool_name: &str, allowed: bool) {
+    ui.status(&format!(
+        "{} was {} by remembered policy",
+        tool_name,
+        if allowed {
+            "auto-allowed"
+        } else {
+            "auto-denied"
+        }
+    ));
+}
+
+/// The shared 50ms reactor tick: surface background autosave errors, advance
+/// animations, and redraw when dirty.
+fn reactor_tick(ui: &mut TerminalUi, autosave: &AutosaveWriter) -> Result<()> {
+    autosave.drain_errors(ui);
+    ui.tick();
+    ui.draw_if_dirty()
+        .map_err(|error| Error::Other(error.to_string()))
+}
+
+/// The stable bundle of collaborators threaded through every reactor loop.
+///
+/// Every drive loop destructures this at entry (tokio::select! needs
+/// disjoint field borrows), so the struct's job is keeping the loop
+/// signatures uniform and small.
+struct ReactorCtx<'a> {
+    ui: &'a mut TerminalUi,
+    queue: &'a PromptQueue,
+    history_store: &'a HistoryStore,
+    permission_handler: &'a MemoryPermissionHandler,
+    permission_rx: &'a mut mpsc::UnboundedReceiver<PermissionUiEvent>,
+    memory_events: &'a mut mpsc::UnboundedReceiver<MemoryEvent>,
+    memory: Option<&'a EpisodicMemory>,
+    autosave: &'a AutosaveWriter,
 }
 
 struct StartupRecoveryPlan {
@@ -594,20 +832,25 @@ fn recover_startup_runtime(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn drive_mcp_discovery(
+    ctx: &mut ReactorCtx<'_>,
     registry: &mut ToolRegistry,
     config: &McpConfig,
     runtime: &mut McpRuntime,
     targets: &BTreeSet<String>,
-    ui: &mut TerminalUi,
-    queue: &PromptQueue,
-    history_store: &HistoryStore,
-    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
-    permission_handler: &MemoryPermissionHandler,
-    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
     durable: &DurableBoundary,
 ) -> Result<bool> {
+    let ReactorCtx {
+        ui,
+        queue,
+        history_store,
+        permission_handler,
+        permission_rx,
+        memory_events,
+        autosave,
+        ..
+    } = ctx;
+    let ui: &mut TerminalUi = ui;
     runtime.mark_connecting(targets);
     let base_bridge_count = registry.tool_names().len();
     ui.set_bridge_count(base_bridge_count);
@@ -644,25 +887,10 @@ async fn drive_mcp_discovery(
                 }
                 reports = &mut discovery => break (false, false, Some(reports)),
                 Some(permission_event) = permission_rx.recv() => {
-                    match permission_event {
-                        PermissionUiEvent::Request(request) => {
-                            let _ = request.reply.send(PermissionChoice::DenyOnce);
-                            ui.error("Ignored a stale permission request with no active turn.");
-                        }
-                        PermissionUiEvent::Automatic { request, allowed } => {
-                            ui.status(&format!(
-                                "{} was {} by remembered policy",
-                                request.tool_name,
-                                if allowed { "auto-allowed" } else { "auto-denied" }
-                            ));
-                        }
-                    }
+                    handle_stale_permission_event(ui, permission_event);
                 }
                 Some(event) = memory_events.recv() => handle_memory_event(ui, event),
-                _ = ticker.tick() => {
-                    ui.tick();
-                    ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
-                }
+                _ = ticker.tick() => reactor_tick(ui, autosave)?,
                 terminal_event = ui.next_event() => {
                     let action = terminal(ui.handle_event(terminal(terminal_event)?, queue))?;
                     let persist_queue = action.requires_queue_persist();
@@ -677,13 +905,7 @@ async fn drive_mcp_discovery(
                         | UiAction::Permission { .. } => {}
                     }
                     if persist_queue {
-                        if let Err(error) = durable.save(
-                            history_store,
-                            permission_handler,
-                            queue,
-                        ) {
-                            ui.error(&format!("Failed to persist startup queue: {error}"));
-                        }
+                        autosave.save(durable.snapshot(history_store, permission_handler, queue));
                     }
                 }
             }
@@ -724,11 +946,29 @@ async fn drive_mcp_discovery(
     Ok(exit_requested)
 }
 
+/// After a driven operation settles, deliver every event still queued in
+/// the checkpoint and display channels before touching the agent again.
+fn drain_pending_agent_events(
+    checkpoint_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    event_rx: &AgentDisplayReceiver,
+    mut apply: impl FnMut(AgentEvent),
+) {
+    while let Ok(event) = checkpoint_rx.try_recv() {
+        apply(event);
+    }
+    while let Some(events) = event_rx.try_recv_batch() {
+        for event in events {
+            apply(event);
+        }
+    }
+}
+
 fn apply_runtime_event(
     ui: &mut TerminalUi,
     queue: &PromptQueue,
     history_store: &HistoryStore,
     permission_handler: &MemoryPermissionHandler,
+    autosave: &AutosaveWriter,
     durable: &mut DurableBoundary,
     event: AgentEvent,
 ) {
@@ -742,193 +982,12 @@ fn apply_runtime_event(
             ui.set_context_tokens(context_tokens);
             durable.history = history;
             durable.goal = goal;
-            if let Err(error) = durable.save(history_store, permission_handler, queue) {
-                ui.error(&format!("Failed to persist runtime checkpoint: {error}"));
-            }
+            autosave.save(durable.snapshot(history_store, permission_handler, queue));
         }
         event => ui.handle_agent_event(event),
     }
     if steering {
         ui.sync_queue(queue);
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StreamPreviewKind {
-    Text,
-    Reasoning,
-}
-
-#[derive(Debug, Default)]
-struct PendingStreamPreview {
-    text: String,
-    reasoning: String,
-    omitted_text_bytes: usize,
-    omitted_reasoning_bytes: usize,
-    first: Option<StreamPreviewKind>,
-}
-
-impl PendingStreamPreview {
-    fn append(&mut self, kind: StreamPreviewKind, fragment: String) {
-        self.first.get_or_insert(kind);
-        let available = MAX_PENDING_STREAM_BYTES.saturating_sub(self.retained_bytes());
-        let mut keep = available.min(fragment.len());
-        while !fragment.is_char_boundary(keep) {
-            keep -= 1;
-        }
-
-        let omitted = fragment.len() - keep;
-        match kind {
-            StreamPreviewKind::Text => {
-                self.text.push_str(&fragment[..keep]);
-                self.omitted_text_bytes = self.omitted_text_bytes.saturating_add(omitted);
-            }
-            StreamPreviewKind::Reasoning => {
-                self.reasoning.push_str(&fragment[..keep]);
-                self.omitted_reasoning_bytes = self.omitted_reasoning_bytes.saturating_add(omitted);
-            }
-        }
-    }
-
-    fn retained_bytes(&self) -> usize {
-        self.text.len() + self.reasoning.len()
-    }
-
-    fn into_events(self) -> Vec<AgentEvent> {
-        let Self {
-            text,
-            reasoning,
-            omitted_text_bytes,
-            omitted_reasoning_bytes,
-            first,
-        } = self;
-        let mut events = Vec::with_capacity(3);
-        match first {
-            Some(StreamPreviewKind::Text) => {
-                if !text.is_empty() {
-                    events.push(AgentEvent::AssistantTextDelta(text));
-                }
-                if !reasoning.is_empty() {
-                    events.push(AgentEvent::ReasoningDelta(reasoning));
-                }
-            }
-            Some(StreamPreviewKind::Reasoning) => {
-                if !reasoning.is_empty() {
-                    events.push(AgentEvent::ReasoningDelta(reasoning));
-                }
-                if !text.is_empty() {
-                    events.push(AgentEvent::AssistantTextDelta(text));
-                }
-            }
-            None => {}
-        }
-        if omitted_text_bytes > 0 || omitted_reasoning_bytes > 0 {
-            events.push(AgentEvent::StreamDisplayTruncated {
-                text_bytes: omitted_text_bytes,
-                reasoning_bytes: omitted_reasoning_bytes,
-            });
-        }
-        events
-    }
-}
-
-#[derive(Debug)]
-enum BufferedAgentEvent {
-    Event(AgentEvent),
-    Stream(PendingStreamPreview),
-}
-
-#[derive(Clone)]
-struct AgentDisplaySender {
-    queue: Rc<RefCell<VecDeque<BufferedAgentEvent>>>,
-    notify: Rc<Notify>,
-}
-
-struct AgentDisplayReceiver {
-    queue: Rc<RefCell<VecDeque<BufferedAgentEvent>>>,
-    notify: Rc<Notify>,
-}
-
-fn agent_display_channel() -> (AgentDisplaySender, AgentDisplayReceiver) {
-    let queue = Rc::new(RefCell::new(VecDeque::new()));
-    let notify = Rc::new(Notify::new());
-    (
-        AgentDisplaySender {
-            queue: Rc::clone(&queue),
-            notify: Rc::clone(&notify),
-        },
-        AgentDisplayReceiver { queue, notify },
-    )
-}
-
-impl AgentDisplaySender {
-    fn send(&self, event: AgentEvent) {
-        let mut queue = self.queue.borrow_mut();
-        match event {
-            AgentEvent::AssistantTextDelta(text) => {
-                Self::append_delta(&mut queue, StreamPreviewKind::Text, text)
-            }
-            AgentEvent::ReasoningDelta(reasoning) => {
-                Self::append_delta(&mut queue, StreamPreviewKind::Reasoning, reasoning)
-            }
-            event => queue.push_back(BufferedAgentEvent::Event(event)),
-        }
-        drop(queue);
-        self.notify.notify_one();
-    }
-
-    fn append_delta(
-        queue: &mut VecDeque<BufferedAgentEvent>,
-        kind: StreamPreviewKind,
-        fragment: String,
-    ) {
-        if !matches!(queue.back(), Some(BufferedAgentEvent::Stream(_))) {
-            queue.push_back(BufferedAgentEvent::Stream(PendingStreamPreview::default()));
-        }
-        let Some(BufferedAgentEvent::Stream(preview)) = queue.back_mut() else {
-            unreachable!("a stream preview was just appended")
-        };
-        preview.append(kind, fragment);
-    }
-}
-
-impl AgentDisplayReceiver {
-    async fn recv_batch(&self) -> Vec<AgentEvent> {
-        loop {
-            let notify = Rc::clone(&self.notify);
-            let notified = notify.notified();
-            if let Some(events) = self.try_recv_batch() {
-                return events;
-            }
-            notified.await;
-        }
-    }
-
-    fn try_recv_batch(&self) -> Option<Vec<AgentEvent>> {
-        self.queue
-            .borrow_mut()
-            .pop_front()
-            .map(|event| match event {
-                BufferedAgentEvent::Event(event) => vec![event],
-                BufferedAgentEvent::Stream(preview) => preview.into_events(),
-            })
-    }
-
-    #[cfg(test)]
-    fn buffered_records(&self) -> usize {
-        self.queue.borrow().len()
-    }
-
-    #[cfg(test)]
-    fn pending_preview_bytes(&self) -> usize {
-        self.queue
-            .borrow()
-            .iter()
-            .filter_map(|event| match event {
-                BufferedAgentEvent::Stream(preview) => Some(preview.retained_bytes()),
-                BufferedAgentEvent::Event(_) => None,
-            })
-            .sum()
     }
 }
 
@@ -1137,22 +1196,31 @@ fn enqueue_submission(
     ));
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn drive_started_turn(
-    agent: &mut Agent,
-    ui: &mut TerminalUi,
-    queue: &PromptQueue,
-    history_store: &HistoryStore,
-    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
-    permission_handler: &MemoryPermissionHandler,
-    memory: Option<&EpisodicMemory>,
-    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
-    prompt: &str,
+/// Everything identifying one settled turn for episodic capture.
+struct EpisodeContext<'a> {
+    prompt: &'a str,
     prompt_source: PromptSource,
-    episode_history_start: usize,
-    episode_history_revision: u64,
+    history_start: usize,
+    history_revision: u64,
     started_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn drive_started_turn(
+    ctx: &mut ReactorCtx<'_>,
+    agent: &mut Agent,
+    episode: EpisodeContext<'_>,
 ) -> Result<bool> {
+    let ReactorCtx {
+        ui,
+        queue,
+        history_store,
+        permission_handler,
+        permission_rx,
+        memory_events,
+        memory,
+        autosave,
+    } = ctx;
+    let ui: &mut TerminalUi = ui;
     let mut durable = DurableBoundary::from_agent(agent);
     let episode_provider = agent.provider().id().to_string();
     let episode_model = agent.provider().model().to_string();
@@ -1188,6 +1256,7 @@ async fn drive_started_turn(
                         queue,
                         history_store,
                         permission_handler,
+                        autosave,
                         &mut durable,
                         event,
                     );
@@ -1210,19 +1279,12 @@ async fn drive_started_turn(
                             ui.draw().map_err(|error| Error::Other(error.to_string()))?;
                         }
                         PermissionUiEvent::Automatic { request, allowed } => {
-                            ui.status(&format!(
-                                "{} was {} by remembered policy",
-                                request.tool_name,
-                                if allowed { "auto-allowed" } else { "auto-denied" }
-                            ));
+                            note_automatic_permission(ui, &request.tool_name, allowed);
                         }
                     }
                 }
                 Some(event) = memory_events.recv() => handle_memory_event(ui, event),
-                _ = ticker.tick() => {
-                    ui.tick();
-                    ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
-                }
+                _ = ticker.tick() => reactor_tick(ui, autosave)?,
                 terminal_event = ui.next_event() => {
                     let action = terminal(
                         ui.handle_event(terminal(terminal_event)?, queue)
@@ -1258,11 +1320,7 @@ async fn drive_started_turn(
                         }
                     }
                     if persist_queue {
-                        if let Err(error) =
-                            durable.save(history_store, permission_handler, queue)
-                        {
-                            ui.error(&format!("Failed to persist runtime state: {error}"));
-                        }
+                        autosave.save(durable.snapshot(history_store, permission_handler, queue));
                     }
                 }
                 // Keep ordinary display events last in this biased reactor.
@@ -1275,6 +1333,7 @@ async fn drive_started_turn(
                             queue,
                             history_store,
                             permission_handler,
+                            autosave,
                             &mut durable,
                             event,
                         );
@@ -1284,28 +1343,17 @@ async fn drive_started_turn(
         }
     };
 
-    while let Ok(event) = checkpoint_rx.try_recv() {
+    drain_pending_agent_events(&mut checkpoint_rx, &event_rx, |event| {
         apply_runtime_event(
             ui,
             queue,
             history_store,
             permission_handler,
+            autosave,
             &mut durable,
             event,
         );
-    }
-    while let Some(events) = event_rx.try_recv_batch() {
-        for event in events {
-            apply_runtime_event(
-                ui,
-                queue,
-                history_store,
-                permission_handler,
-                &mut durable,
-                event,
-            );
-        }
-    }
+    });
     queue.normalize_steers();
     let continue_goal = should_continue_goal(agent.goal().is_some(), exit_requested, &outcome);
     let goal_queue_changed = queue.reconcile_goal_continuation(continue_goal);
@@ -1313,38 +1361,38 @@ async fn drive_started_turn(
         ui.info("Goal remains active; queued an automatic continuation.");
     }
     ui.sync_queue(queue);
-    if let Err(error) = history_store.save(
-        &make_saved_state(agent, permission_handler, queue, history_store.scope()),
-        AUTOSAVE_NAME,
-    ) {
-        ui.error(&format!("Failed to persist settled runtime state: {error}"));
-    }
+    autosave.save(make_saved_state(
+        agent,
+        permission_handler,
+        queue,
+        history_store.scope(),
+    ));
     let episode_outcome = match &outcome {
         Ok(outcome) => EpisodeOutcome::from(*outcome),
         Err(_) => EpisodeOutcome::Error,
     };
-    if let Some(memory) = memory {
+    if let Some(memory) = *memory {
         if history_tool_protocol_is_valid(agent.history()) {
-            let episode_history = if agent.history_revision() == episode_history_revision {
+            let episode_history = if agent.history_revision() == episode.history_revision {
                 agent
                     .history()
-                    .get(episode_history_start..)
+                    .get(episode.history_start..)
                     .unwrap_or_default()
             } else {
                 &[]
             };
-            let prompt_origin = match prompt_source {
+            let prompt_origin = match episode.prompt_source {
                 PromptSource::User => MessageOrigin::Conversation,
                 PromptSource::GoalContinuation => MessageOrigin::GoalContinuation,
             };
             if let Err(error) = memory.enqueue_settled_turn_with_origin(
-                prompt,
+                episode.prompt,
                 prompt_origin,
                 episode_history,
                 episode_outcome,
                 &episode_provider,
                 &episode_model,
-                started_at,
+                episode.started_at,
             ) {
                 ui.error(&format!("Failed to queue settled episode: {error}"));
             }
@@ -1379,15 +1427,18 @@ async fn drive_started_turn(
     Ok(exit_requested)
 }
 
-async fn drive_compaction(
-    agent: &mut Agent,
-    ui: &mut TerminalUi,
-    queue: &PromptQueue,
-    history_store: &HistoryStore,
-    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
-    permission_handler: &MemoryPermissionHandler,
-    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
-) -> Result<bool> {
+async fn drive_compaction(ctx: &mut ReactorCtx<'_>, agent: &mut Agent) -> Result<bool> {
+    let ReactorCtx {
+        ui,
+        queue,
+        history_store,
+        permission_handler,
+        permission_rx,
+        memory_events,
+        autosave,
+        ..
+    } = ctx;
+    let ui: &mut TerminalUi = ui;
     let mut durable = DurableBoundary::from_agent(agent);
     let before = agent.context_tokens();
     let (event_tx, event_rx) = agent_display_channel();
@@ -1416,29 +1467,16 @@ async fn drive_compaction(
                     queue,
                     history_store,
                     permission_handler,
+                    autosave,
                     &mut durable,
                     event,
                 ),
                 result = &mut operation => break Some(result),
                 Some(permission_event) = permission_rx.recv() => {
-                    match permission_event {
-                        PermissionUiEvent::Request(request) => {
-                            let _ = request.reply.send(PermissionChoice::DenyOnce);
-                        }
-                        PermissionUiEvent::Automatic { request, allowed } => {
-                            ui.status(&format!(
-                                "{} was {} by remembered policy",
-                                request.tool_name,
-                                if allowed { "auto-allowed" } else { "auto-denied" }
-                            ));
-                        }
-                    }
+                    handle_stale_permission_event(ui, permission_event);
                 }
                 Some(event) = memory_events.recv() => handle_memory_event(ui, event),
-                _ = ticker.tick() => {
-                    ui.tick();
-                    ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
-                }
+                _ = ticker.tick() => reactor_tick(ui, autosave)?,
                 terminal_event = ui.next_event() => {
                     let action =
                         terminal(ui.handle_event(terminal(terminal_event)?, queue))?;
@@ -1461,11 +1499,7 @@ async fn drive_compaction(
                         UiAction::None | UiAction::QueueChanged | UiAction::Permission { .. } => {}
                     }
                     if persist_queue {
-                        if let Err(error) =
-                            durable.save(history_store, permission_handler, queue)
-                        {
-                            ui.error(&format!("Failed to persist runtime state: {error}"));
-                        }
+                        autosave.save(durable.snapshot(history_store, permission_handler, queue));
                     }
                 }
                 // See the active-turn reactor above: fragment-amplified
@@ -1477,6 +1511,7 @@ async fn drive_compaction(
                             queue,
                             history_store,
                             permission_handler,
+                            autosave,
                             &mut durable,
                             event,
                         );
@@ -1486,34 +1521,23 @@ async fn drive_compaction(
         }
     };
 
-    while let Ok(event) = checkpoint_rx.try_recv() {
+    drain_pending_agent_events(&mut checkpoint_rx, &event_rx, |event| {
         apply_runtime_event(
             ui,
             queue,
             history_store,
             permission_handler,
+            autosave,
             &mut durable,
             event,
         );
-    }
-    while let Some(events) = event_rx.try_recv_batch() {
-        for event in events {
-            apply_runtime_event(
-                ui,
-                queue,
-                history_store,
-                permission_handler,
-                &mut durable,
-                event,
-            );
-        }
-    }
-    if let Err(error) = history_store.save(
-        &make_saved_state(agent, permission_handler, queue, history_store.scope()),
-        AUTOSAVE_NAME,
-    ) {
-        ui.error(&format!("Failed to persist compaction state: {error}"));
-    }
+    });
+    autosave.save(make_saved_state(
+        agent,
+        permission_handler,
+        queue,
+        history_store.scope(),
+    ));
     match compacted {
         Some(Ok(true)) => ui.info(&format!(
             "Context compacted: ~{}k → ~{}k tokens",
@@ -1560,369 +1584,6 @@ fn should_continue_goal(
         )
 }
 
-fn run_permission_command(
-    command: PermissionCommand<'_>,
-    handler: &MemoryPermissionHandler,
-) -> String {
-    match command {
-        PermissionCommand::List => {
-            let policy = handler.remembered_policy();
-            let mut always_allow = policy.always_allow.into_iter().collect::<Vec<_>>();
-            let mut always_deny = policy.always_deny.into_iter().collect::<Vec<_>>();
-            always_allow.sort_unstable();
-            always_deny.sort_unstable();
-            if always_allow.is_empty() && always_deny.is_empty() {
-                return "No remembered tool permissions; the next permissioned use of each tool will ask."
-                    .to_string();
-            }
-            let mut lines = vec!["Remembered tool permissions:".to_string()];
-            lines.push("Always allow:".to_string());
-            if always_allow.is_empty() {
-                lines.push("  (none)".to_string());
-            } else {
-                lines.extend(always_allow.into_iter().map(|tool| format!("  {tool}")));
-            }
-            lines.push("Always deny:".to_string());
-            if always_deny.is_empty() {
-                lines.push("  (none)".to_string());
-            } else {
-                lines.extend(always_deny.into_iter().map(|tool| format!("  {tool}")));
-            }
-            lines.join("\n")
-        }
-        PermissionCommand::Reset(tool) => {
-            if handler.reset_remembered_tool(tool) {
-                format!(
-                    "Reset the remembered permission for '{tool}'; its next permissioned use will ask."
-                )
-            } else {
-                format!("No remembered permission exists for '{tool}'.")
-            }
-        }
-        PermissionCommand::Clear => {
-            let count = handler.clear_remembered_policy();
-            if count == 0 {
-                "No remembered tool permissions to clear.".to_string()
-            } else {
-                format!(
-                    "Cleared {count} remembered tool permission(s); their next permissioned use will ask."
-                )
-            }
-        }
-    }
-}
-
-const TOOL_LIST_LIMIT: usize = 60;
-const TOOL_SUMMARY_CHARS: usize = 180;
-const TOOL_DETAIL_CHARS: usize = 30_000;
-const HISTORY_LIST_LIMIT: usize = 60;
-const HISTORY_DETAIL_CHARS: usize = 30_000;
-
-fn one_line_tool_summary(description: &str) -> String {
-    let flattened = description.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_middle(&flattened, TOOL_SUMMARY_CHARS)
-}
-
-fn bounded_tool_detail(detail: String) -> String {
-    let count = detail.chars().count();
-    if count <= TOOL_DETAIL_CHARS {
-        return detail;
-    }
-    let kept = detail.chars().take(TOOL_DETAIL_CHARS).collect::<String>();
-    format!(
-        "{kept}\n\n[{} characters omitted; this display is bounded]",
-        count - TOOL_DETAIL_CHARS
-    )
-}
-
-fn advertised_interface(agent: &Agent) -> String {
-    let names = agent
-        .advertised_tool_defs()
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        "Model-facing tools: (none)".to_string()
-    } else {
-        format!("Model-facing tools: {}", names.join(", "))
-    }
-}
-
-fn sorted_bridge_catalog(agent: &Agent) -> (Vec<ToolDef>, HashSet<String>) {
-    let mut definitions = agent.registry.get_bridge_tool_defs();
-    definitions.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    let progressive = agent
-        .registry
-        .code_only_tool_defs()
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect();
-    (definitions, progressive)
-}
-
-fn find_named_tool<'a>(definitions: &'a [ToolDef], name: &str) -> Result<Option<&'a ToolDef>> {
-    if let Some(definition) = definitions
-        .iter()
-        .find(|definition| definition.name == name)
-    {
-        return Ok(Some(definition));
-    }
-    let matches = definitions
-        .iter()
-        .filter(|definition| definition.name.eq_ignore_ascii_case(name))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [definition] => Ok(Some(*definition)),
-        _ => Err(Error::Other(format!(
-            "Tool name '{name}' is ambiguous; use exact case: {}",
-            matches
-                .iter()
-                .map(|definition| definition.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
-    }
-}
-
-fn render_tool_definition(name: &str, exposure: &str, definition: &ToolDef) -> String {
-    let schema = serde_json::to_string_pretty(&definition.input_schema)
-        .unwrap_or_else(|_| definition.input_schema.to_string());
-    bounded_tool_detail(format!(
-        "Tool {name}\nExposure: {exposure}\n\nDescription:\n{}\n\nInput schema:\n{schema}",
-        definition.description
-    ))
-}
-
-fn run_tools_command(command: ToolsCommand<'_>, agent: &Agent) -> String {
-    let (bridges, progressive) = sorted_bridge_catalog(agent);
-    match command {
-        ToolsCommand::List | ToolsCommand::Search(_) => {
-            let query = match command {
-                ToolsCommand::Search(query) => Some(query),
-                ToolsCommand::List => None,
-                ToolsCommand::Show(_) => unreachable!(),
-            };
-            let normalized_query = query.map(|query| query.to_lowercase());
-            let matches = bridges
-                .iter()
-                .filter(|definition| {
-                    normalized_query.as_ref().is_none_or(|query| {
-                        definition.name.to_lowercase().contains(query)
-                            || definition.description.to_lowercase().contains(query)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let progressive_count = bridges
-                .iter()
-                .filter(|definition| progressive.contains(&definition.name))
-                .count();
-            let mut lines = vec![advertised_interface(agent)];
-            lines.push(if let Some(query) = query {
-                format!(
-                    "Registered bridge tools matching '{query}': {} of {}",
-                    matches.len(),
-                    bridges.len()
-                )
-            } else {
-                format!(
-                    "Registered bridge tools: {} total ({progressive_count} schema-on-demand)",
-                    bridges.len()
-                )
-            });
-            if matches.is_empty() {
-                lines.push("  (no matches)".to_string());
-            } else {
-                lines.extend(matches.iter().take(TOOL_LIST_LIMIT).map(|definition| {
-                    let qualifier = if progressive.contains(&definition.name) {
-                        " [schema on demand]"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "  tools.{}{qualifier} — {}",
-                        definition.name,
-                        one_line_tool_summary(&definition.description)
-                    )
-                }));
-                if matches.len() > TOOL_LIST_LIMIT {
-                    lines.push(format!(
-                        "  … {} more omitted; narrow the list with /tools search <query>",
-                        matches.len() - TOOL_LIST_LIMIT
-                    ));
-                }
-            }
-            lines.push("Use /tools show <name> for one description and input schema.".to_string());
-            lines.join("\n")
-        }
-        ToolsCommand::Show(name) => {
-            match find_named_tool(&bridges, name) {
-                Ok(Some(definition)) => {
-                    let exposure = if progressive.contains(&definition.name) {
-                        "bridge capability; full schema is available to scripts on demand via __doc__"
-                    } else if agent.uses_builtin_code_mode() {
-                        "bridge capability; compact signature and description are preloaded in the python runner"
-                    } else {
-                        "registered model-facing capability"
-                    };
-                    return render_tool_definition(
-                        &format!("tools.{}", definition.name),
-                        exposure,
-                        definition,
-                    );
-                }
-                Err(error) => return error.to_string(),
-                Ok(None) => {}
-            }
-
-            let advertised = agent.advertised_tool_defs();
-            match find_named_tool(&advertised, name) {
-                Ok(Some(definition)) => {
-                    let exposure = if definition.name == "python" && agent.uses_builtin_code_mode()
-                    {
-                        "model-facing built-in runner; registered capabilities are called through tools.<name> inside its script"
-                    } else if definition.name == generalist::UPDATE_GOAL_TOOL_NAME {
-                        "model-facing host control while an objective is active; permission-free and not a bridge capability"
-                    } else {
-                        "model-facing capability"
-                    };
-                    render_tool_definition(&definition.name, exposure, definition)
-                }
-                Err(error) => error.to_string(),
-                Ok(None) if name.eq_ignore_ascii_case(generalist::UPDATE_GOAL_TOOL_NAME) => {
-                    "Tool 'update_goal' is advertised only while an active goal exists.".to_string()
-                }
-                Ok(None) => format!(
-                    "No registered or currently advertised tool named '{name}'. Use /tools search <query>."
-                ),
-            }
-        }
-    }
-}
-
-fn bounded_history_detail(detail: String) -> String {
-    let count = detail.chars().count();
-    if count <= HISTORY_DETAIL_CHARS {
-        return detail;
-    }
-    let kept = detail
-        .chars()
-        .take(HISTORY_DETAIL_CHARS)
-        .collect::<String>();
-    format!(
-        "{kept}\n\n[{} characters omitted; inspect the saved session file for the complete sanitized view]",
-        count - HISTORY_DETAIL_CHARS
-    )
-}
-
-fn render_archived_conversation(conversation: &ArchivedConversation) -> String {
-    let mut lines = vec![
-        format!("Saved session {}", conversation.name),
-        format!(
-            "{} · {} · {} / {}",
-            conversation.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
-            conversation.scope,
-            conversation.provider,
-            conversation.model
-        ),
-    ];
-    if let Some(goal) = &conversation.goal {
-        lines.push(format!(
-            "prospective goal (not a past event):\n{}",
-            truncate_middle(goal, 1_200)
-        ));
-    }
-    for event in &conversation.events {
-        match event {
-            ArchivedConversationEvent::UserText { text } => {
-                lines.push(format!("user:\n{}", truncate_middle(text, 1_200)));
-            }
-            ArchivedConversationEvent::AssistantText { text } => {
-                lines.push(format!("assistant:\n{}", truncate_middle(text, 1_200)));
-            }
-            ArchivedConversationEvent::ToolCall { name } => {
-                lines.push(format!("tool: {name} (input omitted)"));
-            }
-            ArchivedConversationEvent::ToolResult { is_error } => {
-                lines.push(format!(
-                    "tool result: {} (content omitted)",
-                    if *is_error { "error" } else { "success" }
-                ));
-            }
-        }
-    }
-    bounded_history_detail(lines.join("\n\n"))
-}
-
-fn run_history_command(command: HistoryCommand<'_>, history: &HistoryStore) -> Result<String> {
-    match command {
-        HistoryCommand::List => {
-            let names = history.list();
-            let mut lines = vec![format!(
-                "Saved sessions in {}: {}",
-                history.scope().display_name(),
-                names.len()
-            )];
-            if names.is_empty() {
-                lines.push("  (none)".to_string());
-            } else {
-                lines.extend(
-                    names
-                        .iter()
-                        .take(HISTORY_LIST_LIMIT)
-                        .map(|name| format!("  {name}")),
-                );
-                if names.len() > HISTORY_LIST_LIMIT {
-                    lines.push(format!(
-                        "  … {} more omitted; narrow the list with /history search <query>",
-                        names.len() - HISTORY_LIST_LIMIT
-                    ));
-                }
-            }
-            lines.push("Use /history show <name> to inspect without loading.".to_string());
-            Ok(lines.join("\n"))
-        }
-        HistoryCommand::Search(query) => {
-            let matches = history.search_current_archives(query)?;
-            if matches.is_empty() {
-                return Ok(format!(
-                    "No current-scope saved sessions matched ‘{query}’."
-                ));
-            }
-            let mut lines = vec![format!(
-                "{} current-scope saved session(s) matched ‘{query}’:",
-                matches.len()
-            )];
-            lines.extend(matches.into_iter().map(|conversation| {
-                format!(
-                    "{} · {} · {} / {} · {}",
-                    conversation.name,
-                    conversation.updated_at.format("%Y-%m-%d %H:%M"),
-                    conversation.provider,
-                    conversation.model,
-                    conversation.preview
-                )
-            }));
-            lines.push("Use /history show <name> to inspect without loading.".to_string());
-            Ok(lines.join("\n"))
-        }
-        HistoryCommand::Show(name) => match history.inspect_current_archive(name)? {
-            Some(conversation) => Ok(render_archived_conversation(&conversation)),
-            None => Ok(format!(
-                "No current-scope saved session named '{name}'. Use /history list."
-            )),
-        },
-        HistoryCommand::Forget(_) => Err(Error::Other(
-            "Forgetting a saved session requires interactive host confirmation".to_string(),
-        )),
-    }
-}
-
 fn handle_memory_event(ui: &mut TerminalUi, event: MemoryEvent) {
     match event {
         MemoryEvent::CaptureFailed(error) => {
@@ -1931,156 +1592,24 @@ fn handle_memory_event(ui: &mut TerminalUi, event: MemoryEvent) {
     }
 }
 
-fn render_episode(episode: &Episode) -> String {
-    let mut lines = vec![
-        format!("Episode {}", episode.id),
-        format!(
-            "{} · {} · {} / {}",
-            episode.settled_at.format("%Y-%m-%d %H:%M:%S UTC"),
-            episode.outcome.label(),
-            episode.provider,
-            episode.model
-        ),
-        format!(
-            "Capture: {} · project: {}",
-            episode.capture_quality, episode.project_root
-        ),
-    ];
-    for event in &episode.events {
-        match event {
-            EpisodeEvent::UserText { text } => {
-                lines.push(format!("user:\n{}", truncate_middle(text, 1_200)));
-            }
-            EpisodeEvent::AssistantText { text } => {
-                lines.push(format!("assistant:\n{}", truncate_middle(text, 1_200)));
-            }
-            EpisodeEvent::ToolCall { name, .. } => {
-                lines.push(format!("tool: {name} (input omitted)"));
-            }
-            EpisodeEvent::ToolResult { is_error, .. } => {
-                lines.push(format!(
-                    "tool result: {} (content omitted)",
-                    if *is_error { "error" } else { "success" }
-                ));
-            }
-        }
-    }
-    lines.join("\n\n")
-}
-
-async fn run_memory_command(
-    command: MemoryCommand<'_>,
-    memory: &EpisodicMemory,
-    exports_directory: &Path,
-) -> Result<Vec<String>> {
-    match command {
-        MemoryCommand::Status => {
-            let status = memory.status().await?;
-            Ok(vec![format!(
-                "Episodic memory: {} · {} episode(s)\nScope: {}\nSQLite {} at {}\n\
-                 Explicit search only; no automatic retrieval. User/assistant text is retained; \
-                 provider reasoning and tool payloads are omitted.",
-                if status.capture_enabled {
-                    "recording"
-                } else {
-                    "paused"
-                },
-                status.episode_count,
-                status.project_root,
-                status.sqlite_version,
-                status.database_path.display()
-            )])
-        }
-        MemoryCommand::Pause => {
-            memory.set_capture_enabled(false).await?;
-            Ok(vec![
-                "Episodic capture paused for the current scope.".to_string()
-            ])
-        }
-        MemoryCommand::Resume => {
-            memory.set_capture_enabled(true).await?;
-            Ok(vec![
-                "Episodic capture enabled for the current scope. Future settled user/assistant text \
-                 is retained; provider reasoning and tool payloads are omitted. Pause capture \
-                 before entering sensitive text."
-                    .to_string(),
-            ])
-        }
-        MemoryCommand::Search(query) => {
-            let matches = memory.search(query).await?;
-            if matches.is_empty() {
-                return Ok(vec![format!(
-                    "No current-scope episodes matched “{query}”."
-                )]);
-            }
-            let mut lines = vec![format!(
-                "{} current-scope episode(s) matched “{query}”:",
-                matches.len()
-            )];
-            for episode in matches {
-                let short_id: String = episode.id.chars().take(8).collect();
-                lines.push(format!(
-                    "{} · {} · {} · {}",
-                    short_id,
-                    episode.settled_at.format("%Y-%m-%d %H:%M"),
-                    episode.outcome.label(),
-                    episode.preview
-                ));
-            }
-            Ok(lines)
-        }
-        MemoryCommand::Show(id) => match memory.show(id).await? {
-            Some(episode) => Ok(vec![render_episode(&episode)]),
-            None => Ok(vec![format!(
-                "No current-scope episode matches ID prefix '{id}'."
-            )]),
-        },
-        MemoryCommand::Export => {
-            let episodes = memory.export().await?;
-            let count = episodes.len();
-            let exports_directory = exports_directory.to_path_buf();
-            let path = tokio::task::spawn_blocking(move || {
-                write_memory_export(&exports_directory, &episodes)
-            })
-            .await
-            .map_err(|error| Error::Other(format!("Episode export worker failed: {error}")))??;
-            Ok(vec![format!(
-                "Exported {count} current-scope episode(s) to {}",
-                path.display()
-            )])
-        }
-        MemoryCommand::Forget(id) => match memory.forget(id).await? {
-            ForgetResult::Deleted => Ok(vec![
-                "Episode deleted from the live SQLite store. This does not erase external \
-                     exports, backups, or filesystem snapshots."
-                    .to_string(),
-            ]),
-            ForgetResult::DeletedCheckpointPending(error) => Ok(vec![format!(
-                "Episode deleted from live queries, but WAL truncation is still pending: \
-                     {error}. Prior exports, backups, and filesystem snapshots are outside this \
-                     guarantee."
-            )]),
-            ForgetResult::NotFound => Ok(vec![format!(
-                "No current-scope episode matches ID prefix '{id}'."
-            )]),
-        },
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn drive_memory_command(
+    ctx: &mut ReactorCtx<'_>,
     command: MemoryCommand<'_>,
-    memory: Option<&EpisodicMemory>,
     exports_directory: &Path,
     agent: &Agent,
-    ui: &mut TerminalUi,
-    queue: &PromptQueue,
-    history_store: &HistoryStore,
-    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
-    permission_handler: &MemoryPermissionHandler,
-    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
 ) -> Result<bool> {
-    let Some(memory) = memory else {
+    let ReactorCtx {
+        ui,
+        queue,
+        history_store,
+        permission_handler,
+        permission_rx,
+        memory_events,
+        memory,
+        autosave,
+    } = ctx;
+    let ui: &mut TerminalUi = ui;
+    let Some(memory) = *memory else {
         ui.error("Episodic memory is unavailable; see the startup error.");
         return Ok(false);
     };
@@ -2104,25 +1633,10 @@ async fn drive_memory_command(
                 break false;
             }
             Some(permission_event) = permission_rx.recv() => {
-                match permission_event {
-                    PermissionUiEvent::Request(request) => {
-                        let _ = request.reply.send(PermissionChoice::DenyOnce);
-                        ui.error("Ignored a stale permission request with no active turn.");
-                    }
-                    PermissionUiEvent::Automatic { request, allowed } => {
-                        ui.status(&format!(
-                            "{} was {} by remembered policy",
-                            request.tool_name,
-                            if allowed { "auto-allowed" } else { "auto-denied" }
-                        ));
-                    }
-                }
+                handle_stale_permission_event(ui, permission_event);
             }
             Some(event) = memory_events.recv() => handle_memory_event(ui, event),
-            _ = ticker.tick() => {
-                ui.tick();
-                ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
-            }
+            _ = ticker.tick() => reactor_tick(ui, autosave)?,
             terminal_event = ui.next_event() => {
                 let action = terminal(ui.handle_event(terminal(terminal_event)?, queue))?;
                 let persist_queue = action.requires_queue_persist();
@@ -2139,17 +1653,12 @@ async fn drive_memory_command(
                     | UiAction::Permission { .. } => {}
                 }
                 if persist_queue {
-                    if let Err(error) = history_store.save(
-                        &make_saved_state(
-                            agent,
-                            permission_handler,
-                            queue,
-                            history_store.scope(),
-                        ),
-                        AUTOSAVE_NAME,
-                    ) {
-                        ui.error(&format!("Failed to persist runtime state: {error}"));
-                    }
+                    autosave.save(make_saved_state(
+                        agent,
+                        permission_handler,
+                        queue,
+                        history_store.scope(),
+                    ));
                 }
             }
         }
@@ -2160,16 +1669,10 @@ async fn drive_memory_command(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_command(
+    ctx: &mut ReactorCtx<'_>,
     text: &str,
     agent: &mut Agent,
-    ui: &mut TerminalUi,
-    queue: &PromptQueue,
-    history_store: &HistoryStore,
-    permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
-    permission_handler: &MemoryPermissionHandler,
-    memory: Option<&EpisodicMemory>,
     profile_paths: &ProfilePaths,
-    memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
     mcp_runtime: &mut Option<McpRuntime>,
     keys: &ApiKeys,
     available: &[&'static str],
@@ -2177,147 +1680,65 @@ async fn execute_command(
     let command = parse_local_command(text).unwrap_or(LocalCommand::Unknown(text.trim()));
     match command {
         LocalCommand::Exit => return Ok(CommandFlow::Exit),
-        LocalCommand::Help => terminal(ui.show_help().await)?,
+        LocalCommand::Help => terminal(ctx.ui.show_help().await)?,
         LocalCommand::Compact => {
-            if drive_compaction(
-                agent,
-                ui,
-                queue,
-                history_store,
-                permission_rx,
-                permission_handler,
-                memory_events,
-            )
-            .await?
-            {
+            if drive_compaction(ctx, agent).await? {
                 return Ok(CommandFlow::Exit);
             }
         }
         LocalCommand::Clear => {
             agent.clear_history();
-            ui.clear_conversation();
-            ui.set_context_tokens(0);
-            ui.info("Conversation cleared. The active goal was preserved.");
+            ctx.ui.clear_conversation();
+            ctx.ui.set_context_tokens(0);
+            ctx.ui
+                .info("Conversation cleared. The active goal was preserved.");
         }
-        LocalCommand::Save(name) => {
-            let prompted_name = if name.is_none() {
-                let default = format!("chat_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-                terminal(ui.prompt("Save conversation as", &default).await)?
-            } else {
-                None
-            };
-            if let Some(name) = name
-                .map(str::to_string)
-                .or(prompted_name)
-                .map(|name| name.trim().to_string())
-            {
-                if name == AUTOSAVE_NAME {
-                    ui.error(
-                        "The live autosave name is reserved; choose another name for a durable checkpoint.",
-                    );
-                } else {
-                    match save_new_named_session(
-                        &name,
-                        agent,
-                        permission_handler,
-                        queue,
-                        history_store,
-                    ) {
-                        Ok(Some(path)) => {
-                            ui.info(&format!("Saved session '{name}' to {}", path.display()))
-                        }
-                        Err(error) => ui.error(&format!("Failed to save '{name}': {error}")),
-                        Ok(None) => match history_store.inspect_current_archive(&name) {
-                            Err(error) => {
-                                ui.error(&format!("Saved-session replacement refused: {error}"))
-                            }
-                            Ok(None) => ui.error(&format!(
-                                "A path for saved session '{name}' already exists but is not a valid current-scope save; refusing to overwrite it."
-                            )),
-                            Ok(Some(_)) => {
-                                let choices =
-                                    vec!["Cancel".to_string(), format!("Replace '{name}'")];
-                                let title = format!(
-                                    "Replace saved session '{name}'? The prior checkpoint will be overwritten."
-                                );
-                                if terminal(ui.select(&title, &choices).await)? == Some(1) {
-                                    match save_named_session(
-                                        &name,
-                                        agent,
-                                        permission_handler,
-                                        queue,
-                                        history_store,
-                                    ) {
-                                        Ok(path) => ui.info(&format!(
-                                            "Replaced saved session '{name}' at {}",
-                                            path.display()
-                                        )),
-                                        Err(error) => ui.error(&format!(
-                                            "Failed to replace saved session '{name}': {error}"
-                                        )),
-                                    }
-                                } else {
-                                    ui.info(&format!("Kept existing saved session '{name}'."));
-                                }
-                            }
-                        },
-                    }
-                }
-            }
-        }
+        LocalCommand::Save(name) => run_save_command(ctx, agent, name).await?,
         LocalCommand::Load(name) => {
             let selected_name = if let Some(name) = name {
                 Some(name.to_string())
             } else {
-                let saved = history_store.list();
+                let saved = with_history_store(ctx.history_store, |store| store.list()).await?;
                 if saved.is_empty() {
-                    ui.info("No saved conversations found.");
+                    ctx.ui.info("No saved conversations found.");
                     None
                 } else {
-                    terminal(ui.select("Load conversation", &saved).await)?
+                    terminal(ctx.ui.select("Load conversation", &saved).await)?
                         .map(|index| saved[index].clone())
                 }
             };
             if let Some(name) = selected_name {
-                match load_named_session(
-                    &name,
-                    agent,
-                    ui,
-                    queue,
-                    history_store,
-                    permission_handler,
-                    keys,
-                ) {
-                    Ok(count) => ui.info(&format!(
+                match load_named_session(ctx, &name, agent, keys).await {
+                    Ok(count) => ctx.ui.info(&format!(
                         "Loaded saved session '{name}' ({count} messages)."
                     )),
-                    Err(error) => ui.error(&format!("Failed to load '{name}': {error}")),
+                    Err(error) => ctx.ui.error(&format!("Failed to load '{name}': {error}")),
                 }
             }
         }
         LocalCommand::Model => {
             if let Some((provider_name, model)) =
-                choose_provider_and_model(ui, keys, available).await?
+                choose_provider_and_model(ctx.ui, keys, available).await?
             {
                 match build_provider(keys, &provider_name, model) {
                     Ok(provider) => {
                         agent.set_provider(provider);
-                        ui.set_session(
+                        ctx.ui.set_session(
                             agent.provider().display_name(),
                             agent.provider().model(),
                             agent.registry.tool_names().len(),
                         );
-                        ui.info("Model switched.");
+                        ctx.ui.info("Model switched.");
                     }
-                    Err(error) => ui.error(&format!("Failed to switch model: {error}")),
+                    Err(error) => ctx.ui.error(&format!("Failed to switch model: {error}")),
                 }
             }
         }
         LocalCommand::Mcp(McpCommand::Status) => {
             if let Some(runtime) = mcp_runtime {
-                ui.info(&runtime.status());
+                ctx.ui.info(&runtime.status());
             } else {
-                ui.info(&format!(
+                ctx.ui.info(&format!(
                     "MCP: no configuration was loaded. Add {} and restart.",
                     profile_paths.mcp_config().display()
                 ));
@@ -2325,32 +1746,28 @@ async fn execute_command(
         }
         LocalCommand::Mcp(McpCommand::Retry(requested)) => {
             let Some(runtime) = mcp_runtime else {
-                ui.error("MCP retry is unavailable because no configuration was loaded.");
+                ctx.ui
+                    .error("MCP retry is unavailable because no configuration was loaded.");
                 return Ok(CommandFlow::Continue);
             };
             match runtime.retry_targets(requested) {
-                Err(error) => ui.error(&format!("MCP retry refused: {error}")),
+                Err(error) => ctx.ui.error(&format!("MCP retry refused: {error}")),
                 Ok(targets) => {
                     let config = runtime.config.clone();
                     let durable = DurableBoundary::from_agent(agent);
                     if drive_mcp_discovery(
+                        ctx,
                         &mut agent.registry,
                         &config,
                         runtime,
                         &targets,
-                        ui,
-                        queue,
-                        history_store,
-                        permission_rx,
-                        permission_handler,
-                        memory_events,
                         &durable,
                     )
                     .await?
                     {
                         return Ok(CommandFlow::Exit);
                     }
-                    ui.set_session(
+                    ctx.ui.set_session(
                         agent.provider().display_name(),
                         agent.provider().model(),
                         agent.registry.tool_names().len(),
@@ -2358,7 +1775,7 @@ async fn execute_command(
                 }
             }
         }
-        LocalCommand::Copy(CopyCommand::Select) => terminal(ui.enter_copy_mode())?,
+        LocalCommand::Copy(CopyCommand::Select) => terminal(ctx.ui.enter_copy_mode())?,
         LocalCommand::Copy(copy) => {
             let (payload, empty_message) = match copy {
                 CopyCommand::Last => (
@@ -2376,111 +1793,146 @@ async fn execute_command(
                 CopyCommand::Select => unreachable!("selection copy handled above"),
             };
             if let Some(payload) = payload {
-                match ui.request_clipboard_copy(&payload) {
-                    Ok(bytes) => ui.info(&format!(
+                match ctx.ui.request_clipboard_copy(&payload) {
+                    Ok(bytes) => ctx.ui.info(&format!(
                         "Sent {bytes} bytes to the terminal clipboard via OSC 52. If the terminal blocks it, use /copy select."
                     )),
-                    Err(error) => ui.error(&format!(
+                    Err(error) => ctx.ui.error(&format!(
                         "Clipboard request failed: {error}. Use /copy select for native selection."
                     )),
                 }
             } else {
-                ui.info(empty_message);
+                ctx.ui.info(empty_message);
             }
         }
         LocalCommand::Permissions(command) => {
-            ui.info(&run_permission_command(command, permission_handler));
+            ctx.ui
+                .info(&run_permission_command(command, ctx.permission_handler));
         }
         LocalCommand::Tools(command) => {
-            ui.info(&run_tools_command(command, agent));
+            ctx.ui.info(&run_tools_command(command, agent));
         }
         LocalCommand::Usage(UsageCommand::Show) => {
-            let report = ui.provider_usage_report();
-            ui.info(&report);
+            let report = ctx.ui.provider_usage_report();
+            ctx.ui.info(&report);
         }
         LocalCommand::Usage(UsageCommand::Reset) => {
-            ui.reset_provider_usage();
-            ui.info("Provider usage counters reset. Conversation, context, and provider state were unchanged.");
+            ctx.ui.reset_provider_usage();
+            ctx.ui.info("Provider usage counters reset. Conversation, context, and provider state were unchanged.");
         }
         LocalCommand::History(HistoryCommand::Forget(name)) => {
             if name == AUTOSAVE_NAME {
-                ui.error(
+                ctx.ui.error(
                     "The active autosave cannot be forgotten; use /clear to replace its conversation content.",
                 );
             } else {
-                match history_store.inspect_current_archive(name) {
-                    Ok(None) => ui.info(&format!(
+                let requested = name.to_string();
+                let existing = with_history_store(ctx.history_store, move |store| {
+                    store.inspect_current_archive(&requested)
+                })
+                .await
+                .and_then(|result| result);
+                match existing {
+                    Ok(None) => ctx.ui.info(&format!(
                         "No current-scope saved session named '{name}'. Use /history list."
                     )),
-                    Err(error) => ui.error(&format!("History deletion refused: {error}")),
+                    Err(error) => ctx.ui.error(&format!("History deletion refused: {error}")),
                     Ok(Some(_)) => {
                         let choices = vec!["Cancel".to_string(), format!("Delete '{name}'")];
                         let title = format!(
                             "Forget saved session '{name}'? Backups and prior copies remain."
                         );
-                        if terminal(ui.select(&title, &choices).await)? == Some(1) {
-                            match history_store.forget_current_archive(name) {
-                                Ok(true) => ui.info(&format!(
+                        if terminal(ctx.ui.select(&title, &choices).await)? == Some(1) {
+                            let requested = name.to_string();
+                            let deleted = with_history_store(ctx.history_store, move |store| {
+                                store.forget_current_archive(&requested)
+                            })
+                            .await
+                            .and_then(|result| result);
+                            match deleted {
+                                Ok(true) => ctx.ui.info(&format!(
                                     "Deleted current-scope saved session '{name}'. Prior copies, backups, and filesystem snapshots are not erased."
                                 )),
-                                Ok(false) => ui.info(&format!(
+                                Ok(false) => ctx.ui.info(&format!(
                                     "Saved session '{name}' disappeared before deletion."
                                 )),
                                 Err(error) => {
-                                    ui.error(&format!("History deletion failed: {error}"))
+                                    ctx.ui.error(&format!("History deletion failed: {error}"))
                                 }
                             }
                         } else {
-                            ui.info(&format!("Kept saved session '{name}'."));
+                            ctx.ui.info(&format!("Kept saved session '{name}'."));
                         }
                     }
                 }
             }
         }
-        LocalCommand::History(command) => match run_history_command(command, history_store) {
-            Ok(output) => ui.info(&output),
-            Err(error) => ui.error(&format!("History inspection failed: {error}")),
-        },
+        LocalCommand::History(command) => {
+            match run_history_command(command, ctx.history_store).await {
+                Ok(output) => ctx.ui.info(&output),
+                Err(error) => ctx.ui.error(&format!("History inspection failed: {error}")),
+            }
+        }
         LocalCommand::Goal(GoalCommand::Edit) => {
             let current = agent.goal().unwrap_or_default();
-            if let Some(goal) = terminal(ui.prompt("Active goal (empty clears)", current).await)? {
-                replace_goal(agent, ui, queue, Some(goal));
+            if let Some(goal) =
+                terminal(ctx.ui.prompt("Active goal (empty clears)", current).await)?
+            {
+                replace_goal(agent, ctx.ui, ctx.queue, Some(goal));
             }
         }
         LocalCommand::Goal(GoalCommand::Show) => {
             if let Some(goal) = agent.goal() {
-                ui.info(&format!("Active goal: {goal}"));
+                ctx.ui.info(&format!("Active goal: {goal}"));
             } else {
-                ui.info("No active goal. Use /goal <objective> to set one.");
+                ctx.ui
+                    .info("No active goal. Use /goal <objective> to set one.");
             }
         }
-        LocalCommand::Goal(GoalCommand::Clear) => replace_goal(agent, ui, queue, None),
+        LocalCommand::Goal(GoalCommand::Clear) => replace_goal(agent, ctx.ui, ctx.queue, None),
         LocalCommand::Goal(GoalCommand::Set(goal)) => {
-            replace_goal(agent, ui, queue, Some(goal.to_string()))
+            replace_goal(agent, ctx.ui, ctx.queue, Some(goal.to_string()))
         }
         LocalCommand::Memory(command) => {
-            if drive_memory_command(
-                command,
-                memory,
-                profile_paths.exports_directory(),
-                agent,
-                ui,
-                queue,
-                history_store,
-                permission_rx,
-                permission_handler,
-                memory_events,
-            )
-            .await?
-            {
+            if drive_memory_command(ctx, command, profile_paths.exports_directory(), agent).await? {
                 return Ok(CommandFlow::Exit);
             }
         }
         LocalCommand::Unknown(command) => {
-            ui.info(&format!("Unknown local command: {command}. Use /help."));
+            ctx.ui
+                .info(&format!("Unknown local command: {command}. Use /help."));
         }
     }
     Ok(CommandFlow::Continue)
+}
+
+/// The base system prompt plus per-run context: archive scope, the skills
+/// index, and project notes (AGENTS.md/CLAUDE.md).
+fn compose_system_prompt(scope: &WorkspaceScope, profile_paths: &ProfilePaths) -> String {
+    let mut system_prompt = include_str!("../SYSTEM_PROMPT.md").to_string();
+    system_prompt.push_str(&format!(
+        "\n\n## Active archive scope\n\nThis run's history and episodic-memory scope is `{}`. \
+         Current-scope storage is isolated from every other project. Global or other-project \
+         archives are available only through the permission-gated search/read tools; never \
+         assume or retrieve them automatically.",
+        scope.display_name()
+    ));
+    if let Some(index) = generalist::skills::skills_index(profile_paths.skills_directory()) {
+        system_prompt.push_str(&index);
+    }
+    if let Some(project_root) = scope.project_root() {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let path = project_root.join(name);
+            if let Ok(notes) = fs::read_to_string(&path) {
+                system_prompt.push_str(&format!(
+                    "\n\n## Project notes ({})\n\n{notes}",
+                    path.display()
+                ));
+                break;
+            }
+        }
+    }
+    system_prompt
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -2591,6 +2043,7 @@ async fn main() -> Result<()> {
         startup_goal.clone(),
         startup_history.clone(),
     );
+    let autosave = AutosaveWriter::spawn(history_store.clone());
     let mut mcp_runtime = match McpConfig::load_checked(profile_paths.mcp_config()) {
         Ok(config) => config.map(McpRuntime::new),
         Err(error) => {
@@ -2598,20 +2051,25 @@ async fn main() -> Result<()> {
             None
         }
     };
+    let mut ctx = ReactorCtx {
+        ui: &mut ui,
+        queue: &queue,
+        history_store: &history_store,
+        permission_handler: &permission_handler,
+        permission_rx: &mut permission_rx,
+        memory_events: &mut memory_event_rx,
+        memory: memory.as_ref(),
+        autosave: &autosave,
+    };
     if let Some(runtime) = mcp_runtime.as_mut() {
         let config = runtime.config.clone();
         let targets = runtime.configured_targets();
         if drive_mcp_discovery(
+            &mut ctx,
             &mut registry,
             &config,
             runtime,
             &targets,
-            &mut ui,
-            &queue,
-            &history_store,
-            &mut permission_rx,
-            &permission_handler,
-            &mut memory_event_rx,
             &startup_durable,
         )
         .await?
@@ -2620,29 +2078,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut system_prompt = include_str!("../SYSTEM_PROMPT.md").to_string();
-    system_prompt.push_str(&format!(
-        "\n\n## Active archive scope\n\nThis run's history and episodic-memory scope is `{}`. \
-         Current-scope storage is isolated from every other project. Global or other-project \
-         archives are available only through the permission-gated search/read tools; never \
-         assume or retrieve them automatically.",
-        scope.display_name()
-    ));
-    if let Some(index) = generalist::skills::skills_index(profile_paths.skills_directory()) {
-        system_prompt.push_str(&index);
-    }
-    if let Some(project_root) = scope.project_root() {
-        for name in ["AGENTS.md", "CLAUDE.md"] {
-            let path = project_root.join(name);
-            if let Ok(notes) = fs::read_to_string(&path) {
-                system_prompt.push_str(&format!(
-                    "\n\n## Project notes ({})\n\n{notes}",
-                    path.display()
-                ));
-                break;
-            }
-        }
-    }
+    let system_prompt = compose_system_prompt(&scope, &profile_paths);
 
     let mut agent = Agent::new(provider, registry, system_prompt);
     agent.max_tokens = cli.max_tokens;
@@ -2650,43 +2086,37 @@ async fn main() -> Result<()> {
     if !startup_history.is_empty() {
         agent.replace_history(startup_history);
     }
-    ui.sync_queue(&queue);
-    ui.set_goal(agent.goal());
-    ui.set_session(
+    ctx.ui.sync_queue(ctx.queue);
+    ctx.ui.set_goal(agent.goal());
+    ctx.ui.set_session(
         agent.provider().display_name(),
         agent.provider().model(),
         agent.registry.tool_names().len(),
     );
-    ui.set_context_tokens(agent.context_tokens());
+    ctx.ui.set_context_tokens(agent.context_tokens());
 
     let mut ticker = tokio::time::interval(Duration::from_millis(50));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut exiting = false;
 
     while !exiting {
-        queue.normalize_steers();
-        ui.sync_queue(&queue);
+        ctx.queue.normalize_steers();
+        ctx.ui.sync_queue(ctx.queue);
 
-        if let Some(claim) = queue.claim_follow_up() {
+        if let Some(claim) = ctx.queue.claim_follow_up() {
             let prompt = claim.prompts()[0].clone();
             if prompt.source == PromptSource::GoalContinuation && agent.goal().is_none() {
                 claim.commit();
-                ui.sync_queue(&queue);
+                ctx.ui.sync_queue(ctx.queue);
                 continue;
             } else if is_local_command(&prompt.text) {
                 claim.commit();
                 exiting = matches!(
                     execute_command(
+                        &mut ctx,
                         &prompt.text,
                         &mut agent,
-                        &mut ui,
-                        &queue,
-                        &history_store,
-                        &mut permission_rx,
-                        &permission_handler,
-                        memory.as_ref(),
                         &profile_paths,
-                        &mut memory_event_rx,
                         &mut mcp_runtime,
                         &keys,
                         &available,
@@ -2701,72 +2131,64 @@ async fn main() -> Result<()> {
                 agent.begin_queued_turn(&prompt);
                 claim.commit();
                 if prompt.source == PromptSource::GoalContinuation {
-                    ui.info("Continuing the active goal automatically.");
+                    ctx.ui.info("Continuing the active goal automatically.");
                 } else {
-                    ui.push_user(prompt.text.trim());
+                    ctx.ui.push_user(prompt.text.trim());
                 }
-                if let Err(error) = history_store.save(
-                    &make_saved_state(&agent, &permission_handler, &queue, history_store.scope()),
-                    AUTOSAVE_NAME,
-                ) {
-                    ui.error(&format!("Failed to persist the started turn: {error}"));
-                }
+                ctx.autosave.save(make_saved_state(
+                    &agent,
+                    ctx.permission_handler,
+                    ctx.queue,
+                    ctx.history_store.scope(),
+                ));
                 exiting = drive_started_turn(
+                    &mut ctx,
                     &mut agent,
-                    &mut ui,
-                    &queue,
-                    &history_store,
-                    &mut permission_rx,
-                    &permission_handler,
-                    memory.as_ref(),
-                    &mut memory_event_rx,
-                    &prompt.text,
-                    prompt.source,
-                    episode_history_start,
-                    episode_history_revision,
-                    started_at,
+                    EpisodeContext {
+                        prompt: &prompt.text,
+                        prompt_source: prompt.source,
+                        history_start: episode_history_start,
+                        history_revision: episode_history_revision,
+                        started_at,
+                    },
                 )
                 .await?;
             }
-            if let Err(error) = history_store.save(
-                &make_saved_state(&agent, &permission_handler, &queue, history_store.scope()),
-                AUTOSAVE_NAME,
-            ) {
-                ui.error(&format!("Failed to persist settled runtime state: {error}"));
-            }
+            ctx.autosave.save(make_saved_state(
+                &agent,
+                ctx.permission_handler,
+                ctx.queue,
+                ctx.history_store.scope(),
+            ));
             continue;
         }
 
-        ui.set_busy(false, "Ready");
+        ctx.ui.set_busy(false, "Ready");
+        let ReactorCtx {
+            ui,
+            queue,
+            history_store,
+            permission_handler,
+            permission_rx,
+            memory_events,
+            autosave,
+            ..
+        } = &mut ctx;
+        let ui: &mut TerminalUi = ui;
         tokio::select! {
             biased;
             Some(permission_event) = permission_rx.recv() => {
-                match permission_event {
-                    PermissionUiEvent::Request(request) => {
-                        let _ = request.reply.send(PermissionChoice::DenyOnce);
-                        ui.error("Ignored a stale permission request with no active turn.");
-                    }
-                    PermissionUiEvent::Automatic { request, allowed } => {
-                        ui.status(&format!(
-                            "{} was {} by remembered policy",
-                            request.tool_name,
-                            if allowed { "auto-allowed" } else { "auto-denied" }
-                        ));
-                    }
-                }
+                handle_stale_permission_event(ui, permission_event);
             }
-            Some(event) = memory_event_rx.recv() => handle_memory_event(&mut ui, event),
-            _ = ticker.tick() => {
-                ui.tick();
-                ui.draw_if_dirty().map_err(|error| Error::Other(error.to_string()))?;
-            }
+            Some(event) = memory_events.recv() => handle_memory_event(ui, event),
+            _ = ticker.tick() => reactor_tick(ui, autosave)?,
             terminal_event = ui.next_event() => {
                 let action =
-                    terminal(ui.handle_event(terminal(terminal_event)?, &queue))?;
+                    terminal(ui.handle_event(terminal(terminal_event)?, queue))?;
                 let persist_queue = action.requires_queue_persist();
                 match action {
                     UiAction::Submit { text, delivery } => {
-                        enqueue_submission(&mut ui, &queue, text, delivery, false);
+                        enqueue_submission(ui, queue, text, delivery, false);
                     }
                     UiAction::Exit => exiting = true,
                     UiAction::None
@@ -2775,28 +2197,32 @@ async fn main() -> Result<()> {
                     | UiAction::Permission { .. } => {}
                 }
                 if persist_queue {
-                    if let Err(error) = history_store.save(
-                        &make_saved_state(
-                            &agent,
-                            &permission_handler,
-                            &queue,
-                            history_store.scope(),
-                        ),
-                        AUTOSAVE_NAME,
-                    ) {
-                        ui.error(&format!("Failed to persist runtime state: {error}"));
-                    }
+                    autosave.save(make_saved_state(
+                        &agent,
+                        permission_handler,
+                        queue,
+                        history_store.scope(),
+                    ));
                 }
             }
         }
     }
 
+    // Everything queued before exit must reach disk, and a final write error
+    // must not disappear merely because the reactor has stopped ticking.
+    let mut shutdown_errors = Vec::new();
+    if let Err(error) = autosave.flush() {
+        shutdown_errors.push(error.to_string());
+    }
     if let Some(memory) = &memory {
-        memory.flush().await.map_err(|error| {
-            Error::Other(format!(
+        if let Err(error) = memory.flush().await {
+            shutdown_errors.push(format!(
                 "Failed to flush episodic memory before exit: {error}"
-            ))
-        })?;
+            ));
+        }
+    }
+    if !shutdown_errors.is_empty() {
+        return Err(Error::Other(shutdown_errors.join("\n")));
     }
     Ok(())
 }
@@ -2804,6 +2230,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use generalist::{PermissionCommand, ToolsCommand};
 
     #[test]
     fn memory_export_uses_supplied_profile_directory() {
@@ -3028,6 +2455,21 @@ mod tests {
         let autosave = store.save(&state, AUTOSAVE_NAME).unwrap();
         assert!(autosave.starts_with(store.directory()));
         assert_eq!(store.load(AUTOSAVE_NAME).unwrap().model, "model-v2");
+    }
+
+    #[test]
+    fn autosave_flush_persists_the_latest_queued_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(home.path().to_path_buf(), WorkspaceScope::Global).unwrap();
+        let writer = AutosaveWriter::spawn(store.clone());
+        let first = SavedState::new(WorkspaceScope::Global, "openai".into(), "first".into());
+        let latest = SavedState::new(WorkspaceScope::Global, "openai".into(), "latest".into());
+
+        writer.save(first);
+        writer.save(latest);
+        writer.flush().unwrap();
+
+        assert_eq!(store.load(AUTOSAVE_NAME).unwrap().model, "latest");
     }
 
     #[test]
@@ -3256,8 +2698,8 @@ mod tests {
         assert!(agent.history().is_empty());
     }
 
-    #[test]
-    fn history_catalog_is_sorted_searchable_sanitized_and_non_mutating() {
+    #[tokio::test]
+    async fn history_catalog_is_sorted_searchable_sanitized_and_non_mutating() {
         let home = tempfile::tempdir().unwrap();
         let store = HistoryStore::open(home.path().to_path_buf(), WorkspaceScope::Global).unwrap();
         let mut alpha = SavedState::new(WorkspaceScope::Global, "openai".into(), "model-a".into());
@@ -3294,13 +2736,19 @@ mod tests {
         let path = store.save(&zeta, "zeta").unwrap();
         let before = fs::read(&path).unwrap();
 
-        let list = run_history_command(HistoryCommand::List, &store).unwrap();
+        let list = run_history_command(HistoryCommand::List, &store)
+            .await
+            .unwrap();
         assert!(list.find("  alpha").unwrap() < list.find("  zeta").unwrap());
-        let search = run_history_command(HistoryCommand::Search("SEARCH-NEEDLE"), &store).unwrap();
+        let search = run_history_command(HistoryCommand::Search("SEARCH-NEEDLE"), &store)
+            .await
+            .unwrap();
         assert!(search.contains("1 current-scope saved session(s)"));
         assert!(search.contains("zeta"));
         assert!(!search.contains("alpha"));
-        let show = run_history_command(HistoryCommand::Show("zeta"), &store).unwrap();
+        let show = run_history_command(HistoryCommand::Show("zeta"), &store)
+            .await
+            .unwrap();
         for included in [
             "Saved session zeta",
             "prospective archive goal",
@@ -3321,9 +2769,11 @@ mod tests {
             assert!(!show.contains(excluded), "displayed {excluded}");
         }
         assert!(run_history_command(HistoryCommand::Show("missing"), &store)
+            .await
             .unwrap()
             .contains("No current-scope saved session"));
         assert!(run_history_command(HistoryCommand::Forget("zeta"), &store)
+            .await
             .unwrap_err()
             .to_string()
             .contains("interactive host confirmation"));

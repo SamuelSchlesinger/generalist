@@ -1,3 +1,6 @@
+use crate::subprocess::{
+    collect_bounded, combine_output, kill_process_group, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS,
+};
 use crate::{Error, Result, Tool};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -6,8 +9,6 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
-const DEFAULT_TIMEOUT_SECS: u64 = 120;
-const MAX_TIMEOUT_SECS: u64 = 600;
 /// Output cap before spilling to a file: keep the *tail* (errors and results
 /// live at the end of command output).
 const MAX_OUTPUT_CHARS: usize = 50_000;
@@ -82,46 +83,49 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
-        let child = Command::new("bash")
+        let mut child = Command::new("bash")
             .arg("-c")
             .arg(command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Own process group so a timeout can kill descendants too.
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| Error::Tool(format!("Failed to start bash: {}", e)))?;
 
-        let output =
-            match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-                Ok(result) => {
-                    result.map_err(|e| Error::Tool(format!("Failed to run bash command: {}", e)))?
-                }
-                // Dropping the future kills the child (kill_on_drop).
-                Err(_) => {
-                    return Ok(format!(
-                        "Command timed out after {} seconds and was killed.",
-                        timeout_secs
-                    ))
-                }
+        let stdout_pipe = child.stdout.take().expect("stdout piped");
+        let stderr_pipe = child.stderr.take().expect("stderr piped");
+        // Drain both pipes concurrently with the wait, with bounded memory,
+        // so a chatty command can neither dead-lock nor OOM. The inner scope
+        // ends the future's borrow of `child` before the timeout kill.
+        let finished = {
+            let run = async {
+                tokio::join!(
+                    child.wait(),
+                    collect_bounded(stdout_pipe, "generalist-bash-stdout-"),
+                    collect_bounded(stderr_pipe, "generalist-bash-stderr-"),
+                )
             };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        let combined = if output.status.success() && stderr.is_empty() {
-            stdout.to_string()
-        } else if output.status.success() {
-            format!("{}\nStderr:\n{}", stdout, stderr)
-        } else {
-            format!(
-                "Exit code: {}\nStdout:\n{}\nStderr:\n{}",
-                output.status.code().unwrap_or(-1),
-                stdout,
-                stderr
-            )
+            tokio::pin!(run);
+            timeout(Duration::from_secs(timeout_secs), &mut run)
+                .await
+                .ok()
         };
+        let Some((status, stdout, stderr)) = finished else {
+            // A timeout is a structured failure, never a success result.
+            kill_process_group(&child);
+            let _ = child.start_kill();
+            return Err(Error::Tool(format!(
+                "Command timed out after {} seconds and was killed.",
+                timeout_secs
+            )));
+        };
+        let status =
+            status.map_err(|e| Error::Tool(format!("Failed to run bash command: {}", e)))?;
 
+        let combined = combine_output(status, &stdout.into_text(), &stderr.into_text());
         Ok(tail_truncate_with_spill(&combined))
     }
 }
@@ -147,11 +151,11 @@ mod tests {
 
     #[tokio::test]
     async fn times_out_and_kills() {
-        let result = BashTool
+        let error = BashTool
             .execute(json!({"command": "sleep 30", "timeout_seconds": 1}))
             .await
-            .unwrap();
-        assert!(result.contains("timed out"));
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]

@@ -39,7 +39,9 @@ fn parse_skill(dir_name: &str, path: &Path, content: &str) -> Skill {
             if let Some(value) = line.strip_prefix("name:") {
                 name = value.trim().to_string();
             } else if let Some(value) = line.strip_prefix("description:") {
-                description = value.trim().to_string();
+                // Same bound as the fallback below: descriptions enter the
+                // system prompt, so frontmatter cannot bypass the cap.
+                description = value.trim().chars().take(200).collect();
             }
         }
     }

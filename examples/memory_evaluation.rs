@@ -465,7 +465,7 @@ async fn evaluate_exit_boundary(root: &Path) -> Result<ExitBoundaryReport> {
         }
         let memory = EpisodicMemory::open(database.clone(), project.clone())?;
         let matches = memory.search(&marker).await?;
-        match matches.as_slice() {
+        match matches.summaries.as_slice() {
             [] => enqueue_absent += 1,
             [summary] => {
                 let episode = memory.show(&summary.id).await?.ok_or_else(|| {
@@ -502,7 +502,7 @@ async fn evaluate_exit_boundary(root: &Path) -> Result<ExitBoundaryReport> {
         }
         let memory = EpisodicMemory::open(database.clone(), project.clone())?;
         let matches = memory.search(&marker).await?;
-        if let [summary] = matches.as_slice() {
+        if let [summary] = matches.summaries.as_slice() {
             let episode = memory
                 .show(&summary.id)
                 .await?
@@ -565,7 +565,7 @@ async fn evaluate_exit_boundary(root: &Path) -> Result<ExitBoundaryReport> {
         lock.execute_batch("ROLLBACK")?;
         let memory = EpisodicMemory::open(database.clone(), project.clone())?;
         let matches = memory.search(&marker).await?;
-        if matches.is_empty() {
+        if matches.summaries.is_empty() {
             locked_absent += 1;
         } else {
             duplicate_or_partial_rows += 1;
@@ -709,6 +709,7 @@ async fn evaluate() -> Result<EvaluationReport> {
             b0_memory
                 .search(&query.query)
                 .await?
+                .summaries
                 .into_iter()
                 .map(|match_| match_.id)
                 .collect(),
@@ -773,15 +774,19 @@ async fn evaluate() -> Result<EvaluationReport> {
     let all_scope_match_count = all_value["matches"].as_array().map_or(0, Vec::len);
     let scope_isolation = ScopeIsolationReport {
         current_scope_matches: current_matches
+            .summaries
             .iter()
             .filter_map(|summary| b1_aliases.get(&summary.id).cloned())
             .collect(),
         all_scope_match_count,
-        leaked_other_project_record: current_matches.iter().any(|summary| summary.id == other_id),
+        leaked_other_project_record: current_matches
+            .summaries
+            .iter()
+            .any(|summary| summary.id == other_id),
     };
 
-    let retained_export = b1_memory.export().await?;
-    let b0_logical_bytes = serde_json::to_vec(&b0_memory.export().await?)?.len() as u64;
+    let retained_export = b1_memory.export().await?.episodes;
+    let b0_logical_bytes = serde_json::to_vec(&b0_memory.export().await?.episodes)?.len() as u64;
     let logical_memory_bytes = serde_json::to_vec(&retained_export)?.len() as u64;
     let b1_allocated_before_delete = database_bytes(&b1_path)?;
     let deletion_target = b1_aliases
@@ -789,13 +794,21 @@ async fn evaluate() -> Result<EvaluationReport> {
         .find_map(|(id, record)| (record == "rare_safety").then(|| id.clone()))
         .ok_or_else(|| generalist::Error::Other("missing deletion target".into()))?;
     let forget = b1_memory.forget(&deletion_target).await?;
-    let live_search_absent = b1_memory.search("SAFE-QUARTZ-73").await?.is_empty();
+    let live_search_absent = b1_memory
+        .search("SAFE-QUARTZ-73")
+        .await?
+        .summaries
+        .is_empty();
     let exported_snapshot_still_contains_record = retained_export
         .iter()
         .any(|episode| episode.id == deletion_target);
     drop(b1_memory);
     let reopened = EpisodicMemory::open_scoped(b1_path.clone(), scope.clone())?;
-    let restart_search_absent = reopened.search("SAFE-QUARTZ-73").await?.is_empty();
+    let restart_search_absent = reopened
+        .search("SAFE-QUARTZ-73")
+        .await?
+        .summaries
+        .is_empty();
     let b1_allocated_after_delete = database_bytes(&b1_path)?;
     let deletion = DeletionReport {
         live_search_absent,

@@ -4,10 +4,35 @@ use crate::types::truncate_middle;
 use async_trait::async_trait;
 use dialoguer::{console::style, theme::ColorfulTheme, Select};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{mpsc, oneshot};
+
+/// Tools whose interactive "always allow" is remembered per exact input
+/// rather than per name: one prompt-fatigue click on an arbitrary-code tool
+/// must never become a standing grant for every future command. Explicit
+/// name-level policy (the `/permission` command or a loaded saved state)
+/// remains honored as configured.
+const EXACT_INPUT_TOOLS: [&str; 2] = ["bash", "python"];
+
+/// Whether an interactive "always allow" for this tool is scoped to the
+/// exact input instead of the tool name.
+pub fn remembers_exact_input(tool_name: &str) -> bool {
+    EXACT_INPUT_TOOLS.contains(&tool_name)
+}
+
+/// Session key for one exact (tool, input) grant. `\u{0}` cannot appear in a
+/// tool name, so the key is unambiguous.
+fn exact_input_key(tool_name: &str, input: &Value) -> String {
+    format!("{tool_name}\u{0}{input}")
+}
+
+/// Poison-tolerant lock: the guarded sets are plain collections, so a panic
+/// in another thread must not cascade into the permission path.
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Decision on whether a tool call may run.
 #[derive(Debug, Clone, PartialEq)]
@@ -174,7 +199,7 @@ impl PermissionPrompt for ConsolePermissionPrompt {
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
             Self::print_request(&request);
-            Self::choose_blocking()
+            Self::choose_blocking(remembers_exact_input(&request.tool_name))
         })
         .await
         .unwrap_or(PermissionChoice::DenyOnce)
@@ -200,9 +225,13 @@ impl PermissionPrompt for ConsolePermissionPrompt {
 }
 
 impl ConsolePermissionPrompt {
-    fn choose_blocking() -> PermissionChoice {
+    fn choose_blocking(exact_input: bool) -> PermissionChoice {
         let choices = [
-            "Yes (always allow this tool)",
+            if exact_input {
+                "Yes (always allow this exact input, this session)"
+            } else {
+                "Yes (always allow this tool)"
+            },
             "Yes (just this once)",
             "No (never allow this tool)",
             "No (just this once)",
@@ -280,15 +309,18 @@ impl PermissionPrompt for PermissionBrokerPrompt {
     }
 }
 
-/// Interactive handler with remembered always/never decisions per tool.
+/// Interactive handler with remembered always/never decisions.
 ///
-/// Remembered "always allow" is per tool *name*, which means a remembered
-/// `bash` approval covers every future command. To keep that meaningful, the
+/// Remembered "always allow" is per tool *name* for ordinary tools; for
+/// arbitrary-code tools (see [`remembers_exact_input`]) an interactive
+/// approval is remembered per exact input for this session only. The
 /// auto-allow path still prints the full input before execution.
 #[derive(Clone)]
 pub struct MemoryPermissionHandler {
     always_allow: Arc<Mutex<HashSet<String>>>,
     always_deny: Arc<Mutex<HashSet<String>>>,
+    /// Session-scoped exact (tool, input) grants; never persisted.
+    always_allow_exact: Arc<Mutex<HashSet<String>>>,
     prompt: Arc<dyn PermissionPrompt>,
 }
 
@@ -300,20 +332,20 @@ impl Default for MemoryPermissionHandler {
 
 impl MemoryPermissionHandler {
     pub fn new() -> Self {
-        Self {
-            always_allow: Arc::new(Mutex::new(HashSet::new())),
-            always_deny: Arc::new(Mutex::new(HashSet::new())),
-            prompt: Arc::new(ConsolePermissionPrompt),
-        }
+        Self::with_shared_state_and_prompt(
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(ConsolePermissionPrompt),
+        )
     }
 
     /// Create an empty remembered policy using a custom interactive frontend.
     pub fn with_prompt(prompt: Arc<dyn PermissionPrompt>) -> Self {
-        Self {
-            always_allow: Arc::new(Mutex::new(HashSet::new())),
-            always_deny: Arc::new(Mutex::new(HashSet::new())),
+        Self::with_shared_state_and_prompt(
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(HashSet::new())),
             prompt,
-        }
+        )
     }
 
     /// Create a handler sharing decision state with another.
@@ -321,11 +353,11 @@ impl MemoryPermissionHandler {
         always_allow: Arc<Mutex<HashSet<String>>>,
         always_deny: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
-        Self {
+        Self::with_shared_state_and_prompt(
             always_allow,
             always_deny,
-            prompt: Arc::new(ConsolePermissionPrompt),
-        }
+            Arc::new(ConsolePermissionPrompt),
+        )
     }
 
     /// Create a handler sharing both remembered state and a custom frontend.
@@ -337,8 +369,20 @@ impl MemoryPermissionHandler {
         Self {
             always_allow,
             always_deny,
+            always_allow_exact: Arc::new(Mutex::new(HashSet::new())),
             prompt,
         }
+    }
+
+    /// Lock both name sets in a fixed order (allow, then deny) so every call
+    /// site preserves the same deadlock-free ordering.
+    fn lock_both(
+        &self,
+    ) -> (
+        MutexGuard<'_, HashSet<String>>,
+        MutexGuard<'_, HashSet<String>>,
+    ) {
+        (locked(&self.always_allow), locked(&self.always_deny))
     }
 
     pub fn always_allow(&self) -> Arc<Mutex<HashSet<String>>> {
@@ -350,15 +394,13 @@ impl MemoryPermissionHandler {
     }
 
     pub fn set_always_allow(&self, tools: HashSet<String>) {
-        let mut always_allow = self.always_allow.lock().unwrap();
-        let mut always_deny = self.always_deny.lock().unwrap();
+        let (mut always_allow, mut always_deny) = self.lock_both();
         always_deny.retain(|tool| !tools.contains(tool));
         *always_allow = tools;
     }
 
     pub fn set_always_deny(&self, tools: HashSet<String>) {
-        let mut always_allow = self.always_allow.lock().unwrap();
-        let mut always_deny = self.always_deny.lock().unwrap();
+        let (mut always_allow, mut always_deny) = self.lock_both();
         always_allow.retain(|tool| !tools.contains(tool));
         *always_deny = tools;
     }
@@ -371,16 +413,20 @@ impl MemoryPermissionHandler {
         always_deny: HashSet<String>,
     ) {
         always_allow.retain(|tool| !always_deny.contains(tool));
-        let mut current_allow = self.always_allow.lock().unwrap();
-        let mut current_deny = self.always_deny.lock().unwrap();
+        let (mut current_allow, mut current_deny) = self.lock_both();
+        let mut exact = locked(&self.always_allow_exact);
         *current_allow = always_allow;
         *current_deny = always_deny;
+        // Exact grants are deliberately not persisted. Replacing policy from
+        // a saved session must not carry hidden executable approvals over
+        // from the conversation that was active before the load.
+        exact.clear();
     }
 
-    /// Take a consistent, fail-closed snapshot for display or persistence.
+    /// Take a consistent, fail-closed snapshot for persistence.
+    /// Session-scoped exact-input grants are deliberately excluded.
     pub fn remembered_policy(&self) -> RememberedPermissionPolicy {
-        let current_allow = self.always_allow.lock().unwrap();
-        let current_deny = self.always_deny.lock().unwrap();
+        let (current_allow, current_deny) = self.lock_both();
         let mut always_allow = current_allow.clone();
         always_allow.retain(|tool| !current_deny.contains(tool));
         RememberedPermissionPolicy {
@@ -389,27 +435,58 @@ impl MemoryPermissionHandler {
         }
     }
 
-    /// Remove any remembered decision for one exact tool name.
+    /// Count session-only exact-input grants by tool without disclosing the
+    /// potentially sensitive executable inputs themselves.
+    pub fn session_exact_allow_counts(&self) -> Vec<(String, usize)> {
+        let mut counts = BTreeMap::<String, usize>::new();
+        for key in locked(&self.always_allow_exact).iter() {
+            if let Some((tool, _)) = key.split_once('\0') {
+                *counts.entry(tool.to_string()).or_default() += 1;
+            }
+        }
+        counts.into_iter().collect()
+    }
+
+    /// Remove any remembered decision for one exact tool name, including its
+    /// session-scoped exact-input grants.
     pub fn reset_remembered_tool(&self, tool: &str) -> bool {
-        let mut always_allow = self.always_allow.lock().unwrap();
-        let mut always_deny = self.always_deny.lock().unwrap();
-        always_allow.remove(tool) | always_deny.remove(tool)
+        let (mut always_allow, mut always_deny) = self.lock_both();
+        let mut exact = locked(&self.always_allow_exact);
+        let prefix = format!("{tool}\u{0}");
+        let had_exact = exact.iter().any(|key| key.starts_with(&prefix));
+        exact.retain(|key| !key.starts_with(&prefix));
+        always_allow.remove(tool) | always_deny.remove(tool) | had_exact
     }
 
     /// Remove every remembered decision and return the number of distinct
     /// affected tools.
     pub fn clear_remembered_policy(&self) -> usize {
-        let mut always_allow = self.always_allow.lock().unwrap();
-        let mut always_deny = self.always_deny.lock().unwrap();
-        let count = always_allow.union(&always_deny).count();
+        let (mut always_allow, mut always_deny) = self.lock_both();
+        let mut exact = locked(&self.always_allow_exact);
+        let mut affected = always_allow
+            .union(&always_deny)
+            .cloned()
+            .collect::<HashSet<_>>();
+        affected.extend(
+            exact
+                .iter()
+                .filter_map(|key| key.split_once('\0').map(|(tool, _)| tool.to_string())),
+        );
         always_allow.clear();
         always_deny.clear();
-        count
+        exact.clear();
+        affected.len()
     }
 
-    fn remember(&self, tool: &str, allowed: bool) {
-        let mut always_allow = self.always_allow.lock().unwrap();
-        let mut always_deny = self.always_deny.lock().unwrap();
+    fn remember(&self, request: &ToolExecutionRequest, allowed: bool) {
+        let tool = request.tool_name.as_str();
+        if allowed && remembers_exact_input(tool) {
+            // An interactive approval of an arbitrary-code tool covers this
+            // exact input only, and only for this session.
+            locked(&self.always_allow_exact).insert(exact_input_key(tool, &request.input));
+            return;
+        }
+        let (mut always_allow, mut always_deny) = self.lock_both();
         if allowed {
             always_deny.remove(tool);
             always_allow.insert(tool.to_string());
@@ -424,7 +501,7 @@ impl MemoryPermissionHandler {
 impl ToolPermissionHandler for MemoryPermissionHandler {
     async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision {
         {
-            let always_deny = self.always_deny.lock().unwrap();
+            let always_deny = locked(&self.always_deny);
             if always_deny.contains(&request.tool_name) {
                 self.prompt.automatic_decision(request, false);
                 return PermissionDecision::DenyWithReason(
@@ -434,21 +511,29 @@ impl ToolPermissionHandler for MemoryPermissionHandler {
         }
 
         {
-            let always_allow = self.always_allow.lock().unwrap();
+            let always_allow = locked(&self.always_allow);
             if always_allow.contains(&request.tool_name) {
                 self.prompt.automatic_decision(request, true);
                 return PermissionDecision::Allow;
             }
         }
 
+        if remembers_exact_input(&request.tool_name)
+            && locked(&self.always_allow_exact)
+                .contains(&exact_input_key(&request.tool_name, &request.input))
+        {
+            self.prompt.automatic_decision(request, true);
+            return PermissionDecision::Allow;
+        }
+
         match self.prompt.choose(request).await {
             PermissionChoice::AllowAlways => {
-                self.remember(&request.tool_name, true);
+                self.remember(request, true);
                 PermissionDecision::Allow
             }
             PermissionChoice::AllowOnce => PermissionDecision::Allow,
             PermissionChoice::DenyAlways => {
-                self.remember(&request.tool_name, false);
+                self.remember(request, false);
                 PermissionDecision::DenyWithReason(
                     "User chose to never allow this tool".to_string(),
                 )
@@ -545,6 +630,168 @@ mod tests {
         let policy = handler.remembered_policy();
         assert!(policy.always_allow.is_empty());
         assert_eq!(policy.always_deny, ["bash".to_string()].into());
+    }
+
+    /// Prompt scripted to return a fixed choice, counting invocations.
+    struct ScriptedPrompt {
+        choice: PermissionChoice,
+        prompts: std::sync::atomic::AtomicU64,
+        automatic: std::sync::atomic::AtomicU64,
+    }
+
+    impl ScriptedPrompt {
+        fn new(choice: PermissionChoice) -> Arc<Self> {
+            Arc::new(Self {
+                choice,
+                prompts: 0.into(),
+                automatic: 0.into(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl PermissionPrompt for ScriptedPrompt {
+        async fn choose(&self, _request: &ToolExecutionRequest) -> PermissionChoice {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            self.choice
+        }
+        fn automatic_decision(&self, _request: &ToolExecutionRequest, _allowed: bool) {
+            self.automatic.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn request_with_input(name: &str, input: Value) -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            tool_use_id: "id".into(),
+            tool_name: name.into(),
+            input,
+            tool_description: "desc".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_always_allow_persists_and_undenies_ordinary_tools() {
+        let prompt = ScriptedPrompt::new(PermissionChoice::AllowAlways);
+        let handler = MemoryPermissionHandler::with_prompt(Arc::clone(&prompt) as _);
+        handler.set_always_deny(["read_file".to_string()].into());
+        // First deny is remembered; resetting clears it so the prompt runs.
+        assert!(matches!(
+            handler.check_permission(&request("read_file")).await,
+            PermissionDecision::DenyWithReason(_)
+        ));
+        assert!(handler.reset_remembered_tool("read_file"));
+
+        assert_eq!(
+            handler.check_permission(&request("read_file")).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 1);
+        // Remembered: the second identical call never prompts.
+        assert_eq!(
+            handler.check_permission(&request("read_file")).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 1);
+        assert!(handler
+            .remembered_policy()
+            .always_allow
+            .contains("read_file"));
+    }
+
+    #[tokio::test]
+    async fn interactive_always_allow_on_exec_tools_covers_only_the_exact_input() {
+        let prompt = ScriptedPrompt::new(PermissionChoice::AllowAlways);
+        let handler = MemoryPermissionHandler::with_prompt(Arc::clone(&prompt) as _);
+
+        let ls = request_with_input("bash", json!({"command": "ls"}));
+        assert_eq!(
+            handler.check_permission(&ls).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 1);
+
+        // The identical command is auto-allowed without another prompt...
+        assert_eq!(
+            handler.check_permission(&ls).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(prompt.automatic.load(Ordering::SeqCst), 1);
+
+        // ...but a different command prompts again.
+        let rm = request_with_input("bash", json!({"command": "rm -rf /"}));
+        assert_eq!(
+            handler.check_permission(&rm).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 2);
+
+        // Nothing leaks into the persisted name-level policy.
+        assert!(handler.remembered_policy().always_allow.is_empty());
+        // Resetting the tool clears the session grants.
+        assert!(handler.reset_remembered_tool("bash"));
+        assert_eq!(
+            handler.check_permission(&ls).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn clearing_exact_input_grants_reports_and_revokes_the_tool() {
+        let prompt = ScriptedPrompt::new(PermissionChoice::AllowAlways);
+        let handler = MemoryPermissionHandler::with_prompt(Arc::clone(&prompt) as _);
+        let command = request_with_input("bash", json!({"command": "printf safe"}));
+
+        assert_eq!(
+            handler.check_permission(&command).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(handler.clear_remembered_policy(), 1);
+        assert_eq!(
+            handler.check_permission(&command).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn replacing_loaded_policy_clears_session_exact_input_grants() {
+        let prompt = ScriptedPrompt::new(PermissionChoice::AllowAlways);
+        let handler = MemoryPermissionHandler::with_prompt(Arc::clone(&prompt) as _);
+        let command = request_with_input("bash", json!({"command": "printf safe"}));
+
+        assert_eq!(
+            handler.check_permission(&command).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            handler.session_exact_allow_counts(),
+            vec![("bash".to_string(), 1)]
+        );
+        handler.replace_remembered_policy(HashSet::new(), HashSet::new());
+        assert!(handler.session_exact_allow_counts().is_empty());
+
+        assert_eq!(
+            handler.check_permission(&command).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn explicit_name_level_exec_allow_is_still_honored() {
+        // A deliberate `/permission`-style grant is configuration, not a
+        // prompt-fatigue click, and keeps name-level semantics.
+        let prompt = ScriptedPrompt::new(PermissionChoice::DenyOnce);
+        let handler = MemoryPermissionHandler::with_prompt(Arc::clone(&prompt) as _);
+        handler.set_always_allow(["bash".to_string()].into());
+        let ls = request_with_input("bash", json!({"command": "ls"}));
+        assert_eq!(
+            handler.check_permission(&ls).await,
+            PermissionDecision::Allow
+        );
+        assert_eq!(prompt.prompts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

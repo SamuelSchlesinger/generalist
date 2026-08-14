@@ -295,43 +295,39 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Tool definitions in registration order, filtered by `included`.
+    ///
+    /// The order is deterministic on purpose: providers that cache the prompt
+    /// prefix would otherwise miss the cache whenever a HashMap iteration
+    /// order changed.
+    fn tool_defs_where(&self, included: impl Fn(&dyn Tool) -> bool) -> Vec<ToolDef> {
+        self.order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .filter(|tool| included(tool.as_ref()))
+            .map(|tool| tool.to_tool_def())
+            .collect()
+    }
+
     /// Direct tool definitions in registration order, excluding code-only
     /// tools. When built-in code mode is active, these definitions are folded
     /// into the sole model-facing `python` capability tool instead of being
     /// independently callable. Host controls such as `update_goal` are owned
     /// by [`crate::Agent`] and never enter this registry.
-    ///
-    /// The order is deterministic on purpose: providers that cache the prompt
-    /// prefix would otherwise miss the cache whenever a HashMap iteration
-    /// order changed.
     pub fn get_tool_defs(&self) -> Vec<ToolDef> {
-        self.order
-            .iter()
-            .filter_map(|name| self.tools.get(name))
-            .filter(|tool| !tool.code_only())
-            .map(|tool| tool.to_tool_def())
-            .collect()
+        self.tool_defs_where(|tool| !tool.code_only())
     }
 
     /// Every tool, including code-only ones — the set exposed to code-mode
     /// scripts through the generated `tools` module.
     pub fn get_bridge_tool_defs(&self) -> Vec<ToolDef> {
-        self.order
-            .iter()
-            .filter_map(|name| self.tools.get(name))
-            .map(|tool| tool.to_tool_def())
-            .collect()
+        self.tool_defs_where(|_| true)
     }
 
     /// Definitions of progressive-disclosure tools, used to list their names
     /// without folding their full schemas into the `python` description.
     pub fn code_only_tool_defs(&self) -> Vec<ToolDef> {
-        self.order
-            .iter()
-            .filter_map(|name| self.tools.get(name))
-            .filter(|tool| tool.code_only())
-            .map(|tool| tool.to_tool_def())
-            .collect()
+        self.tool_defs_where(|tool| tool.code_only())
     }
 
     pub fn has_tool(&self, name: &str) -> bool {
@@ -369,12 +365,15 @@ impl ToolRegistry {
             tool_description: tool.description().to_string(),
         };
         let archive_request = archive_request(&request);
-        let model_request_id = self.model_trace.as_ref().map(ModelTrace::next_request_id);
-        if let Some(trace) = &self.model_trace {
+        // The trace and its allocated permission-request ID travel together,
+        // so no later step can observe one without the other.
+        let traced = self
+            .model_trace
+            .as_ref()
+            .map(|trace| (trace, trace.next_request_id()));
+        if let Some((trace, request_id)) = &traced {
             trace.record_async(AsyncModelAction::AskPermission {
-                request_id: model_request_id
-                    .clone()
-                    .expect("a model trace allocated no permission ID"),
+                request_id: request_id.clone(),
             });
             if let Some((kind, filter)) = archive_request {
                 trace.record_archive(ArchiveModelAction::RequestSearch {
@@ -389,11 +388,9 @@ impl ToolRegistry {
 
         match self.permission_handler.check_permission(&request).await {
             PermissionDecision::Allow => {
-                if let Some(trace) = &self.model_trace {
+                if let Some((trace, request_id)) = &traced {
                     trace.record_async(AsyncModelAction::AllowPermission {
-                        request_id: model_request_id
-                            .clone()
-                            .expect("a model trace allocated no permission ID"),
+                        request_id: request_id.clone(),
                     });
                 }
                 execution.state = ExecutionState::Executing;
@@ -418,7 +415,7 @@ impl ToolRegistry {
                 call_result
             }
             PermissionDecision::Deny => {
-                self.record_denial(model_request_id.as_deref(), archive_request);
+                record_denial(&traced, archive_request);
                 execution.deny("Permission denied");
                 self.executions.push(execution);
                 ToolCallResult::new(
@@ -428,7 +425,7 @@ impl ToolRegistry {
                 )
             }
             PermissionDecision::DenyWithReason(reason) => {
-                self.record_denial(model_request_id.as_deref(), archive_request);
+                record_denial(&traced, archive_request);
                 execution.deny(&reason);
                 self.executions.push(execution);
                 ToolCallResult::new(
@@ -447,25 +444,22 @@ impl ToolRegistry {
     pub fn clear_history(&mut self) {
         self.executions.clear();
     }
+}
 
-    fn record_denial(
-        &self,
-        request_id: Option<&str>,
-        archive_request: Option<(&'static str, ScopeFilter)>,
-    ) {
-        let Some(trace) = &self.model_trace else {
-            return;
-        };
-        trace.record_async(AsyncModelAction::DenyPermission {
-            request_id: request_id
-                .expect("a model trace allocated no permission ID")
-                .to_string(),
-        });
-        if let Some((kind, _)) = archive_request {
-            trace.record_archive(ArchiveModelAction::DenySearch);
-            if kind == "memory" {
-                trace.record_memory(MemoryModelAction::DenySearch);
-            }
+fn record_denial(
+    traced: &Option<(&ModelTrace, String)>,
+    archive_request: Option<(&'static str, ScopeFilter)>,
+) {
+    let Some((trace, request_id)) = traced else {
+        return;
+    };
+    trace.record_async(AsyncModelAction::DenyPermission {
+        request_id: request_id.clone(),
+    });
+    if let Some((kind, _)) = archive_request {
+        trace.record_archive(ArchiveModelAction::DenySearch);
+        if kind == "memory" {
+            trace.record_memory(MemoryModelAction::DenySearch);
         }
     }
 }

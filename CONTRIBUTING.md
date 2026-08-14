@@ -26,10 +26,12 @@ mappings are in
 `docs/runtime-traceability.md`. Treat that file as review evidence, not as
 architecture prose that can be updated from memory.
 
-For every change touching `src/main.rs`, `src/command.rs`, `src/goal.rs`, `src/tui.rs`,
-`src/runtime.rs`, `src/agent.rs`, `src/permissions.rs`, `src/codemode.rs`,
-`src/tool.rs`, `src/mcp.rs`, `src/provider/`, `src/types.rs`, or queue/goal-bearing
-persistence in `src/state.rs`, plus every change to `src/memory.rs`,
+For every change touching `src/main.rs`, `src/command.rs`, `src/commands.rs`,
+`src/goal.rs`, `src/tui/`, `src/runtime.rs`, `src/agent/`,
+`src/display_channel.rs`, `src/execution.rs`, `src/subprocess.rs`,
+`src/permissions.rs`, `src/codemode.rs`, `src/tool.rs`, `src/mcp.rs`,
+`src/provider/`, `src/types.rs`, or queue/goal-bearing persistence in
+`src/state.rs`, plus every change to `src/storage.rs`, `src/memory.rs`,
 `src/history.rs`, `src/scope.rs`, or `src/tools/archive.rs`:
 
 1. Read the changed Rust paths and the entire TLA+ action they refine. Do not
@@ -86,12 +88,16 @@ persistence in `src/state.rs`, plus every change to `src/memory.rs`,
    provider reasoning and with no reasoning field; answer text must stay out of
    the inspector, reasoning must stay out of conversation text, and provider
    signatures/redacted payloads must never render.
-   For remembered-policy changes, choose allow-always in the permission modal,
+   For remembered-policy changes, choose allow-always for an ordinary tool,
    verify `/permissions` and the scoped autosave show that exact tool, reset it,
-   and confirm the next use prompts again. Repeat with deny-always and
-   `/permissions clear`; a contradictory saved fixture must deny and normalize
-   to disjoint sets. Treat the command's rendered status as insufficient
-   without the subsequent prompt and durable JSON evidence.
+   and confirm the next use prompts again. For `bash` and `python`, verify the
+   same choice auto-allows only the identical input in the current process,
+   `/permissions` reports a session-only count without disclosing the input,
+   a different input prompts, the autosave omits the grant, and `/load` clears
+   it. Repeat with deny-always and `/permissions clear`; a contradictory saved
+   fixture must deny and normalize to disjoint name-level sets. Treat the
+   command's rendered status as insufficient without the subsequent prompt
+   and, where persistence is intended, durable JSON evidence.
    Exercise `/tools`, a case-insensitive `/tools search`, and `/tools show` on
    the rebuilt binary after MCP discovery. Confirm stable ordering, the
    schema-on-demand label, the separate model-facing interface, and that no

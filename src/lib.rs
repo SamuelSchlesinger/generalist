@@ -67,6 +67,8 @@ pub mod runtime;
 pub mod scope;
 pub mod skills;
 pub mod state;
+pub(crate) mod storage;
+pub(crate) mod subprocess;
 pub mod tool;
 pub mod tools;
 pub mod tui;
@@ -86,17 +88,18 @@ pub use history::{
     ArchivedConversation, ArchivedConversationEvent, ConversationSummary, HistoryStore,
 };
 pub use memory::{
-    default_memory_path, Episode, EpisodeEvent, EpisodeOutcome, EpisodeSummary, EpisodicMemory,
-    ForgetResult, MemoryEvent, MemoryStatus,
+    default_memory_path, CorruptEpisode, Episode, EpisodeEvent, EpisodeExport, EpisodeMatches,
+    EpisodeOutcome, EpisodeSummary, EpisodicMemory, ForgetResult, MemoryEvent, MemoryStatus,
 };
 pub use model_trace::{
     ArchiveModelAction, AsyncModelAction, MemoryModelAction, ModelKind, ModelTrace,
     ModelTraceSnapshot,
 };
 pub use permissions::{
-    AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler, PermissionBrokerPrompt,
-    PermissionChoice, PermissionDecision, PermissionPrompt, PermissionRequest, PermissionUiEvent,
-    PolicyPermissions, RememberedPermissionPolicy, ToolExecutionRequest, ToolPermissionHandler,
+    remembers_exact_input, AlwaysAllowPermissions, AlwaysDenyPermissions, MemoryPermissionHandler,
+    PermissionBrokerPrompt, PermissionChoice, PermissionDecision, PermissionPrompt,
+    PermissionRequest, PermissionUiEvent, PolicyPermissions, RememberedPermissionPolicy,
+    ToolExecutionRequest, ToolPermissionHandler,
 };
 pub use profile::ProfilePaths;
 pub use provider::Provider;

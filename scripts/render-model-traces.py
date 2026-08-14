@@ -62,7 +62,7 @@ def render_value(value: Any) -> str:
 
 
 def normalize_async(events: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
-    prompts = FiniteIds(["p1", "p2", "p3"], "prompt")
+    prompts = FiniteIds(["p1", "p2", "p3", "p4"], "prompt")
     requests = FiniteIds(["r1", "r2"], "permission request")
     normalized: list[tuple[Any, ...]] = []
     known = {
@@ -313,7 +313,7 @@ TraceCompletes == <>(traceIndex = Len(Trace) + 1)
 ASYNC_CONFIG = """SPECIFICATION TraceSpec
 
 CONSTANTS
-    PromptIds = {"p1", "p2", "p3"}
+    PromptIds = {"p1", "p2", "p3", "p4"}
     RequestIds = {"r1", "r2"}
     NoPrompt = NoPrompt
     NoRequest = NoRequest

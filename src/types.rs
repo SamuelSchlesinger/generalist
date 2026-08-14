@@ -224,7 +224,7 @@ impl CompletionLimits {
     pub(crate) fn checked_response_bytes(self, current: usize, additional: usize) -> Result<usize> {
         let observed = current.saturating_add(additional);
         if observed > self.max_response_bytes {
-            return Err(Error::Other(format!(
+            return Err(Error::Limit(format!(
                 "provider completion exceeded the host payload limit of {} bytes",
                 self.max_response_bytes
             )));
@@ -242,7 +242,7 @@ impl CompletionLimits {
     /// Validate a complete response before it becomes conversation history.
     pub fn validate_response(self, response: &CompletionResponse) -> Result<()> {
         if response.content.len() > self.max_content_blocks {
-            return Err(Error::Other(format!(
+            return Err(Error::Limit(format!(
                 "provider completion contained {} blocks; host limit is {}",
                 response.content.len(),
                 self.max_content_blocks
@@ -254,7 +254,7 @@ impl CompletionLimits {
             .filter(|block| matches!(block, ContentBlock::ToolUse { .. }))
             .count();
         if tool_uses > self.max_tool_uses {
-            return Err(Error::Other(format!(
+            return Err(Error::Limit(format!(
                 "provider completion contained {tool_uses} tool calls; host limit is {}",
                 self.max_tool_uses
             )));

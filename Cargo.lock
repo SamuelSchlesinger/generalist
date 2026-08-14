@@ -661,6 +661,7 @@ dependencies = [
  "exmex",
  "firecrawl",
  "futures-util",
+ "libc",
  "ratatui",
  "reqwest 0.13.4",
  "rusqlite",

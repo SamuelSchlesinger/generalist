@@ -102,10 +102,7 @@ impl ToolExecution {
 
     /// Mark the execution as completed with a result
     pub fn complete(&mut self, result: Result<String, String>) {
-        self.completed_at = Some(Utc::now());
-        self.duration_ms =
-            Some((self.completed_at.unwrap() - self.started_at).num_milliseconds() as u64);
-
+        self.finish();
         match result {
             Ok(output) => {
                 self.state = ExecutionState::Completed { result: output };
@@ -121,9 +118,15 @@ impl ToolExecution {
         self.state = ExecutionState::Denied {
             reason: reason.to_string(),
         };
-        self.completed_at = Some(Utc::now());
-        self.duration_ms =
-            Some((self.completed_at.unwrap() - self.started_at).num_milliseconds() as u64);
+        self.finish();
+    }
+
+    /// Stamp the completion time and duration. A clock stepping backwards
+    /// between start and finish clamps to zero rather than wrapping huge.
+    fn finish(&mut self) {
+        let now = Utc::now();
+        self.completed_at = Some(now);
+        self.duration_ms = Some((now - self.started_at).num_milliseconds().max(0) as u64);
     }
 
     /// Check if the execution is finished (completed, failed, or denied)

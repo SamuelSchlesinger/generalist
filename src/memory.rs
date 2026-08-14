@@ -120,6 +120,29 @@ pub struct EpisodeSummary {
     pub preview: String,
 }
 
+/// A stored row whose contents no longer decode, identified so the user can
+/// inspect or `/memory forget` it instead of losing the whole query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptEpisode {
+    pub id: String,
+    pub error: String,
+}
+
+/// Search results plus any rows that had to be skipped as corrupt. One bad
+/// row must never make every healthy episode unreachable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EpisodeMatches {
+    pub summaries: Vec<EpisodeSummary>,
+    pub corrupt: Vec<CorruptEpisode>,
+}
+
+/// Export results plus any rows that had to be skipped as corrupt.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EpisodeExport {
+    pub episodes: Vec<Episode>,
+    pub corrupt: Vec<CorruptEpisode>,
+}
+
 /// Current status of the local prototype.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryStatus {
@@ -158,14 +181,14 @@ enum Request {
     Search {
         query: String,
         filter: ScopeFilter,
-        reply: Reply<Vec<EpisodeSummary>>,
+        reply: Reply<EpisodeMatches>,
     },
     Show {
         id_prefix: String,
         filter: ScopeFilter,
         reply: Reply<Option<Episode>>,
     },
-    Export(Reply<Vec<Episode>>),
+    Export(Reply<EpisodeExport>),
     Forget {
         id_prefix: String,
         reply: Reply<ForgetResult>,
@@ -319,6 +342,11 @@ impl EpisodicMemory {
     /// Queue a settled turn without waiting for SQLite.
     ///
     /// Channel ordering ensures a later [`Self::flush`] observes this record.
+    ///
+    /// Durability contract: this is fire-and-forget. An episode is durable
+    /// only once the worker thread has committed it; on a crash or kill,
+    /// queued-but-unwritten episodes are lost. Clean shutdown calls `flush`,
+    /// which is the only point that guarantees the queue has drained.
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_settled_turn(
         &self,
@@ -400,7 +428,7 @@ impl EpisodicMemory {
         receive(response).await
     }
 
-    pub async fn search(&self, query: &str) -> Result<Vec<EpisodeSummary>> {
+    pub async fn search(&self, query: &str) -> Result<EpisodeMatches> {
         self.search_scoped_inner(query, ScopeFilter::Current).await
     }
 
@@ -411,12 +439,16 @@ impl EpisodicMemory {
         query: &str,
         filter: ScopeFilter,
         grant: &DisclosureGrant,
-    ) -> Result<Vec<EpisodeSummary>> {
+    ) -> Result<EpisodeMatches> {
         grant.ensure_search(DisclosureCapability::SearchMemories, query, filter)?;
         let matches = self.search_scoped_inner(query, filter).await?;
         if let Some(trace) = &self.model_trace {
             trace.record_memory(MemoryModelAction::ApproveSearch {
-                episode_ids: matches.iter().map(|episode| episode.id.clone()).collect(),
+                episode_ids: matches
+                    .summaries
+                    .iter()
+                    .map(|episode| episode.id.clone())
+                    .collect(),
             });
         }
         Ok(matches)
@@ -426,7 +458,7 @@ impl EpisodicMemory {
         &self,
         query: &str,
         filter: ScopeFilter,
-    ) -> Result<Vec<EpisodeSummary>> {
+    ) -> Result<EpisodeMatches> {
         let (reply, response) = oneshot::channel();
         self.send(Request::Search {
             query: query.to_string(),
@@ -477,7 +509,7 @@ impl EpisodicMemory {
         receive(response).await
     }
 
-    pub async fn export(&self) -> Result<Vec<Episode>> {
+    pub async fn export(&self) -> Result<EpisodeExport> {
         let (reply, response) = oneshot::channel();
         self.send(Request::Export(reply))?;
         receive(response).await
@@ -572,26 +604,7 @@ impl MemoryWorker {
                 database_path.display()
             ))
         })?;
-        reject_symlink(parent, "memory directory")?;
-        fs::create_dir_all(parent).map_err(|error| {
-            Error::Other(format!(
-                "Failed to create memory directory {}: {error}",
-                parent.display()
-            ))
-        })?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|error| {
-            Error::Other(format!(
-                "Failed to restrict memory directory {}: {error}",
-                parent.display()
-            ))
-        })?;
-        reject_symlink(parent, "memory directory")?;
-        if !parent.is_dir() {
-            return Err(Error::Other(format!(
-                "Memory directory {} is not a directory",
-                parent.display()
-            )));
-        }
+        crate::storage::ensure_private_directory(parent, "memory directory")?;
         let database_name = database_path.file_name().ok_or_else(|| {
             Error::Other(format!(
                 "Memory database {} has no file name",
@@ -659,6 +672,9 @@ impl MemoryWorker {
                 "Memory schema version {user_version} is newer than supported version {SCHEMA_VERSION}"
             )));
         }
+        // Migration ladder. Version 0 is a fresh database, brought to the
+        // current layout by the idempotent DDL below; each future schema
+        // change adds an explicit `if user_version < N` step here.
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS memory_settings (
@@ -689,11 +705,14 @@ impl MemoryWorker {
                  BEFORE UPDATE ON episodes
                  BEGIN
                      SELECT RAISE(ABORT, 'episodes are immutable');
-                 END;
-
-                 PRAGMA user_version = 1;",
+                 END;",
             )
             .map_err(sqlite_error("initialize schema"))?;
+        // Stamp from the const so the guard above and the stored version can
+        // never desynchronize.
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(sqlite_error("stamp schema version"))?;
         connection
             .execute(
                 "INSERT OR IGNORE INTO memory_settings(project_key, capture_enabled)
@@ -888,27 +907,22 @@ impl MemoryWorker {
         Ok(Some(episode.id))
     }
 
-    fn search(&self, query: &str, filter: ScopeFilter) -> Result<Vec<EpisodeSummary>> {
+    fn search(&self, query: &str, filter: ScopeFilter) -> Result<EpisodeMatches> {
         if query.trim().is_empty() {
             return Err(Error::Other("Memory search query cannot be empty".into()));
         }
         let global_key = WorkspaceScope::global().memory_key();
         let mut statement = self
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, project_root, settled_at, outcome, search_text
                  FROM episodes
-                 WHERE (
-                        (?1 = 'current' AND project_key = ?2)
-                     OR (?1 = 'global' AND project_key = ?3)
-                     OR (?1 = 'other_projects'
-                         AND project_key != ?2 AND project_key != ?3)
-                     OR (?1 = 'all')
-                 )
+                 WHERE {}
                    AND instr(lower(search_text), lower(?4)) > 0
                  ORDER BY settled_at DESC
                  LIMIT ?5",
-            )
+                scope_predicate_sql(1, 2, 3)
+            ))
             .map_err(sqlite_error("prepare episode search"))?;
         let rows = statement
             .query_map(
@@ -930,18 +944,28 @@ impl MemoryWorker {
                 },
             )
             .map_err(sqlite_error("search episodes"))?;
-        rows.map(|row| {
+        let mut matches = EpisodeMatches::default();
+        for row in rows {
             let (id, project_root, settled_at, outcome, search_text) =
                 row.map_err(sqlite_error("read episode search result"))?;
-            Ok(EpisodeSummary {
-                id,
-                project_root,
-                settled_at: parse_timestamp(&settled_at)?,
-                outcome: EpisodeOutcome::parse(&outcome)?,
-                preview: preview(&search_text, 180),
-            })
-        })
-        .collect()
+            let decoded = parse_timestamp(&settled_at).and_then(|settled_at| {
+                Ok(EpisodeSummary {
+                    id: id.clone(),
+                    project_root,
+                    settled_at,
+                    outcome: EpisodeOutcome::parse(&outcome)?,
+                    preview: crate::storage::normalized_preview(&search_text, 180),
+                })
+            });
+            match decoded {
+                Ok(summary) => matches.summaries.push(summary),
+                Err(error) => matches.corrupt.push(CorruptEpisode {
+                    id,
+                    error: error.to_string(),
+                }),
+            }
+        }
+        Ok(matches)
     }
 
     fn show(&self, id_prefix: &str, filter: ScopeFilter) -> Result<Option<Episode>> {
@@ -951,27 +975,32 @@ impl MemoryWorker {
         let global_key = WorkspaceScope::global().memory_key();
         self.connection
             .query_row(
-                "SELECT id, project_root, session_id, started_at, settled_at,
+                &format!(
+                    "SELECT id, project_root, session_id, started_at, settled_at,
                         outcome, provider, model, capture_quality, events_json
                  FROM episodes
                  WHERE id = ?1
-                   AND (
-                          (?2 = 'current' AND project_key = ?3)
-                       OR (?2 = 'global' AND project_key = ?4)
-                       OR (?2 = 'other_projects'
-                           AND project_key != ?3 AND project_key != ?4)
-                       OR (?2 = 'all')
-                   )",
+                   AND {}",
+                    scope_predicate_sql(2, 3, 4)
+                ),
                 params![id, filter.as_str(), &self.project_key, &global_key],
                 stored_episode_row,
             )
             .optional()
             .map_err(sqlite_error("read episode"))?
-            .map(StoredEpisode::decode)
+            .map(|stored| {
+                let id = stored.id.clone();
+                stored.decode().map_err(|error| {
+                    Error::Other(format!(
+                        "Stored episode {id} no longer decodes ({error}); \
+                         `/memory forget {id}` removes it"
+                    ))
+                })
+            })
             .transpose()
     }
 
-    fn export(&self) -> Result<Vec<Episode>> {
+    fn export(&self) -> Result<EpisodeExport> {
         let mut statement = self
             .connection
             .prepare(
@@ -985,8 +1014,19 @@ impl MemoryWorker {
         let rows = statement
             .query_map(params![&self.project_key], stored_episode_row)
             .map_err(sqlite_error("export episodes"))?;
-        rows.map(|row| row.map_err(sqlite_error("read exported episode"))?.decode())
-            .collect()
+        let mut export = EpisodeExport::default();
+        for row in rows {
+            let stored = row.map_err(sqlite_error("read exported episode"))?;
+            let id = stored.id.clone();
+            match stored.decode() {
+                Ok(episode) => export.episodes.push(episode),
+                Err(error) => export.corrupt.push(CorruptEpisode {
+                    id,
+                    error: error.to_string(),
+                }),
+            }
+        }
+        Ok(export)
     }
 
     fn forget(&self, id_prefix: &str) -> Result<(ForgetResult, Option<String>)> {
@@ -1040,19 +1080,14 @@ impl MemoryWorker {
         let global_key = WorkspaceScope::global().memory_key();
         let mut statement = self
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT id FROM episodes
-                 WHERE (
-                        (?1 = 'current' AND project_key = ?2)
-                     OR (?1 = 'global' AND project_key = ?3)
-                     OR (?1 = 'other_projects'
-                         AND project_key != ?2 AND project_key != ?3)
-                     OR (?1 = 'all')
-                 )
+                 WHERE {}
                    AND id LIKE ?4
                  ORDER BY id
                  LIMIT 2",
-            )
+                scope_predicate_sql(1, 2, 3)
+            ))
             .map_err(sqlite_error("prepare episode ID lookup"))?;
         let ids = statement
             .query_map(
@@ -1126,6 +1161,17 @@ fn stored_episode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEpisode
     })
 }
 
+impl From<crate::storage::RetainedEvent> for EpisodeEvent {
+    fn from(event: crate::storage::RetainedEvent) -> Self {
+        match event {
+            crate::storage::RetainedEvent::UserText { text } => Self::UserText { text },
+            crate::storage::RetainedEvent::AssistantText { text } => Self::AssistantText { text },
+            crate::storage::RetainedEvent::ToolCall { name } => Self::ToolCall { name },
+            crate::storage::RetainedEvent::ToolResult { is_error } => Self::ToolResult { is_error },
+        }
+    }
+}
+
 fn retained_events(
     prompt: &str,
     prompt_origin: MessageOrigin,
@@ -1146,32 +1192,14 @@ fn retained_events(
             text: prompt.to_string(),
         });
     }
-    for message in if has_initial_prompt { history } else { &[] } {
-        for block in &message.content {
-            match block {
-                ContentBlock::Text { text }
-                    if !text.is_empty()
-                        && message.role == "user"
-                        && !message.is_goal_continuation() =>
-                {
-                    events.push(EpisodeEvent::UserText { text: text.clone() });
-                }
-                ContentBlock::Text { text } if !text.is_empty() && message.role == "assistant" => {
-                    events.push(EpisodeEvent::AssistantText { text: text.clone() });
-                }
-                ContentBlock::ToolUse { name, .. } => {
-                    events.push(EpisodeEvent::ToolCall { name: name.clone() });
-                }
-                ContentBlock::ToolResult { is_error, .. } => {
-                    events.push(EpisodeEvent::ToolResult {
-                        is_error: is_error.unwrap_or(false),
-                    });
-                }
-                ContentBlock::Thinking { .. }
-                | ContentBlock::RedactedThinking { .. }
-                | ContentBlock::Text { .. } => {}
-            }
-        }
+    if has_initial_prompt {
+        // The retention policy itself lives in `storage`, shared with the
+        // conversation archive so the two stores can never drift.
+        events.extend(
+            crate::storage::retained_events(history)
+                .into_iter()
+                .map(EpisodeEvent::from),
+        );
     }
     let quality = if has_initial_prompt {
         "text_and_tool_metadata"
@@ -1199,17 +1227,6 @@ fn searchable_text(episode: &Episode) -> String {
     parts.join("\n")
 }
 
-fn preview(text: &str, limit: usize) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut characters = normalized.chars();
-    let prefix: String = characters.by_ref().take(limit).collect();
-    if characters.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
-    }
-}
-
 fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -1232,23 +1249,24 @@ fn version_at_least(version: &str, minimum: (u32, u32, u32)) -> bool {
     actual >= minimum
 }
 
-fn sqlite_error(context: &'static str) -> impl FnOnce(rusqlite::Error) -> Error {
-    move |error| Error::Other(format!("Failed to {context}: {error}"))
+use crate::storage::reject_symlink;
+
+/// The scope-filter WHERE predicate shared by every episode query, with
+/// caller-chosen parameter positions so the three query shapes cannot drift.
+fn scope_predicate_sql(filter: usize, current: usize, global: usize) -> String {
+    format!(
+        "(
+                        (?{filter} = 'current' AND project_key = ?{current})
+                     OR (?{filter} = 'global' AND project_key = ?{global})
+                     OR (?{filter} = 'other_projects'
+                         AND project_key != ?{current} AND project_key != ?{global})
+                     OR (?{filter} = 'all')
+                 )"
+    )
 }
 
-fn reject_symlink(path: &Path, description: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::Other(format!(
-            "Refusing to use symlinked {description} {}",
-            path.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::Other(format!(
-            "Failed to inspect {description} {}: {error}",
-            path.display()
-        ))),
-    }
+fn sqlite_error(context: &'static str) -> impl FnOnce(rusqlite::Error) -> Error {
+    move |error| Error::Other(format!("Failed to {context}: {error}"))
 }
 
 pub fn default_memory_path(home: &Path) -> PathBuf {
@@ -1519,8 +1537,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(first.search("beta-only").await.unwrap(), Vec::new());
-        assert_eq!(second.search("alpha-only").await.unwrap(), Vec::new());
+        assert_eq!(
+            first.search("beta-only").await.unwrap(),
+            EpisodeMatches::default()
+        );
+        assert_eq!(
+            second.search("alpha-only").await.unwrap(),
+            EpisodeMatches::default()
+        );
         assert_eq!(
             second.forget(&first_id[..8]).await.unwrap(),
             ForgetResult::NotFound
@@ -1568,32 +1592,32 @@ mod tests {
             .search_scoped_inner("shared needle", ScopeFilter::Current)
             .await
             .unwrap();
-        assert_eq!(current.len(), 1);
-        assert_eq!(current[0].id, project_id);
+        assert_eq!(current.summaries.len(), 1);
+        assert_eq!(current.summaries[0].id, project_id);
         let global_matches = project
             .search_scoped_inner("shared needle", ScopeFilter::Global)
             .await
             .unwrap();
-        assert_eq!(global_matches.len(), 1);
-        assert_eq!(global_matches[0].id, global_id);
-        assert_eq!(global_matches[0].project_root, "global");
+        assert_eq!(global_matches.summaries.len(), 1);
+        assert_eq!(global_matches.summaries[0].id, global_id);
+        assert_eq!(global_matches.summaries[0].project_root, "global");
         let all = project
             .search_scoped_inner("shared needle", ScopeFilter::All)
             .await
             .unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.summaries.len(), 2);
         let global_current = global
             .search_scoped_inner("shared needle", ScopeFilter::Current)
             .await
             .unwrap();
-        assert_eq!(global_current.len(), 1);
-        assert_eq!(global_current[0].id, global_id);
+        assert_eq!(global_current.summaries.len(), 1);
+        assert_eq!(global_current.summaries[0].id, global_id);
         let global_other = global
             .search_scoped_inner("shared needle", ScopeFilter::OtherProjects)
             .await
             .unwrap();
-        assert_eq!(global_other.len(), 1);
-        assert_eq!(global_other[0].id, project_id);
+        assert_eq!(global_other.summaries.len(), 1);
+        assert_eq!(global_other.summaries[0].id, project_id);
         assert!(project
             .show_scoped_inner(&global_id, ScopeFilter::Current)
             .await
@@ -1757,5 +1781,83 @@ mod tests {
             discover_project_root(&nested).unwrap(),
             fs::canonicalize(project).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn one_corrupt_row_does_not_poison_search_or_export() {
+        let temp = TempDir::new().unwrap();
+        let memory = open_memory(&temp, "project");
+        memory.set_capture_enabled(true).await.unwrap();
+        let good_id = memory
+            .record_settled_turn(
+                "healthy needle",
+                &[Message::user_text("healthy needle")],
+                EpisodeOutcome::Completed,
+                "test",
+                "model",
+                Utc::now(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Simulate on-disk corruption: a row whose outcome no longer parses.
+        let direct = Connection::open(memory.database_path()).unwrap();
+        direct
+            .execute(
+                "INSERT INTO episodes(id, project_key, project_root, session_id,
+                     started_at, settled_at, outcome, provider, model,
+                     capture_quality, events_json, search_text)
+                 SELECT 'corrupt-row-1', project_key, project_root, session_id,
+                     started_at, settled_at, 'garbled', provider, model,
+                     capture_quality, events_json, search_text
+                 FROM episodes LIMIT 1",
+                [],
+            )
+            .unwrap();
+        drop(direct);
+
+        let matches = memory.search("healthy needle").await.unwrap();
+        assert_eq!(matches.summaries.len(), 1);
+        assert_eq!(matches.summaries[0].id, good_id);
+        assert_eq!(matches.corrupt.len(), 1);
+        assert_eq!(matches.corrupt[0].id, "corrupt-row-1");
+        assert!(matches.corrupt[0].error.contains("garbled"));
+
+        let export = memory.export().await.unwrap();
+        assert_eq!(export.episodes.len(), 1);
+        assert_eq!(export.episodes[0].id, good_id);
+        assert_eq!(export.corrupt.len(), 1);
+        assert_eq!(export.corrupt[0].id, "corrupt-row-1");
+    }
+
+    #[test]
+    fn refuses_a_database_from_a_newer_schema_version() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        let database = temp.path().join("episodes.sqlite3");
+        let raw = Connection::open(&database).unwrap();
+        raw.pragma_update(None, "user_version", 99_i64).unwrap();
+        drop(raw);
+
+        let error = match EpisodicMemory::open(database, project) {
+            Ok(_) => panic!("a future schema version was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn version_floor_comparisons_pin_the_parse_policy() {
+        assert!(version_at_least("3.51.3", MIN_SQLITE_VERSION));
+        assert!(version_at_least("3.52.0", MIN_SQLITE_VERSION));
+        assert!(version_at_least("4.0.0", MIN_SQLITE_VERSION));
+        assert!(!version_at_least("3.51.2", MIN_SQLITE_VERSION));
+        assert!(!version_at_least("3.50.9", MIN_SQLITE_VERSION));
+        // Unparseable components read as zero, so a suffixed patch release
+        // below the floor is rejected rather than trusted.
+        assert!(!version_at_least("3.51-beta", MIN_SQLITE_VERSION));
+        assert!(!version_at_least("garbage", MIN_SQLITE_VERSION));
     }
 }

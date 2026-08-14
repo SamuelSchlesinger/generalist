@@ -22,6 +22,11 @@
 \* explicitly: it gates user input and therefore participates in the liveness
 \* argument, while agent progress remains independent of it.
 \*
+\* The autosave worker, its queue, and filesystem state are also hidden.
+\* Modeled checkpoints linearize at history-valid in-memory snapshots; the
+\* concrete writer may coalesce complete snapshots, and orderly shutdown
+\* flushes the newest queued snapshot or reports failure.
+\*
 \* MCP startup discovery and its cancellation/progress payloads are also
 \* hidden. Before an Agent exists, accepted composer and queue-manager actions
 \* refine the ordinary idle Enqueue/DeleteQueued/ReclassifyQueued/

@@ -139,6 +139,18 @@ impl OpenAiProvider {
         body
     }
 
+    /// An in-band `{"error": ...}` SSE payload, mapped to a structured
+    /// stream error. Unknown error types default to non-retryable: in-band
+    /// errors are usually request-level (context overflow, bad input) and
+    /// will fail identically on every attempt.
+    fn in_band_stream_error(value: &Value) -> Option<Error> {
+        let (message, error_type) = crate::provider::parse_error_value(value)?;
+        Some(Error::Stream {
+            retryable: crate::error::provider_error_type_is_transient(error_type.as_deref(), false),
+            message,
+        })
+    }
+
     /// Reasoning extensions used by common OpenAI-compatible servers.
     ///
     /// Qwen/vLLM/SGLang commonly use `reasoning_content`; Ollama's model
@@ -197,6 +209,7 @@ impl OpenAiProvider {
                 content.push(ContentBlock::ToolUse { name, input, id });
             }
         }
+        super::ensure_unique_tool_call_ids(&mut content);
 
         let stop_reason = choice
             .get("finish_reason")
@@ -292,7 +305,7 @@ impl ChunkState {
                         .saturating_add(usize::from(!self.text.is_empty()))
                         .saturating_add(usize::from(!self.reasoning.is_empty()));
                     if projected_blocks > limits.max_content_blocks {
-                        return Err(Error::Other(format!(
+                        return Err(Error::Limit(format!(
                             "provider completion exceeded the host limit of {} blocks",
                             limits.max_content_blocks
                         )));
@@ -336,7 +349,7 @@ impl ChunkState {
                     .saturating_add(1)
                     > limits.max_content_blocks
             {
-                return Err(Error::Other(format!(
+                return Err(Error::Limit(format!(
                     "provider completion exceeded the host limit of {} blocks",
                     limits.max_content_blocks
                 )));
@@ -359,7 +372,7 @@ impl ChunkState {
                     .saturating_add(1)
                     > limits.max_content_blocks
             {
-                return Err(Error::Other(format!(
+                return Err(Error::Limit(format!(
                     "provider completion exceeded the host limit of {} blocks",
                     limits.max_content_blocks
                 )));
@@ -387,6 +400,7 @@ impl ChunkState {
                 .unwrap_or_else(|_| json!({"_unparsed_arguments": arguments}));
             content.push(ContentBlock::ToolUse { name, input, id });
         }
+        super::ensure_unique_tool_call_ids(&mut content);
         let has_tools = content
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
@@ -442,19 +456,12 @@ impl Provider for OpenAiProvider {
             .and_then(crate::error::Error::parse_retry_after);
         let response_body = crate::provider::read_response_body_bounded(response, limits).await?;
         if !status.is_success() {
-            let message = serde_json::from_slice::<Value>(&response_body)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
+            let (message, error_type) = crate::provider::parse_error_body(&response_body);
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
                 retry_after,
+                error_type,
             });
         }
 
@@ -489,18 +496,12 @@ impl Provider for OpenAiProvider {
         if !status.is_success() {
             let response_body =
                 crate::provider::read_response_body_bounded(response, limits).await?;
-            let message = serde_json::from_slice::<Value>(&response_body)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/message")
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
+            let (message, error_type) = crate::provider::parse_error_body(&response_body);
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
                 retry_after,
+                error_type,
             });
         }
 
@@ -517,6 +518,13 @@ impl Provider for OpenAiProvider {
                     continue;
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+                    // Ollama and several compatible gateways report
+                    // mid-stream failures (e.g. context overflow) as an
+                    // in-band error payload; surface it instead of letting
+                    // the stream read as merely cut short.
+                    if let Some(error) = Self::in_band_stream_error(&value) {
+                        return Err(error);
+                    }
                     for delta in state.apply(&value, limits)? {
                         on_delta(delta)?;
                     }
@@ -527,6 +535,9 @@ impl Provider for OpenAiProvider {
             if payload.trim() == "[DONE]" {
                 done = true;
             } else if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+                if let Some(error) = Self::in_band_stream_error(&value) {
+                    return Err(error);
+                }
                 for delta in state.apply(&value, limits)? {
                     on_delta(delta)?;
                 }
@@ -535,10 +546,9 @@ impl Provider for OpenAiProvider {
         // Some compatible servers omit [DONE]; accept a stream that at least
         // reported a finish_reason, otherwise treat it as cut short.
         if !done && state.finish_reason.is_none() {
-            return Err(Error::Api {
-                status: 0,
+            return Err(Error::Stream {
                 message: "stream ended before completion".to_string(),
-                retry_after: None,
+                retryable: true,
             });
         }
         let response = state.into_response();
@@ -550,6 +560,26 @@ impl Provider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_band_stream_errors_surface_with_message_and_retryability() {
+        // Ollama-style bare-string error: non-retryable, message preserved.
+        let error =
+            OpenAiProvider::in_band_stream_error(&json!({"error": "context length exceeded"}))
+                .unwrap();
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("context length exceeded"));
+
+        // Object form with a transient type stays retryable.
+        let overloaded = OpenAiProvider::in_band_stream_error(
+            &json!({"error": {"message": "busy", "type": "overloaded_error"}}),
+        )
+        .unwrap();
+        assert!(overloaded.is_retryable());
+
+        // Ordinary chunks carry no error.
+        assert!(OpenAiProvider::in_band_stream_error(&json!({"choices": []})).is_none());
+    }
 
     #[test]
     fn display_name_describes_service_or_protocol_without_changing_stable_id() {

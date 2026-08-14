@@ -62,21 +62,14 @@ impl AnthropicProvider {
         )
         .await?;
         if !status.is_success() {
-            let message = serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+            let (message, error_type) = crate::provider::parse_error_body(&body);
             return Err(Error::Api {
                 status: status.as_u16(),
                 message: format!(
                     "could not discover the model output limit ({message}); pass --max-tokens to bypass discovery"
                 ),
                 retry_after,
+                error_type,
             });
         }
         Self::parse_model_max_tokens(&serde_json::from_slice(&body)?)
@@ -193,15 +186,13 @@ impl AnthropicProvider {
     }
 
     fn parse_response(value: Value) -> Result<CompletionResponse> {
-        let content = value
-            .get("content")
-            .and_then(|c| c.as_array())
-            .ok_or_else(|| Error::Other("response missing content array".to_string()))?
-            .iter()
-            // Skip block types we don't model (server tool results etc.)
-            // rather than failing the whole response.
-            .filter_map(|block| serde_json::from_value::<ContentBlock>(block.clone()).ok())
-            .collect();
+        let mut content = decode_content_blocks(
+            value
+                .get("content")
+                .and_then(|c| c.as_array())
+                .ok_or_else(|| Error::Other("response missing content array".to_string()))?,
+        )?;
+        super::ensure_unique_tool_call_ids(&mut content);
 
         let stop_reason = value
             .get("stop_reason")
@@ -311,14 +302,14 @@ impl StreamState {
                     )));
                 }
                 if self.blocks.len() >= limits.max_content_blocks {
-                    return Err(Error::Other(format!(
+                    return Err(Error::Limit(format!(
                         "provider completion exceeded the host limit of {} blocks",
                         limits.max_content_blocks
                     )));
                 }
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                     if self.tool_uses >= limits.max_tool_uses {
-                        return Err(Error::Other(format!(
+                        return Err(Error::Limit(format!(
                             "provider completion exceeded the host limit of {} tool calls",
                             limits.max_tool_uses
                         )));
@@ -407,14 +398,17 @@ impl StreamState {
                 }
             }
             "error" => {
-                let message = event
-                    .pointer("/error/message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("stream error");
-                return Err(Error::Api {
-                    status: 0,
-                    message: message.to_string(),
-                    retry_after: None,
+                // Carry the provider's error type so a mid-stream
+                // invalid_request is not pointlessly retried while an
+                // overload still is.
+                let (message, error_type) = crate::provider::parse_error_value(event)
+                    .unwrap_or_else(|| ("stream error".to_string(), None));
+                return Err(Error::Stream {
+                    retryable: crate::error::provider_error_type_is_transient(
+                        error_type.as_deref(),
+                        true,
+                    ),
+                    message,
                 });
             }
             // ping / content_block_stop / message_stop carry no state we need.
@@ -423,7 +417,7 @@ impl StreamState {
         Ok(emitted)
     }
 
-    fn into_response(mut self) -> CompletionResponse {
+    fn into_response(mut self) -> Result<CompletionResponse> {
         // Finalize tool_use inputs from their streamed JSON fragments.
         for (block, partial) in self.blocks.iter_mut().zip(&self.partial_json) {
             if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") && !partial.is_empty()
@@ -432,12 +426,9 @@ impl StreamState {
                     serde_json::from_str(partial).unwrap_or(json!({"_unparsed_input": partial}));
             }
         }
-        let content = self
-            .blocks
-            .into_iter()
-            .filter_map(|block| serde_json::from_value::<ContentBlock>(block).ok())
-            .collect();
-        CompletionResponse {
+        let mut content = decode_content_blocks(&self.blocks)?;
+        super::ensure_unique_tool_call_ids(&mut content);
+        Ok(CompletionResponse {
             content,
             stop_reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
             usage: Some(Usage {
@@ -446,8 +437,36 @@ impl StreamState {
                 cache_read_input_tokens: self.cache_read,
                 cache_creation_input_tokens: self.cache_creation,
             }),
-        }
+        })
     }
+}
+
+/// Decode provider content blocks, skipping *unknown* block types (server
+/// tool results and other extensions) while failing on a malformed block of
+/// a known type: silently dropping a corrupt `tool_use` would let a mangled
+/// response read as a completed, empty answer.
+fn decode_content_blocks(blocks: &[Value]) -> Result<Vec<ContentBlock>> {
+    const KNOWN_TYPES: &[&str] = &[
+        "text",
+        "tool_use",
+        "tool_result",
+        "thinking",
+        "redacted_thinking",
+    ];
+    let mut content = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !KNOWN_TYPES.contains(&block_type) {
+            continue;
+        }
+        let decoded = serde_json::from_value::<ContentBlock>(block.clone()).map_err(|error| {
+            Error::Other(format!(
+                "provider sent a malformed {block_type} block: {error}"
+            ))
+        })?;
+        content.push(decoded);
+    }
+    Ok(content)
 }
 
 #[async_trait(?Send)]
@@ -486,19 +505,12 @@ impl Provider for AnthropicProvider {
             .and_then(crate::error::Error::parse_retry_after);
         let response_body = crate::provider::read_response_body_bounded(response, limits).await?;
         if !status.is_success() {
-            let message = serde_json::from_slice::<Value>(&response_body)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
+            let (message, error_type) = crate::provider::parse_error_body(&response_body);
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
                 retry_after,
+                error_type,
             });
         }
 
@@ -537,18 +549,12 @@ impl Provider for AnthropicProvider {
         if !status.is_success() {
             let response_body =
                 crate::provider::read_response_body_bounded(response, limits).await?;
-            let message = serde_json::from_slice::<Value>(&response_body)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/message")
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| String::from_utf8_lossy(&response_body).into_owned());
+            let (message, error_type) = crate::provider::parse_error_body(&response_body);
             return Err(Error::Api {
                 status: status.as_u16(),
                 message,
                 retry_after,
+                error_type,
             });
         }
 
@@ -584,13 +590,12 @@ impl Provider for AnthropicProvider {
         // incomplete message; surface it as a retryable-shaped error rather
         // than acting on a half response.
         if !saw_message_stop {
-            return Err(Error::Api {
-                status: 0,
+            return Err(Error::Stream {
                 message: "stream ended before message_stop".to_string(),
-                retry_after: None,
+                retryable: true,
             });
         }
-        let response = state.into_response();
+        let response = state.into_response()?;
         limits.validate_response(&response)?;
         Ok(response)
     }
@@ -761,7 +766,7 @@ mod tests {
         }
         assert_eq!(streamed_text, "Hello");
         assert_eq!(streamed_reasoning, "hmm");
-        let response = state.into_response();
+        let response = state.into_response().unwrap();
         assert_eq!(response.stop_reason, StopReason::ToolUse);
         assert_eq!(response.content.len(), 3);
         match &response.content[0] {

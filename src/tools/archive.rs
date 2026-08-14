@@ -202,7 +202,7 @@ impl Tool for SearchMemoriesTool {
         let grant = authorization.disclosure_grant(DisclosureCapability::SearchMemories, &input)?;
         let matches = self.memory.search_scoped(query, filter, &grant).await?;
         if let Some(trace) = self.memory.model_trace() {
-            if let Some(result) = matches.first() {
+            if let Some(result) = matches.summaries.first() {
                 trace.record_archive(ArchiveModelAction::ApproveMemorySearch {
                     scope: trace.scope_id(&result.project_root),
                     memory_id: result.id.clone(),
@@ -211,12 +211,19 @@ impl Tool for SearchMemoriesTool {
                 trace.record_archive(ArchiveModelAction::ApproveEmptySearch);
             }
         }
-        serde_json::to_string_pretty(&json!({
+        let mut result = json!({
             "query": query,
             "scope": filter.as_str(),
-            "matches": matches,
-        }))
-        .map_err(Into::into)
+            "matches": matches.summaries,
+        });
+        if !matches.corrupt.is_empty() {
+            result["skipped_corrupt_episode_ids"] = json!(matches
+                .corrupt
+                .iter()
+                .map(|corrupt| corrupt.id.as_str())
+                .collect::<Vec<_>>());
+        }
+        serde_json::to_string_pretty(&result).map_err(Into::into)
     }
 }
 

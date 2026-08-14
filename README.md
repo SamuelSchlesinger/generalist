@@ -68,9 +68,9 @@ the objective; edit the goal or send another prompt to resume. Other commands
 are `/save [name]`, `/load [name]`, `/history`, `/model`, `/compact`, `/clear`, `/memory`,
 `/help`, `/permissions`, `/tools`, `/mcp`, `/usage`, `/copy`, and `/exit`.
 
-History-valid boundaries, the active goal, queue, named sessions, and remembered
-tool decisions are isolated by default to the canonical Git worktree root (or
-canonical working directory outside Git). Scoped state lives beneath
+History-valid boundaries, the active goal, queue, named sessions, and persisted
+name-level tool decisions are isolated by default to the canonical Git worktree
+root (or canonical working directory outside Git). Scoped state lives beneath
 `~/.generalist/history/scopes/<scope-id>/`; the project autosave never falls
 back to another project or to global history. The goal survives restart even
 with no queued work, and startup schedules its next automatic continuation. If
@@ -286,18 +286,24 @@ New tool calls open a permission modal showing the full input. Python scripts ar
 rendered as syntax-highlighted, numbered source, bash commands as numbered command
 text, and neither is buried in a JSON-escaped string. Patches are rendered as colored
 diffs; other inputs remain pretty-printed JSON.
-Choices are allow always, allow once, deny always, and deny once. Decisions persist
-across save/load; remembered decisions are surfaced in the status bar while every
-execution remains visible in the tool-activity panel. The activity preview keeps the
-first source or command lines visible after completion alongside the result summary.
+Choices are allow always, allow once, deny always, and deny once. For ordinary
+tools, always decisions persist across save/load. For `bash` and `python`, an
+interactive allow-always covers only the exact JSON input in the current process
+and is never persisted; a different input prompts again. Deny-always remains a
+persisted name-level decision. Remembered decisions are surfaced in the status bar
+while every execution remains visible in the tool-activity panel. The activity
+preview keeps the first source or command lines visible after completion alongside
+the result summary.
 
-`/permissions` lists remembered decisions in stable tool-name order.
-`/permissions reset <tool>` removes one exact allow/deny decision, and
-`/permissions clear` removes all of them; affected tools ask again on their
-next permissioned use. These are host-only idle commands and their changes are
-included in the next atomic autosave. Loading a named session replaces the
-current remembered policy with that save's policy. Contradictory legacy state
-is resolved fail-closed: deny wins and the next write removes the overlap.
+`/permissions` lists persisted decisions in stable tool-name order and reports
+session-only exact-input allow counts without printing those inputs.
+`/permissions reset <tool>` removes that tool's name-level and session-only
+decisions, and `/permissions clear` removes all of them; affected calls ask
+again. These are host-only idle commands, and the controller queues their
+persisted policy changes for the autosave writer. Loading a named session
+replaces the persisted policy and clears every session-only exact-input grant.
+Contradictory legacy state is resolved fail-closed: deny wins and the next
+write removes the overlap.
 
 All model, tool, queue, provider, and MCP text is control-character-sanitized at
 the display boundary so untrusted content cannot emit terminal escape commands.

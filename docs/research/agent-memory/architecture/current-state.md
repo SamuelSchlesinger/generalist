@@ -14,7 +14,7 @@
 This audit covers Generalist commit `db900fa` (“Fix TUI observability and
 terminal interaction”). The relevant implementation is
 `src/tools/enhanced_memory.rs`, with registration in `src/main.rs`, model
-guidance in `SYSTEM_PROMPT.md`, conversation ownership in `src/agent.rs`,
+guidance in `SYSTEM_PROMPT.md`, conversation ownership in `src/agent/`,
 durable session state in `src/state.rs`, and the async protocol documented in
 `docs/async-tui.md` and `spec/AsyncRuntime.tla`.
 

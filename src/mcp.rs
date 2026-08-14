@@ -31,6 +31,11 @@ use tokio::time::{timeout, Duration};
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Cap on one JSON-RPC message (stdio line or HTTP body). A misbehaving
+/// server must not grow the agent's memory without bound.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Recent stderr retained from a stdio server for connection diagnostics.
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
 
 /// `~/.generalist/mcp.json`:
 ///
@@ -174,7 +179,63 @@ enum Transport {
         _child: Child,
         stdin: ChildStdin,
         reader: BufReader<ChildStdout>,
+        /// Rolling tail of the server's stderr, for diagnostics when it dies.
+        stderr_tail: Arc<std::sync::Mutex<Vec<u8>>>,
     },
+}
+
+/// Read one newline-terminated message with a hard byte cap.
+///
+/// tokio's `read_line` grows its buffer without bound; a server emitting one
+/// enormous line must produce an error, not an allocation storm.
+async fn read_line_bounded(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<usize> {
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(total); // EOF
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map(|index| index + 1).unwrap_or(available.len());
+        if total + take > cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message exceeded {cap} bytes"),
+            ));
+        }
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        total += take;
+        if newline.is_some() {
+            return Ok(total);
+        }
+    }
+}
+
+/// Read an HTTP body with a hard byte cap, decoding lossily.
+async fn read_body_bounded(mut response: reqwest::Response, cap: usize) -> Result<String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > cap as u64)
+    {
+        return Err(Error::Other(format!(
+            "MCP HTTP response exceeded {cap} bytes"
+        )));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > cap {
+            return Err(Error::Other(format!(
+                "MCP HTTP response exceeded {cap} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// One connected MCP server, shared by all of its wrapped tools.
@@ -230,17 +291,42 @@ impl McpServer {
                     .envs(env)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::piped())
                     .kill_on_drop(true);
                 let mut child = cmd.spawn().map_err(|e| {
                     Error::Other(format!("Failed to start MCP server '{}': {}", name, e))
                 })?;
                 let stdin = child.stdin.take().expect("stdin piped");
                 let reader = BufReader::new(child.stdout.take().expect("stdout piped"));
+                // Keep a rolling stderr tail so a crashing server can be
+                // diagnosed instead of reporting a bare closed pipe.
+                let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+                let stderr_tail: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+                let tail_writer = Arc::clone(&stderr_tail);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stderr_pipe.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let mut tail = tail_writer
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                tail.extend_from_slice(&buf[..n]);
+                                let length = tail.len();
+                                if length > STDERR_TAIL_BYTES {
+                                    tail.drain(..length - STDERR_TAIL_BYTES);
+                                }
+                            }
+                        }
+                    }
+                });
                 Transport::Stdio {
                     _child: child,
                     stdin,
                     reader,
+                    stderr_tail,
                 }
             }
         };
@@ -336,12 +422,13 @@ impl McpServer {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let body = response.text().await?;
+                let body = read_body_bounded(response, MAX_MESSAGE_BYTES).await?;
                 if !status.is_success() {
                     return Err(Error::Api {
                         status: status.as_u16(),
                         message: body,
                         retry_after: None,
+                        error_type: None,
                     });
                 }
                 let Some(id) = id else { return Ok(None) }; // notification
@@ -353,7 +440,12 @@ impl McpServer {
                     Ok(Some(serde_json::from_str(&body)?))
                 }
             }
-            Transport::Stdio { stdin, reader, .. } => {
+            Transport::Stdio {
+                stdin,
+                reader,
+                stderr_tail,
+                ..
+            } => {
                 let mut line = serde_json::to_string(&message)?;
                 line.push('\n');
                 stdin
@@ -363,17 +455,25 @@ impl McpServer {
                 let Some(id) = id else { return Ok(None) };
                 // Read until the matching response; skip server-initiated
                 // messages and notifications.
-                let mut buf = String::new();
+                let mut buf = Vec::new();
                 loop {
                     buf.clear();
-                    let n = reader
-                        .read_line(&mut buf)
+                    let n = read_line_bounded(reader, &mut buf, MAX_MESSAGE_BYTES)
                         .await
                         .map_err(|e| Error::Other(format!("MCP stdio read failed: {}", e)))?;
                     if n == 0 {
-                        return Err(Error::Other("MCP server closed its stdout".to_string()));
+                        let tail = stderr_tail
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let stderr = String::from_utf8_lossy(&tail);
+                        let stderr = stderr.trim();
+                        return Err(Error::Other(if stderr.is_empty() {
+                            "MCP server closed its stdout".to_string()
+                        } else {
+                            format!("MCP server closed its stdout. Recent stderr:\n{stderr}")
+                        }));
                     }
-                    if let Ok(value) = serde_json::from_str::<Value>(&buf) {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&buf) {
                         if value.get("id").and_then(|v| v.as_i64()) == Some(id) {
                             return Ok(Some(value));
                         }

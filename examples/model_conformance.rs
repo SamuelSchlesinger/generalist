@@ -16,11 +16,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 struct ScriptedProvider {
-    responses: Mutex<VecDeque<CompletionResponse>>,
+    responses: Mutex<VecDeque<Result<CompletionResponse>>>,
 }
 
 impl ScriptedProvider {
-    fn new(responses: Vec<CompletionResponse>) -> Self {
+    fn new(responses: Vec<Result<CompletionResponse>>) -> Self {
         Self {
             responses: Mutex::new(responses.into()),
         }
@@ -42,7 +42,7 @@ impl Provider for ScriptedProvider {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pop_front()
-            .ok_or_else(|| Error::Other("Conformance provider script was exhausted".to_string()))
+            .ok_or_else(|| Error::Other("Conformance provider script was exhausted".to_string()))?
     }
 }
 
@@ -89,10 +89,30 @@ fn answer_response() -> CompletionResponse {
     }
 }
 
-async fn async_runtime_trace() -> Result<ModelTraceSnapshot> {
-    let trace = ModelTrace::for_models(&[ModelKind::AsyncRuntime]);
-    let queue = PromptQueue::with_model_trace(trace.clone());
-    queue.enqueue("exercise the runtime", DeliveryMode::FollowUp);
+fn refusal_response() -> CompletionResponse {
+    CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: "declined".to_string(),
+        }],
+        stop_reason: StopReason::Refusal,
+        usage: None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExpectedTurn {
+    Outcome(TurnOutcome),
+    ProviderFailure,
+}
+
+async fn run_async_turn(
+    trace: &ModelTrace,
+    queue: &PromptQueue,
+    prompt_text: &str,
+    responses: Vec<Result<CompletionResponse>>,
+    expected: ExpectedTurn,
+) -> Result<()> {
+    queue.enqueue(prompt_text, DeliveryMode::FollowUp);
     let claim = queue
         .claim_follow_up()
         .ok_or_else(|| Error::Other("Conformance follow-up was not claimable".to_string()))?;
@@ -100,21 +120,75 @@ async fn async_runtime_trace() -> Result<ModelTraceSnapshot> {
 
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(Echo))?;
-    let provider = ScriptedProvider::new(vec![tool_response(), answer_response()]);
+    let provider = ScriptedProvider::new(responses);
     let mut agent = Agent::new(Box::new(provider), registry, "conformance");
     agent.code_mode = false;
     agent.max_iterations = 2;
+    agent.max_retries = 0;
     agent.set_model_trace(trace.clone());
     agent.begin_queued_turn(&prompt);
     claim.commit();
 
-    let (_cancel, mut control) = TurnControl::for_turn(queue);
-    let outcome = agent.run_started_turn(&mut |_| {}, &mut control).await?;
-    if outcome != TurnOutcome::Completed {
-        return Err(Error::Other(format!(
-            "Conformance turn ended unexpectedly: {outcome:?}"
-        )));
+    let (cancel, mut control) = TurnControl::for_turn(queue.clone());
+    if matches!(expected, ExpectedTurn::Outcome(TurnOutcome::Interrupted)) {
+        cancel.cancel();
     }
+
+    let actual = agent.run_started_turn(&mut |_| {}, &mut control).await;
+    match (actual, expected) {
+        (Ok(actual), ExpectedTurn::Outcome(expected)) if actual == expected => Ok(()),
+        (Err(Error::Api { status: 401, .. }), ExpectedTurn::ProviderFailure) => Ok(()),
+        (Ok(actual), expected) => Err(Error::Other(format!(
+            "Conformance turn ended with {actual:?}, expected {expected:?}"
+        ))),
+        (Err(error), expected) => Err(Error::Other(format!(
+            "Conformance turn failed with {error}, expected {expected:?}"
+        ))),
+    }
+}
+
+async fn async_runtime_trace() -> Result<ModelTraceSnapshot> {
+    let trace = ModelTrace::for_models(&[ModelKind::AsyncRuntime]);
+    let queue = PromptQueue::with_model_trace(trace.clone());
+
+    run_async_turn(
+        &trace,
+        &queue,
+        "exercise the tool runtime",
+        vec![Ok(tool_response()), Ok(answer_response())],
+        ExpectedTurn::Outcome(TurnOutcome::Completed),
+    )
+    .await?;
+    run_async_turn(
+        &trace,
+        &queue,
+        "exercise provider refusal",
+        vec![Ok(refusal_response())],
+        ExpectedTurn::Outcome(TurnOutcome::Refused),
+    )
+    .await?;
+    run_async_turn(
+        &trace,
+        &queue,
+        "exercise provider failure",
+        vec![Err(Error::Api {
+            status: 401,
+            message: "deterministic failure".to_string(),
+            retry_after: None,
+            error_type: None,
+        })],
+        ExpectedTurn::ProviderFailure,
+    )
+    .await?;
+    run_async_turn(
+        &trace,
+        &queue,
+        "exercise cancellation",
+        Vec::new(),
+        ExpectedTurn::Outcome(TurnOutcome::Interrupted),
+    )
+    .await?;
+
     Ok(trace.snapshot())
 }
 

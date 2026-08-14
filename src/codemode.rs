@@ -22,16 +22,15 @@ use crate::types::{ContentBlock, ToolDef};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 /// The name the code-mode tool is advertised under.
 pub(crate) const PY_TOOL_NAME: &str = "python";
 
-pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 120;
-pub(crate) const MAX_TIMEOUT_SECS: u64 = 600;
+pub(crate) use crate::subprocess::{DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
 
 const RUNNER_MODULE: &str = r#""""Generalist code-mode bootstrap."""
 import runpy as _runpy
@@ -307,17 +306,17 @@ pub(crate) struct ScriptResult {
     pub denied: bool,
 }
 
-/// Remove a file when dropped (used for the bridge socket).
-struct RemoveOnDrop(PathBuf);
+/// Remove the bridge socket and its private directory when dropped.
+struct RemoveOnDrop {
+    socket: PathBuf,
+    directory: PathBuf,
+}
 
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_dir(&self.directory);
     }
-}
-
-fn scopeguard(path: PathBuf) -> RemoveOnDrop {
-    RemoveOnDrop(path)
 }
 
 /// Run `code` with the tool bridge attached.
@@ -366,17 +365,39 @@ async fn run_script_inner(
     std::fs::write(&runner_py, RUNNER_MODULE)
         .map_err(|e| format!("Failed to write runner.py: {}", e))?;
 
-    // Unix socket paths are limited to ~104 bytes (SUN_LEN); macOS
-    // per-user temp dirs under /var/folders are long enough to overflow it,
-    // so the socket lives in /tmp with a short name instead of script_dir.
-    let socket_path = PathBuf::from(format!(
-        "/tmp/gnl-{:.12}.sock",
+    // Unix socket paths are limited to ~104 bytes (SUN_LEN); macOS per-user
+    // temp dirs under /var/folders are long enough to overflow it, so the
+    // socket lives under /tmp with a short name — inside a freshly created
+    // mode-0700 directory, because /tmp is world-listable and a bare socket
+    // would otherwise be connectable by any local user.
+    let bridge_dir = PathBuf::from(format!(
+        "/tmp/gnl-{:.12}",
         uuid::Uuid::new_v4().simple().to_string()
     ));
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // `create` (not `create_all`): an existing path here is unexpected
+        // and must fail rather than adopt a directory someone else planted.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&bridge_dir)
+            .map_err(|e| format!("Failed to create bridge socket dir: {}", e))?;
+    }
+    let socket_path = bridge_dir.join("t.sock");
+    // Install the guard immediately after creation: metadata inspection or
+    // socket binding can fail too, and must not strand a private /tmp dir.
+    let _socket_guard = RemoveOnDrop {
+        socket: socket_path.clone(),
+        directory: bridge_dir.clone(),
+    };
+    let host_uid = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&bridge_dir)
+            .map_err(|e| format!("Failed to inspect bridge socket dir: {}", e))?
+            .uid()
+    };
     let listener = UnixListener::bind(&socket_path)
         .map_err(|e| format!("Failed to bind bridge socket: {}", e))?;
-    // Best-effort cleanup of the socket file when the run ends.
-    let _socket_guard = scopeguard(socket_path.clone());
 
     // Inherit the agent's cwd so the model script reads/writes project files
     // naturally. runner.py's directory is first on sys.path, and run_path
@@ -388,84 +409,95 @@ async fn run_script_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Own process group so a timeout can kill descendants too.
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("Failed to start python3: {}. Is it installed?", e))?;
 
-    // Drain output concurrently so a chatty script can't dead-lock against a
-    // pending tool call.
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf).await;
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf).await;
-        buf
-    });
+    // Drain output concurrently — with bounded memory — so a chatty script
+    // can neither dead-lock against a pending tool call nor OOM the agent.
+    let stdout_pipe = child.stdout.take().expect("stdout piped");
+    let stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stdout_task = tokio::spawn(crate::subprocess::collect_bounded(
+        stdout_pipe,
+        "generalist-script-stdout-",
+    ));
+    let stderr_task = tokio::spawn(crate::subprocess::collect_bounded(
+        stderr_pipe,
+        "generalist-script-stderr-",
+    ));
 
     let mut denied = false;
     let mut bridged_calls: u64 = 0;
-    let serve_and_wait = async {
-        loop {
-            tokio::select! {
-                status = child.wait() => break status,
-                accepted = listener.accept() => {
-                    if let Ok((stream, _)) = accepted {
-                        serve_connection(
-                            stream,
-                            registry,
-                            on_event,
-                            &mut denied,
-                            &mut bridged_calls,
-                        )
-                        .await;
+    // The timeout budget covers script compute only. Time spent inside
+    // bridged tool calls — including however long the user takes to answer a
+    // permission prompt — extends the deadline, so a slow approval can never
+    // kill the script underneath the user; each bridged tool bounds its own
+    // execution instead.
+    let started = tokio::time::Instant::now();
+    let mut serving = Duration::ZERO;
+    let status = loop {
+        let deadline = started + Duration::from_secs(timeout_secs) + serving;
+        tokio::select! {
+            status = child.wait() => break status,
+            accepted = listener.accept() => {
+                if let Ok((stream, _)) = accepted {
+                    // Belt over the 0700 directory: only this user's
+                    // processes may drive the bridge.
+                    let authorized = stream
+                        .peer_cred()
+                        .map(|cred| cred.uid() == host_uid)
+                        .unwrap_or(false);
+                    if !authorized {
+                        continue;
                     }
+                    let serve_started = tokio::time::Instant::now();
+                    serve_connection(
+                        stream,
+                        registry,
+                        on_event,
+                        &mut denied,
+                        &mut bridged_calls,
+                    )
+                    .await;
+                    serving += serve_started.elapsed();
                 }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                crate::subprocess::kill_process_group(&child);
+                let _ = child.start_kill();
+                return Ok(ScriptResult {
+                    content: format!(
+                        "Script timed out after {} seconds and was killed.",
+                        timeout_secs
+                    ),
+                    failed: true,
+                    denied,
+                });
             }
         }
     };
+    let status = status.map_err(|e| format!("Failed to run python: {}", e))?;
 
-    let status = match timeout(Duration::from_secs(timeout_secs), serve_and_wait).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return Err(format!("Failed to run python: {}", e)),
-        Err(_) => {
-            let _ = child.start_kill();
-            return Ok(ScriptResult {
-                content: format!(
-                    "Script timed out after {} seconds and was killed.",
-                    timeout_secs
-                ),
-                failed: true,
-                denied,
-            });
-        }
+    let stdout = match stdout_task.await {
+        Ok(stream) => stream.into_text(),
+        Err(_) => String::new(),
     };
-
-    let stdout = String::from_utf8_lossy(&stdout_task.await.unwrap_or_default()).to_string();
-    let stderr = String::from_utf8_lossy(&stderr_task.await.unwrap_or_default()).to_string();
+    let stderr = match stderr_task.await {
+        Ok(stream) => stream.into_text(),
+        Err(_) => String::new(),
+    };
 
     let failed = !status.success();
-    let content = if !failed && stderr.is_empty() {
-        stdout
-    } else if !failed {
-        format!("{}\nStderr:\n{}", stdout, stderr)
-    } else {
-        format!(
-            "Exit code: {}\nStdout:\n{}\nStderr:\n{}",
-            status.code().unwrap_or(-1),
-            stdout,
-            stderr
-        )
-    };
+    let content = crate::subprocess::combine_output(status, &stdout, &stderr);
 
     let mut content = crate::tools::bash::tail_truncate_with_spill(&content);
     if !failed && bridged_calls > 0 && content.trim().is_empty() {
         content = format!(
-            "Script completed successfully with no output.              {bridged_calls} tool call{} executed through the bridge; their              results stayed inside the script. Print any values the next step              needs.",
+            "Script completed successfully with no output. {bridged_calls} tool call{} executed \
+             through the bridge; their results stayed inside the script. Print any values the \
+             next step needs.",
             if bridged_calls == 1 { "" } else { "s" }
         );
     }

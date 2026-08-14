@@ -3,8 +3,8 @@
 use crate::scope::{ScopeFilter, WorkspaceScope};
 use crate::tool::{DisclosureCapability, DisclosureGrant};
 use crate::{
-    history_tool_protocol_is_valid, ArchiveModelAction, ContentBlock, Error, MessageOrigin,
-    ModelTrace, ProfilePaths, Result, SavedState,
+    history_tool_protocol_is_valid, ArchiveModelAction, Error, ModelTrace, ProfilePaths, Result,
+    SavedState,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -284,7 +284,7 @@ impl HistoryStore {
                 updated_at: entry.updated_at,
                 provider: entry.state.provider,
                 model: entry.state.model,
-                preview: matching_preview(&text, &needle, 220),
+                preview: crate::storage::matching_preview(&text, &needle, 220),
             });
         }
         matches.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
@@ -398,9 +398,12 @@ impl HistoryStore {
                     Ok(Some(state)) => state,
                     Ok(None) | Err(_) => continue,
                 };
-                let metadata = fs::metadata(&path).map_err(|error| {
-                    Error::Other(format!("Failed to inspect {}: {error}", path.display()))
-                })?;
+                // Lenient like the reads above: another instance's `forget`
+                // may delete the file between listing and inspection, and one
+                // vanished archive must not abort the whole scan.
+                let Ok(metadata) = fs::metadata(&path) else {
+                    continue;
+                };
                 let updated_at = metadata
                     .modified()
                     .map(DateTime::<Utc>::from)
@@ -490,36 +493,24 @@ pub struct ArchivedConversation {
     pub events: Vec<ArchivedConversationEvent>,
 }
 
-fn retained_conversation_events(state: &SavedState) -> Vec<ArchivedConversationEvent> {
-    let mut events = Vec::new();
-    for message in &state.conversation_history {
-        for block in &message.content {
-            match block {
-                ContentBlock::Text { text }
-                    if !text.is_empty()
-                        && message.role == "user"
-                        && message.origin == MessageOrigin::Conversation =>
-                {
-                    events.push(ArchivedConversationEvent::UserText { text: text.clone() });
-                }
-                ContentBlock::Text { text } if !text.is_empty() && message.role == "assistant" => {
-                    events.push(ArchivedConversationEvent::AssistantText { text: text.clone() });
-                }
-                ContentBlock::ToolUse { name, .. } => {
-                    events.push(ArchivedConversationEvent::ToolCall { name: name.clone() });
-                }
-                ContentBlock::ToolResult { is_error, .. } => {
-                    events.push(ArchivedConversationEvent::ToolResult {
-                        is_error: is_error.unwrap_or(false),
-                    });
-                }
-                ContentBlock::Thinking { .. }
-                | ContentBlock::RedactedThinking { .. }
-                | ContentBlock::Text { .. } => {}
-            }
+impl From<crate::storage::RetainedEvent> for ArchivedConversationEvent {
+    fn from(event: crate::storage::RetainedEvent) -> Self {
+        match event {
+            crate::storage::RetainedEvent::UserText { text } => Self::UserText { text },
+            crate::storage::RetainedEvent::AssistantText { text } => Self::AssistantText { text },
+            crate::storage::RetainedEvent::ToolCall { name } => Self::ToolCall { name },
+            crate::storage::RetainedEvent::ToolResult { is_error } => Self::ToolResult { is_error },
         }
     }
-    events
+}
+
+fn retained_conversation_events(state: &SavedState) -> Vec<ArchivedConversationEvent> {
+    // The retention policy itself lives in `storage`, shared with episodic
+    // memory so the two stores can never drift.
+    crate::storage::retained_events(&state.conversation_history)
+        .into_iter()
+        .map(ArchivedConversationEvent::from)
+        .collect()
 }
 
 fn searchable_state_text(state: &SavedState) -> String {
@@ -538,18 +529,6 @@ fn searchable_state_text(state: &SavedState) -> String {
         }
     }
     parts.join("\n")
-}
-
-fn matching_preview(text: &str, needle: &str, limit: usize) -> String {
-    let source = text
-        .lines()
-        .find(|line| line.to_lowercase().contains(needle))
-        .unwrap_or(text);
-    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = normalized.chars();
-    let preview: String = chars.by_ref().take(limit).collect();
-    let suffix = if chars.next().is_some() { "…" } else { "" };
-    format!("{preview}{suffix}")
 }
 
 fn state_files_in(directory: &Path) -> Vec<PathBuf> {
@@ -635,26 +614,7 @@ fn validate_filename(filename: &str) -> Result<()> {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
-    reject_symlink(path, "history directory")?;
-    fs::create_dir_all(path).map_err(|error| {
-        Error::Other(format!(
-            "Failed to create history directory {}: {error}",
-            path.display()
-        ))
-    })?;
-    reject_symlink(path, "history directory")?;
-    if !path.is_dir() {
-        return Err(Error::Other(format!(
-            "History path {} is not a directory",
-            path.display()
-        )));
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-        Error::Other(format!(
-            "Failed to restrict history directory {}: {error}",
-            path.display()
-        ))
-    })
+    crate::storage::ensure_private_directory(path, "history directory")
 }
 
 fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
@@ -721,25 +681,12 @@ fn write_new_atomically(path: &Path, contents: &[u8]) -> Result<bool> {
     }
 }
 
+use crate::storage::reject_symlink;
+
 fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
-}
-
-fn reject_symlink(path: &Path, description: &str) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::Other(format!(
-            "Refusing to use symlinked {description} {}",
-            path.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::Other(format!(
-            "Failed to inspect {description} {}: {error}",
-            path.display()
-        ))),
-    }
 }
 
 #[cfg(test)]

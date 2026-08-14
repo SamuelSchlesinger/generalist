@@ -124,9 +124,9 @@ Recovered goal/queue state is classified before discovery. A queued,
 protocol-valid autosave restores its matching history and permission policy;
 goal state survives independently, exactly as in ordinary crash recovery.
 Composer submissions and F2 mutations during discovery operate on that same
-authoritative queue and atomically save it with the admitted pre-agent history
-boundary. They are always follow-ups because no turn exists to steer. Help,
-search, and copy mode remain display-only. `Esc` drops the pending discovery
+authoritative queue and queue a complete autosave with the admitted pre-agent
+history boundary. They are always follow-ups because no turn exists to steer.
+Help, search, and copy mode remain display-only. `Esc` drops the pending discovery
 future and continues with the deterministic prefix of servers that already
 reported completion; an in-progress stdio child has `kill_on_drop`, and an
 in-progress HTTP request is cancelled with its future. No provider request can
@@ -400,8 +400,8 @@ the UI reactor.
 
 The UI owns the modal. A stale response whose turn or request ID no longer
 matches is ignored. Interrupting a turn resolves or drops its pending request
-before closing the modal. Remembered allow/deny decisions emit lightweight
-status events without opening a modal.
+before closing the modal. Remembered name-level or exact-input decisions emit
+lightweight status events without opening a modal.
 
 The modal renders `python.code` as control-sanitized, line-numbered,
 Python-highlighted source and `bash.command` as line-numbered command text instead
@@ -415,14 +415,19 @@ result as a separate summary, so execution does not erase the invocation being
 reviewed.
 
 The remembered policy is host-owned, inspectable, and revocable while idle.
-`/permissions` renders both sets in stable tool-name order;
-`/permissions reset <tool>` removes one exact decision and
-`/permissions clear` removes all decisions. The outer controller persists the
-mutation at the same local-command boundary as goal/model/history changes, so
-the affected tool asks again after the command settles. Loading a named save
-replaces both sets together. `SavedState::from_json`, policy replacement, live
-checks, and snapshots all resolve a contradictory allow/deny entry in favor of
-deny; new snapshots are disjoint.
+For ordinary tools, allow-always and deny-always are persisted by name. An
+interactive allow-always for `bash` or `python` instead records the exact
+`(tool, input)` only for the current process; it is excluded from `SavedState`.
+Explicit loaded/configured name-level allows remain honored, and deny-always
+remains name-level. `/permissions` renders persisted sets in stable tool-name
+order plus per-tool counts for session-only exact grants without rendering
+their inputs. `/permissions reset <tool>` removes both kinds for one tool, and
+`/permissions clear` removes all decisions. The outer controller queues the
+persisted mutation at the same local-command boundary as goal/model/history
+changes. Loading a named save replaces both persisted sets and clears all
+session-only exact grants. `SavedState::from_json`, policy replacement, live
+checks, and snapshots resolve a contradictory name-level allow/deny entry in
+favor of deny; new persisted snapshots are disjoint.
 
 This avoids two terminal readers and avoids deadlocking an agent future behind
 a terminal mutex held by a blocking input loop.
@@ -455,31 +460,36 @@ the controller when the turn returns.
 
 ## Persistence
 
-Autosave happens after every committed boundary, local state command (including
-remembered-permission reset/clear), and visible queue edit, not only after a
-whole multi-turn queue drains. The
-controller retains a clone of the latest history-valid boundary and active goal
-while the agent future owns the live history. It writes that boundary, goal,
-and current queue together to one file using flush, atomic rename, and
-parent-directory flush. A restart recovers queued work only with the
-conversation history from the same atomic snapshot; residual steers become
+The controller queues a complete autosave snapshot after every committed
+boundary, local state command (including remembered-permission reset/clear),
+and visible queue edit, not only after a whole multi-turn queue drains. It
+retains a clone of the latest history-valid boundary and active goal while the
+agent future owns the live history. One dedicated writer performs filesystem
+I/O off the UI reactor; if it falls behind, it coalesces pending complete
+snapshots so the newest one dominates. Each actual write stores history, goal,
+persisted permission policy, and queue together using file flush, atomic
+rename, and parent-directory flush. A restart recovers queued work only with
+the conversation history from the same atomic file; residual steers become
 follow-ups because their target turn no longer exists. Goal restoration is
 independent of queued-work recovery. `HistoryCheckpoint` carries the goal along
 with history so the cross-channel display event for completion cannot race a
-checkpoint that still persists the old objective.
+snapshot that still contains the old objective. Orderly exit flushes the writer
+and reports write failures; a crash after enqueue but before replacement can
+lose the newest accepted boundary while leaving the previous file valid.
 
 The same rule begins before MCP discovery: recovery first admits a goal and,
 only when queued work has a protocol-valid boundary, its matching history and
-permission policy. A `DurableBoundary` containing that pre-agent state persists
-every submission or F2 mutation accepted while discovery is pending. Startup
-therefore never displays “queued” for work that exists only in an ephemeral
-buffer. Once discovery finishes or is skipped, the queue and admitted history
-are moved unchanged into the ordinary controller.
+permission policy. A `DurableBoundary` containing that pre-agent state queues a
+complete snapshot for every submission or F2 mutation accepted while discovery
+is pending. The authoritative process-local queue updates immediately; disk
+follows asynchronously under the crash window above. Once discovery finishes
+or is skipped, the queue and admitted history are moved unchanged into the
+ordinary controller.
 
 Terminal actions explicitly report whether they changed the queue. Submission,
-edit, delete, reclassification, reorder, and restore trigger the atomic write;
+edit, delete, reclassification, reorder, and restore queue a complete snapshot;
 composer editing, scrolling, resize, help navigation, and other display-only
-input do not. In particular, a mouse-wheel burst performs neither file nor
+input do not. In particular, a mouse-wheel burst requests neither a file nor
 parent-directory `fsync`.
 
 The transcript remains the source of truth for committed model context. Queue
@@ -522,9 +532,10 @@ tool data are not rewritten.
 11. Spinner-visible background work cannot create steering: only a live agent
     turn sets `turn_active`, and the registry is finalized before such a turn
     can begin.
-12. Effective and newly persisted remembered permission policy is disjoint;
+12. Effective and newly persisted name-level permission policy is disjoint;
     deny takes precedence over a contradictory legacy or externally shared
-    entry.
+    entry. Session exact-input allows are excluded from persistence and cleared
+    on load, reset, or clear.
 
 ## Alternatives rejected
 
