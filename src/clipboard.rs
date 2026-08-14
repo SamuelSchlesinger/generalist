@@ -6,8 +6,6 @@
 //! this path from an explicit UI action.
 
 use crate::types::Message;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use std::io::{self, Write};
 
 /// Keep one clipboard request bounded even if conversation history is large.
@@ -16,6 +14,31 @@ use std::io::{self, Write};
 /// bound; a terminal may enforce a smaller policy and ignore the request, in
 /// which case native selection remains available.
 pub const MAX_OSC52_SOURCE_BYTES: usize = 1024 * 1024;
+
+fn encode_base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 0b11) << 4) | (second >> 4)) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[(((second & 0b1111) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0b11_1111) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
 
 /// Return the most recent committed assistant text in conversation history.
 ///
@@ -106,7 +129,7 @@ pub fn write_osc52(writer: &mut impl Write, text: &str) -> io::Result<usize> {
         ));
     }
 
-    let encoded = STANDARD.encode(text.as_bytes());
+    let encoded = encode_base64(text.as_bytes());
     let mut sequence = Vec::with_capacity(encoded.len() + 10);
     sequence.extend_from_slice(b"\x1b]52;c;");
     sequence.extend_from_slice(encoded.as_bytes());
@@ -121,6 +144,21 @@ mod tests {
     use super::*;
     use crate::goal::GOAL_CONTINUATION_PROMPT;
     use crate::types::{ContentBlock, MessageOrigin};
+
+    #[test]
+    fn base64_encoder_matches_standard_padding_vectors() {
+        for (source, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(encode_base64(source.as_bytes()), expected);
+        }
+    }
 
     #[test]
     fn latest_assistant_text_ignores_tool_only_messages_and_reasoning() {
@@ -222,7 +260,7 @@ mod tests {
         assert_eq!(write_osc52(&mut output, text).unwrap(), text.len());
         assert_eq!(
             output,
-            format!("\x1b]52;c;{}\x1b\\", STANDARD.encode(text)).into_bytes()
+            b"\x1b]52;c;bGluZSAxChtdNTI7YztpbmplY3RlZAfwn6aA\x1b\\".to_vec()
         );
         assert_eq!(output.iter().filter(|byte| **byte == 0x1b).count(), 2);
     }

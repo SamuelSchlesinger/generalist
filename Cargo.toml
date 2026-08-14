@@ -2,6 +2,7 @@
 name = "generalist"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
 authors = ["Samuel Schlesinger <sgschlesinger@gmail.com>"]
 description = "A provider-agnostic CLI agent with tool use. Works with Anthropic and any OpenAI-compatible API."
 homepage = "https://github.com/SamuelSchlesinger/generalist"
@@ -15,23 +16,20 @@ categories = ["command-line-utilities"]
 reqwest = { version = "0.13", features = ["json", "query"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 async-trait = "0.1"
-base64 = "0.22"
-chrono = { version = "0.4", features = ["serde"] }
-dialoguer = "0.12"
-colored = "3.1"
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
-crossterm = { version = "0.29", features = ["event-stream"] }
-futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+dialoguer = { version = "0.12", default-features = false }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache", "unstable-rendered-line-info"] }
+crossterm = { version = "0.29", default-features = false, features = ["bracketed-paste", "event-stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 unicode-width = "0.2"
-dotenv = "0.15.0"
+dotenvy = "0.15.7"
 exmex = "0.21"
-urlencoding = "2.1"
 uuid = { version = "1.24.0", features = ["v4", "v5"] }
 tempfile = "3.27"
 firecrawl = "2.12.1"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 
 [[bin]]
 name = "generalist"

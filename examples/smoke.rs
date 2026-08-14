@@ -14,7 +14,7 @@ async fn main() -> generalist::Result<()> {
     #[allow(deprecated)]
     let env_path = std::env::home_dir().unwrap().join(".generalist.env");
     if env_path.exists() {
-        dotenv::from_path(&env_path).ok();
+        dotenvy::from_path(&env_path).ok();
     }
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .or_else(|_| std::env::var("CLAUDE_API_KEY"))

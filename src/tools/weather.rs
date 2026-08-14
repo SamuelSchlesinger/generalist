@@ -34,14 +34,15 @@ impl Tool for WeatherTool {
         })?;
 
         // First, get coordinates using geocoding API
-        let geocoding_url = format!(
-            "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
-            urlencoding::encode(city)
-        );
-
         let client = reqwest::Client::new();
         let geocoding_response = client
-            .get(&geocoding_url)
+            .get("https://geocoding-api.open-meteo.com/v1/search")
+            .query(&[
+                ("name", city),
+                ("count", "1"),
+                ("language", "en"),
+                ("format", "json"),
+            ])
             .send()
             .await
             .map_err(|e| Error::Other(format!("Failed to fetch geocoding data: {}", e)))?;

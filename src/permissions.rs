@@ -2,8 +2,7 @@
 
 use crate::types::truncate_middle;
 use async_trait::async_trait;
-use colored::*;
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{console::style, theme::ColorfulTheme, Select};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -122,15 +121,15 @@ fn format_diff_for_display(diff: &str) -> String {
     let mut formatted = String::new();
     for line in diff.lines() {
         let rendered = if line.starts_with("+++") || line.starts_with("---") {
-            line.bright_blue().to_string()
+            style(line).blue().bright().to_string()
         } else if line.starts_with("@@") {
-            line.cyan().to_string()
+            style(line).cyan().to_string()
         } else if line.starts_with('+') {
-            line.green().to_string()
+            style(line).green().to_string()
         } else if line.starts_with('-') {
-            line.red().to_string()
+            style(line).red().to_string()
         } else {
-            line.dimmed().to_string()
+            style(line).dim().to_string()
         };
         formatted.push_str(&rendered);
         formatted.push('\n');
@@ -142,10 +141,10 @@ struct ConsolePermissionPrompt;
 
 impl ConsolePermissionPrompt {
     fn print_request(request: &ToolExecutionRequest) {
-        println!("\n{}", "⚠️  Tool Permission Request".yellow().bold());
-        println!("{}", "─".repeat(50).dimmed());
-        println!("Tool: {}", request.tool_name.cyan().bold());
-        println!("Description: {}", request.tool_description.dimmed());
+        println!("\n{}", style("⚠️  Tool Permission Request").yellow().bold());
+        println!("{}", style("─".repeat(50)).dim());
+        println!("Tool: {}", style(&request.tool_name).cyan().bold());
+        println!("Description: {}", style(&request.tool_description).dim());
 
         // Show diffs as diffs; everything else as pretty JSON.
         let diff = (request.tool_name == "patch_file")
@@ -153,18 +152,16 @@ impl ConsolePermissionPrompt {
             .flatten();
         if let Some(diff) = diff {
             if let Some(path) = request.input.get("path").and_then(|v| v.as_str()) {
-                println!("Target file: {}", path.yellow());
+                println!("Target file: {}", style(path).yellow());
             }
-            println!("\n{}", "Proposed changes:".bold());
-            println!("{}", "─".repeat(50).dimmed());
+            println!("\n{}", style("Proposed changes:").bold());
+            println!("{}", style("─".repeat(50)).dim());
             print!("{}", format_diff_for_display(diff));
-            println!("{}", "─".repeat(50).dimmed());
+            println!("{}", style("─".repeat(50)).dim());
         } else {
             println!(
                 "Input: {}",
-                serde_json::to_string_pretty(&request.input)
-                    .unwrap_or_default()
-                    .dimmed()
+                style(serde_json::to_string_pretty(&request.input).unwrap_or_default()).dim()
             );
         }
         println!();
@@ -188,15 +185,15 @@ impl PermissionPrompt for ConsolePermissionPrompt {
         if allowed {
             eprintln!(
                 "{} Auto-allowing {} {}",
-                "✓".green(),
-                request.tool_name.cyan(),
-                truncate_middle(&compact, 300).dimmed()
+                style("✓").for_stderr().green(),
+                style(&request.tool_name).for_stderr().cyan(),
+                style(truncate_middle(&compact, 300)).for_stderr().dim()
             );
         } else {
             eprintln!(
                 "{} Auto-denying '{}' (previously set to never allow)",
-                "✗".red(),
-                request.tool_name.cyan()
+                style("✗").for_stderr().red(),
+                style(&request.tool_name).for_stderr().cyan()
             );
         }
     }

@@ -492,4 +492,7 @@ required TUI-to-TLA+ trace review—is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT.
+Generalist is licensed under the [MIT License](LICENSE). Third-party license
+texts and notices are collected in
+[THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt), and installed binaries
+also expose them with `generalist --licenses`.

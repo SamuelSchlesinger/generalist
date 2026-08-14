@@ -1,4 +1,4 @@
-use colored::*;
+use dialoguer::console::style;
 use generalist::mcp::{McpConfig, McpRegistrationOutcome, McpRegistrationReport};
 use generalist::provider::{
     anthropic, openrouter, AnthropicProvider, OpenAiProvider, OpenRouterProvider, Provider,
@@ -34,6 +34,7 @@ const AUTOSAVE_NAME: &str = "autosave";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
 const MAX_PENDING_STREAM_BYTES: usize = 16 * 1024;
+const THIRD_PARTY_LICENSES: &str = include_str!("../THIRD_PARTY_LICENSES.txt");
 
 fn home_dir() -> PathBuf {
     if let Some(path) = env::var_os("GENERALIST_HOME").filter(|path| !path.is_empty()) {
@@ -944,10 +945,13 @@ struct CliArgs {
     gemini: bool,
     global_scope: bool,
     max_tokens: Option<u32>,
+    show_licenses: bool,
 }
 
 fn print_usage() {
-    println!("Usage: generalist [--global] [--gemini] [--local [model]] [--max-tokens <count>]");
+    println!(
+        "Usage: generalist [--global] [--gemini] [--local [model]] [--max-tokens <count>] [--licenses]"
+    );
     println!();
     println!("  --global          Use the explicit cross-project history/memory scope");
     println!("                    (default: project scope discovered from the working directory)");
@@ -964,6 +968,7 @@ fn print_usage() {
     );
     println!("  --max-tokens N    Request at most N output tokens per ordinary completion");
     println!("                    (default: Anthropic model maximum; provider default elsewhere)");
+    println!("  --licenses        Show third-party licenses and exit");
     println!("  -h, --help        Show this help");
 }
 
@@ -982,11 +987,13 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
     let mut gemini = false;
     let mut global_scope = false;
     let mut max_tokens = None;
+    let mut show_licenses = false;
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--global" => global_scope = true,
             "--gemini" => gemini = true,
+            "--licenses" => show_licenses = true,
             "--local" => {
                 let model = match args.peek() {
                     Some(next) if !next.starts_with('-') => args.next().unwrap(),
@@ -999,12 +1006,15 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
             }
             "--max-tokens" => {
                 let Some(value) = args.next() else {
-                    eprintln!("{} missing value", "Invalid argument:".red());
+                    eprintln!(
+                        "{} missing value",
+                        style("Invalid argument:").for_stderr().red()
+                    );
                     print_usage();
                     std::process::exit(1);
                 };
                 max_tokens = Some(parse_max_tokens(&value).unwrap_or_else(|error| {
-                    eprintln!("{} {error}", "Invalid argument:".red());
+                    eprintln!("{} {error}", style("Invalid argument:").for_stderr().red());
                     print_usage();
                     std::process::exit(1);
                 }));
@@ -1012,7 +1022,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
             value if value.starts_with("--max-tokens=") => {
                 let value = &value["--max-tokens=".len()..];
                 max_tokens = Some(parse_max_tokens(value).unwrap_or_else(|error| {
-                    eprintln!("{} {error}", "Invalid argument:".red());
+                    eprintln!("{} {error}", style("Invalid argument:").for_stderr().red());
                     print_usage();
                     std::process::exit(1);
                 }));
@@ -1022,7 +1032,11 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
                 std::process::exit(0);
             }
             other => {
-                eprintln!("{} {}", "Unknown argument:".red(), other);
+                eprintln!(
+                    "{} {}",
+                    style("Unknown argument:").for_stderr().red(),
+                    other
+                );
                 print_usage();
                 std::process::exit(1);
             }
@@ -1033,6 +1047,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
         gemini,
         global_scope,
         max_tokens,
+        show_licenses,
     }
 }
 
@@ -2475,11 +2490,15 @@ async fn execute_command(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = parse_args();
+    if cli.show_licenses {
+        print!("{THIRD_PARTY_LICENSES}");
+        return Ok(());
+    }
     let generalist_home = home_dir();
 
     let env_path = generalist_home.join(".generalist.env");
     if env_path.exists() {
-        dotenv::from_path(&env_path).ok();
+        dotenvy::from_path(&env_path).ok();
     }
 
     let mut keys = ApiKeys::from_env();
@@ -2492,13 +2511,13 @@ async fn main() -> Result<()> {
     if cli.gemini && cli.local_model.is_none() && keys.openrouter.is_none() {
         eprintln!(
             "{} --gemini requires OPENROUTER_API_KEY (in the environment or ~/.generalist.env).",
-            "Configuration error:".red()
+            style("Configuration error:").for_stderr().red()
         );
         std::process::exit(1);
     }
     let available = keys.available_providers();
     if available.is_empty() {
-        eprintln!("{}", "No API key found.".red());
+        eprintln!("{}", style("No API key found.").for_stderr().red());
         eprintln!("Set at least one of these (in the environment or ~/.generalist.env):");
         eprintln!("  ANTHROPIC_API_KEY=...   for Anthropic models");
         eprintln!("  OPENAI_API_KEY=...      for OpenAI or a compatible server");
@@ -2801,6 +2820,16 @@ mod tests {
                 "google/gemini-3.7-flash".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn licenses_flag_selects_the_embedded_notice_output() {
+        let cli = parse_args_from(["--licenses"].into_iter().map(str::to_string));
+
+        assert!(cli.show_licenses);
+        assert!(THIRD_PARTY_LICENSES.starts_with("THIRD-PARTY LICENSES\n"));
+        assert!(THIRD_PARTY_LICENSES.contains("CDLA-Permissive-2.0"));
+        assert!(THIRD_PARTY_LICENSES.contains("Unicode-3.0"));
     }
 
     #[test]

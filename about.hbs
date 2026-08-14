@@ -1,0 +1,27 @@
+THIRD-PARTY LICENSES
+====================
+
+This file is generated from Cargo.lock by cargo-about. Do not edit it by hand.
+Regenerate it with:
+
+    cargo about generate --all-features --locked --fail \
+        --output-file THIRD_PARTY_LICENSES.txt about.hbs
+    perl -0pi -e 's/\r\n?/\n/g; s/[ \t]+(?=\n)//g; s/\n*\z/\n/' \
+        THIRD_PARTY_LICENSES.txt
+
+Generalist's own source code is licensed under the MIT license in LICENSE. The
+generated report below covers the complete locked build graph and therefore
+also repeats the root package's license.
+
+{{#each licenses}}
+-------------------------------------------------------------------------------
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}
