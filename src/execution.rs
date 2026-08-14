@@ -38,7 +38,7 @@ pub enum ExecutionState {
 /// Tracks the execution of a tool call
 ///
 /// Provides detailed information about a tool execution including timing,
-/// state, results, and any errors. Used by [`ToolRegistry`] to maintain
+/// state, results, and any errors. Used by [`crate::tool::ToolRegistry`] to maintain
 /// execution history.
 ///
 /// # Example

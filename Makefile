@@ -1,10 +1,10 @@
 SHELL := /bin/sh
 
-.PHONY: check lint test fmt format-staged clippy shellcheck traceability memory-research agent-benchmarks memory-evaluation hooks-check tla conformance setup hooks tla-tools doctor
+.PHONY: check lint test fmt format-staged clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks memory-evaluation hooks-check tla conformance setup hooks tla-tools doctor
 
 check: lint test
 
-lint: fmt clippy shellcheck traceability memory-research agent-benchmarks hooks-check tla
+lint: fmt clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks hooks-check tla
 
 test:
 	cargo test --all-targets --all-features --locked
@@ -22,8 +22,14 @@ format-staged:
 clippy:
 	cargo clippy --all-targets --all-features --locked -- -D warnings
 
+docs:
+	RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps --locked
+
 shellcheck:
 	shellcheck .githooks/pre-commit .githooks/pre-push scripts/*.sh
+
+profile-paths:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_profile_paths.py
 
 traceability:
 	./scripts/check-runtime-traceability.sh

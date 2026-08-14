@@ -4,7 +4,7 @@ use crate::scope::{ScopeFilter, WorkspaceScope};
 use crate::tool::{DisclosureCapability, DisclosureGrant};
 use crate::{
     history_tool_protocol_is_valid, ArchiveModelAction, ContentBlock, Error, MessageOrigin,
-    ModelTrace, Result, SavedState,
+    ModelTrace, ProfilePaths, Result, SavedState,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const SCOPES_DIRECTORY: &str = "scopes";
 const SCOPE_MANIFEST: &str = ".scope.json";
 const PENDING_QUEUE_NAME: &str = "pending-queue";
 const ACTIVE_AUTOSAVE_NAME: &str = "autosave";
@@ -31,15 +30,25 @@ struct ScopeManifest {
 /// One current runtime's scoped conversation store.
 #[derive(Debug, Clone)]
 pub struct HistoryStore {
-    home: PathBuf,
+    scopes_directory: PathBuf,
     scope: WorkspaceScope,
     scope_directory: PathBuf,
     model_trace: Option<ModelTrace>,
 }
 
 impl HistoryStore {
+    /// Open history below an explicit home directory.
+    ///
+    /// This compatibility constructor delegates all path derivation to
+    /// [`ProfilePaths`]. New application code should prefer
+    /// [`Self::open_profile`] so every store shares one profile snapshot.
     pub fn open(home: PathBuf, scope: WorkspaceScope) -> Result<Self> {
-        Self::open_inner(home, scope, None)
+        let profile = ProfilePaths::new(home);
+        Self::open_profile_inner(&profile, scope, None)
+    }
+
+    pub fn open_profile(profile: &ProfilePaths, scope: WorkspaceScope) -> Result<Self> {
+        Self::open_profile_inner(profile, scope, None)
     }
 
     #[doc(hidden)]
@@ -48,19 +57,18 @@ impl HistoryStore {
         scope: WorkspaceScope,
         model_trace: ModelTrace,
     ) -> Result<Self> {
-        Self::open_inner(home, scope, Some(model_trace))
+        let profile = ProfilePaths::new(home);
+        Self::open_profile_inner(&profile, scope, Some(model_trace))
     }
 
-    fn open_inner(
-        home: PathBuf,
+    fn open_profile_inner(
+        profile: &ProfilePaths,
         scope: WorkspaceScope,
         model_trace: Option<ModelTrace>,
     ) -> Result<Self> {
-        let history_root = home.join(".generalist").join("history");
-        let scopes_root = history_root.join(SCOPES_DIRECTORY);
-        ensure_private_directory(&history_root)?;
-        ensure_private_directory(&scopes_root)?;
-        let scope_directory = scopes_root.join(scope.storage_key());
+        ensure_private_directory(profile.history_directory())?;
+        ensure_private_directory(profile.history_scopes_directory())?;
+        let scope_directory = profile.history_scopes_directory().join(scope.storage_key());
         ensure_private_directory(&scope_directory)?;
         let manifest = ScopeManifest {
             version: 1,
@@ -71,7 +79,7 @@ impl HistoryStore {
         write_atomically(&scope_directory.join(SCOPE_MANIFEST), &manifest_bytes)?;
 
         let store = Self {
-            home,
+            scopes_directory: profile.history_scopes_directory().to_path_buf(),
             scope,
             scope_directory,
             model_trace,
@@ -346,12 +354,7 @@ impl HistoryStore {
 
     fn archive_entries(&self, filter: ScopeFilter) -> Result<Vec<ArchiveEntry>> {
         let mut directories = Vec::new();
-        let scopes_root = self
-            .home
-            .join(".generalist")
-            .join("history")
-            .join(SCOPES_DIRECTORY);
-        if let Ok(entries) = fs::read_dir(&scopes_root) {
+        if let Ok(entries) = fs::read_dir(&self.scopes_directory) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if is_symlink(&path) || !path.is_dir() {
@@ -762,6 +765,19 @@ mod tests {
     }
 
     #[test]
+    fn profile_open_uses_precomputed_history_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = ProfilePaths::new(temp.path());
+
+        let store = HistoryStore::open_profile(&profile, WorkspaceScope::Global).unwrap();
+
+        assert_eq!(
+            store.directory().parent(),
+            Some(profile.history_scopes_directory())
+        );
+    }
+
+    #[test]
     fn project_autosaves_are_isolated_and_global_does_not_fallback() {
         let temp = tempfile::tempdir().unwrap();
         let first_scope = project_scope(&temp, "first");
@@ -792,7 +808,7 @@ mod tests {
     #[test]
     fn legacy_flat_history_is_ignored_by_every_new_scope() {
         let temp = tempfile::tempdir().unwrap();
-        let legacy_dir = temp.path().join(".generalist/history");
+        let legacy_dir = temp.path().join(".generalist/history"); // profile-path-allow: legacy fixture
         fs::create_dir_all(&legacy_dir).unwrap();
         let legacy = SavedState::new(
             WorkspaceScope::Global,

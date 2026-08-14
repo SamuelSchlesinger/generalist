@@ -12,7 +12,7 @@ use crate::scope::{ScopeFilter, WorkspaceScope};
 use crate::tool::{DisclosureCapability, DisclosureGrant};
 use crate::{
     ArchiveModelAction, ContentBlock, Error, MemoryModelAction, Message, MessageOrigin, ModelTrace,
-    Result, TurnOutcome,
+    ProfilePaths, Result, TurnOutcome,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -1252,9 +1252,7 @@ fn reject_symlink(path: &Path, description: &str) -> Result<()> {
 }
 
 pub fn default_memory_path(home: &Path) -> PathBuf {
-    home.join(".generalist")
-        .join("memory")
-        .join("scoped-episodes.sqlite3")
+    ProfilePaths::new(home).memory_database().to_path_buf()
 }
 
 #[cfg(test)]
@@ -1304,11 +1302,11 @@ mod tests {
         let home = Path::new("/profile");
         assert_eq!(
             default_memory_path(home),
-            home.join(".generalist/memory/scoped-episodes.sqlite3")
+            home.join(".generalist/memory/scoped-episodes.sqlite3") // profile-path-allow: compatibility assertion
         );
         assert_ne!(
             default_memory_path(home),
-            home.join(".generalist/memory/episodes.sqlite3")
+            home.join(".generalist/memory/episodes.sqlite3") // profile-path-allow: legacy fixture
         );
     }
 

@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::tool::Tool;
+use crate::ProfilePaths;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -83,25 +84,30 @@ impl TodoList {
     }
 }
 
-pub struct TodoTool;
+#[derive(Debug, Clone)]
+pub struct TodoTool {
+    todo_file_path: PathBuf,
+}
 
 impl TodoTool {
-    /// Todos live in the home directory so they survive launching the agent
-    /// from different working directories.
-    fn get_todo_file_path() -> PathBuf {
-        #[allow(deprecated)]
-        std::env::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".generalist_todos.json")
+    /// Build a todo tool bound to one explicit storage file.
+    pub fn new(todo_file_path: impl Into<PathBuf>) -> Self {
+        Self {
+            todo_file_path: todo_file_path.into(),
+        }
     }
 
-    fn load_todos() -> Result<TodoList> {
-        let path = Self::get_todo_file_path();
-        if !path.exists() {
+    /// Build a todo tool from an already-resolved profile snapshot.
+    pub fn for_profile(profile: &ProfilePaths) -> Self {
+        Self::new(profile.todo_file())
+    }
+
+    fn load_todos(&self) -> Result<TodoList> {
+        if !self.todo_file_path.exists() {
             return Ok(TodoList::new());
         }
 
-        let content = fs::read_to_string(&path)
+        let content = fs::read_to_string(&self.todo_file_path)
             .map_err(|e| Error::Other(format!("Failed to read todo file: {}", e)))?;
 
         // A corrupted or partially-written todo file should not wedge the tool:
@@ -112,10 +118,8 @@ impl TodoTool {
         Ok(serde_json::from_str(&content).unwrap_or_else(|_| TodoList::new()))
     }
 
-    fn save_todos(todos: &TodoList) -> Result<()> {
-        let path = Self::get_todo_file_path();
-
-        if let Some(parent) = path.parent() {
+    fn save_todos(&self, todos: &TodoList) -> Result<()> {
+        if let Some(parent) = self.todo_file_path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| Error::Other(format!("Failed to create directory: {}", e)))?;
         }
@@ -123,7 +127,7 @@ impl TodoTool {
         let content = serde_json::to_string_pretty(todos)
             .map_err(|e| Error::Other(format!("Failed to serialize todos: {}", e)))?;
 
-        fs::write(&path, content)
+        fs::write(&self.todo_file_path, content)
             .map_err(|e| Error::Other(format!("Failed to write todo file: {}", e)))
     }
 }
@@ -185,17 +189,17 @@ impl Tool for TodoTool {
         let action: TodoAction = serde_json::from_value(input)
             .map_err(|e| Error::Other(format!("Invalid parameters: {}", e)))?;
 
-        let mut todos = Self::load_todos()?;
+        let mut todos = self.load_todos()?;
 
         match action {
             TodoAction::Add { title } => {
                 let id = todos.add(title.clone());
-                Self::save_todos(&todos)?;
+                self.save_todos(&todos)?;
                 Ok(format!("Added todo '{}' with id: {}", title, id))
             }
             TodoAction::Remove { id } => {
                 if todos.remove(&id) {
-                    Self::save_todos(&todos)?;
+                    self.save_todos(&todos)?;
                     Ok(format!("Removed todo with id: {}", id))
                 } else {
                     Err(Error::Other(format!("Todo with id {} not found", id)))
@@ -203,7 +207,7 @@ impl Tool for TodoTool {
             }
             TodoAction::Complete { id } => {
                 if todos.complete(&id) {
-                    Self::save_todos(&todos)?;
+                    self.save_todos(&todos)?;
                     Ok(format!("Marked todo {} as complete", id))
                 } else {
                     Err(Error::Other(format!("Todo with id {} not found", id)))
@@ -211,7 +215,7 @@ impl Tool for TodoTool {
             }
             TodoAction::Uncomplete { id } => {
                 if todos.uncomplete(&id) {
-                    Self::save_todos(&todos)?;
+                    self.save_todos(&todos)?;
                     Ok(format!("Marked todo {} as incomplete", id))
                 } else {
                     Err(Error::Other(format!("Todo with id {} not found", id)))
@@ -241,9 +245,30 @@ impl Tool for TodoTool {
                 let before_count = todos.todos.len();
                 todos.clear_completed();
                 let removed_count = before_count - todos.todos.len();
-                Self::save_todos(&todos)?;
+                self.save_todos(&todos)?;
                 Ok(format!("Cleared {} completed todo(s)", removed_count))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn configured_todo_tool_writes_under_supplied_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = ProfilePaths::new(home.path());
+        let tool = TodoTool::for_profile(&profile);
+
+        tool.execute(serde_json::json!({"action": "add", "title": "profile-local"}))
+            .await
+            .unwrap();
+
+        let saved: TodoList =
+            serde_json::from_str(&fs::read_to_string(profile.todo_file()).unwrap()).unwrap();
+        assert_eq!(saved.todos.len(), 1);
+        assert_eq!(saved.todos[0].title, "profile-local");
     }
 }

@@ -6,15 +6,15 @@ use generalist::provider::{
 use generalist::tools::*;
 use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
-    conversation_transcript, default_memory_path, history_tool_protocol_is_valid, is_local_command,
+    conversation_transcript, history_tool_protocol_is_valid, is_local_command,
     latest_assistant_reasoning, latest_assistant_text, parse_local_command, truncate_middle, Agent,
     AgentEvent, ArchivedConversation, ArchivedConversationEvent, CopyCommand, DeliveryMode,
     Episode, EpisodeEvent, EpisodeOutcome, EpisodicMemory, Error, ForgetResult, GoalCommand,
     HistoryCommand, HistoryStore, LocalCommand, McpCommand, MemoryCommand, MemoryEvent,
     MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt, PermissionChoice,
-    PermissionCommand, PermissionRequest, PermissionUiEvent, PromptQueue, PromptSource, Result,
-    SavedState, ToolDef, ToolRegistry, ToolsCommand, TurnControl, TurnOutcome, UsageCommand,
-    WorkspaceScope,
+    PermissionCommand, PermissionRequest, PermissionUiEvent, ProfilePaths, PromptQueue,
+    PromptSource, Result, SavedState, ToolDef, ToolRegistry, ToolsCommand, TurnControl,
+    TurnOutcome, UsageCommand, WorkspaceScope,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -35,14 +35,6 @@ const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
 const MAX_PENDING_STREAM_BYTES: usize = 16 * 1024;
 const THIRD_PARTY_LICENSES: &str = include_str!("../THIRD_PARTY_LICENSES.txt");
-
-fn home_dir() -> PathBuf {
-    if let Some(path) = env::var_os("GENERALIST_HOME").filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
-    }
-    #[allow(deprecated)]
-    env::home_dir().unwrap_or_else(|| PathBuf::from("."))
-}
 
 fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     let parent = path
@@ -68,15 +60,14 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
         .map_err(|error| Error::Other(format!("Failed to flush {}: {error}", parent.display())))
 }
 
-fn write_memory_export(home: &Path, episodes: &[Episode]) -> Result<PathBuf> {
-    let directory = home.join(".generalist").join("exports");
-    fs::create_dir_all(&directory).map_err(|error| {
+fn write_memory_export(directory: &Path, episodes: &[Episode]) -> Result<PathBuf> {
+    fs::create_dir_all(directory).map_err(|error| {
         Error::Other(format!(
             "Failed to create export directory {}: {error}",
             directory.display()
         ))
     })?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
         Error::Other(format!(
             "Failed to restrict export directory {}: {error}",
             directory.display()
@@ -193,6 +184,7 @@ fn default_remote_provider_and_model(keys: &ApiKeys) -> Option<(String, String)>
 }
 
 fn build_registry(
+    todo_file_path: &Path,
     permission_handler: &MemoryPermissionHandler,
     history_store: &HistoryStore,
     memory: Option<&EpisodicMemory>,
@@ -206,7 +198,7 @@ fn build_registry(
     registry.register(Arc::new(HttpFetchTool))?;
     registry.register(Arc::new(WikipediaTool))?;
     registry.register(Arc::new(Z3SolverTool))?;
-    registry.register(Arc::new(TodoTool))?;
+    registry.register(Arc::new(TodoTool::new(todo_file_path)))?;
     registry.register(Arc::new(FirecrawlCrawlTool))?;
     registry.register(Arc::new(FirecrawlSearchTool))?;
     registry.register(Arc::new(FirecrawlMapTool))?;
@@ -1979,6 +1971,7 @@ fn render_episode(episode: &Episode) -> String {
 async fn run_memory_command(
     command: MemoryCommand<'_>,
     memory: &EpisodicMemory,
+    exports_directory: &Path,
 ) -> Result<Vec<String>> {
     match command {
         MemoryCommand::Status => {
@@ -2045,13 +2038,12 @@ async fn run_memory_command(
         MemoryCommand::Export => {
             let episodes = memory.export().await?;
             let count = episodes.len();
-            let export_home = home_dir();
-            let path =
-                tokio::task::spawn_blocking(move || write_memory_export(&export_home, &episodes))
-                    .await
-                    .map_err(|error| {
-                        Error::Other(format!("Episode export worker failed: {error}"))
-                    })??;
+            let exports_directory = exports_directory.to_path_buf();
+            let path = tokio::task::spawn_blocking(move || {
+                write_memory_export(&exports_directory, &episodes)
+            })
+            .await
+            .map_err(|error| Error::Other(format!("Episode export worker failed: {error}")))??;
             Ok(vec![format!(
                 "Exported {count} current-scope episode(s) to {}",
                 path.display()
@@ -2079,6 +2071,7 @@ async fn run_memory_command(
 async fn drive_memory_command(
     command: MemoryCommand<'_>,
     memory: Option<&EpisodicMemory>,
+    exports_directory: &Path,
     agent: &Agent,
     ui: &mut TerminalUi,
     queue: &PromptQueue,
@@ -2092,7 +2085,7 @@ async fn drive_memory_command(
         return Ok(false);
     };
     ui.set_busy(true, "Memory");
-    let operation = run_memory_command(command, memory);
+    let operation = run_memory_command(command, memory, exports_directory);
     tokio::pin!(operation);
     let mut ticker = tokio::time::interval(Duration::from_millis(50));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2175,6 +2168,7 @@ async fn execute_command(
     permission_rx: &mut mpsc::UnboundedReceiver<PermissionUiEvent>,
     permission_handler: &MemoryPermissionHandler,
     memory: Option<&EpisodicMemory>,
+    profile_paths: &ProfilePaths,
     memory_events: &mut mpsc::UnboundedReceiver<MemoryEvent>,
     mcp_runtime: &mut Option<McpRuntime>,
     keys: &ApiKeys,
@@ -2323,9 +2317,10 @@ async fn execute_command(
             if let Some(runtime) = mcp_runtime {
                 ui.info(&runtime.status());
             } else {
-                ui.info(
-                    "MCP: no configuration was loaded. Add .generalist/mcp.json under GENERALIST_HOME and restart.",
-                );
+                ui.info(&format!(
+                    "MCP: no configuration was loaded. Add {} and restart.",
+                    profile_paths.mcp_config().display()
+                ));
             }
         }
         LocalCommand::Mcp(McpCommand::Retry(requested)) => {
@@ -2467,6 +2462,7 @@ async fn execute_command(
             if drive_memory_command(
                 command,
                 memory,
+                profile_paths.exports_directory(),
                 agent,
                 ui,
                 queue,
@@ -2494,11 +2490,11 @@ async fn main() -> Result<()> {
         print!("{THIRD_PARTY_LICENSES}");
         return Ok(());
     }
-    let generalist_home = home_dir();
+    let profile_paths = ProfilePaths::discover(); // profile-path-allow: one startup resolution
 
-    let env_path = generalist_home.join(".generalist.env");
+    let env_path = profile_paths.environment_file();
     if env_path.exists() {
-        dotenvy::from_path(&env_path).ok();
+        dotenvy::from_path(env_path).ok();
     }
 
     let mut keys = ApiKeys::from_env();
@@ -2510,15 +2506,19 @@ async fn main() -> Result<()> {
     }
     if cli.gemini && cli.local_model.is_none() && keys.openrouter.is_none() {
         eprintln!(
-            "{} --gemini requires OPENROUTER_API_KEY (in the environment or ~/.generalist.env).",
-            style("Configuration error:").for_stderr().red()
+            "{} --gemini requires OPENROUTER_API_KEY (in the environment or {}).",
+            style("Configuration error:").for_stderr().red(),
+            profile_paths.environment_file().display()
         );
         std::process::exit(1);
     }
     let available = keys.available_providers();
     if available.is_empty() {
         eprintln!("{}", style("No API key found.").for_stderr().red());
-        eprintln!("Set at least one of these (in the environment or ~/.generalist.env):");
+        eprintln!(
+            "Set at least one of these (in the environment or {}):",
+            profile_paths.environment_file().display()
+        );
         eprintln!("  ANTHROPIC_API_KEY=...   for Anthropic models");
         eprintln!("  OPENAI_API_KEY=...      for OpenAI or a compatible server");
         eprintln!(
@@ -2537,12 +2537,12 @@ async fn main() -> Result<()> {
     } else {
         WorkspaceScope::discover(&working_directory)?
     };
-    let history_store = HistoryStore::open(generalist_home.clone(), scope.clone())?;
+    let history_store = HistoryStore::open_profile(&profile_paths, scope.clone())?;
     ui.info(&format!("Storage scope: {}", scope.display_name()));
 
     let (memory_event_tx, mut memory_event_rx) = mpsc::unbounded_channel();
     let memory = match EpisodicMemory::open_scoped_with_events(
-        default_memory_path(&generalist_home),
+        profile_paths.memory_database().to_path_buf(),
         scope.clone(),
         Some(memory_event_tx),
     ) {
@@ -2568,7 +2568,12 @@ async fn main() -> Result<()> {
     let (permission_tx, mut permission_rx) = mpsc::unbounded_channel();
     let permission_prompt = Arc::new(PermissionBrokerPrompt::new(permission_tx));
     let permission_handler = MemoryPermissionHandler::with_prompt(permission_prompt);
-    let mut registry = build_registry(&permission_handler, &history_store, memory.as_ref())?;
+    let mut registry = build_registry(
+        profile_paths.todo_file(),
+        &permission_handler,
+        &history_store,
+        memory.as_ref(),
+    )?;
 
     let (startup_goal, startup_history, queue) =
         recover_startup_runtime(&history_store, &permission_handler, &mut ui);
@@ -2586,8 +2591,7 @@ async fn main() -> Result<()> {
         startup_goal.clone(),
         startup_history.clone(),
     );
-    let mcp_config_path = generalist_home.join(".generalist/mcp.json");
-    let mut mcp_runtime = match McpConfig::load_checked(&mcp_config_path) {
+    let mut mcp_runtime = match McpConfig::load_checked(profile_paths.mcp_config()) {
         Ok(config) => config.map(McpRuntime::new),
         Err(error) => {
             ui.error(&error.to_string());
@@ -2624,9 +2628,7 @@ async fn main() -> Result<()> {
          assume or retrieve them automatically.",
         scope.display_name()
     ));
-    if let Some(index) =
-        generalist::skills::skills_index(&generalist_home.join(".generalist/skills"))
-    {
+    if let Some(index) = generalist::skills::skills_index(profile_paths.skills_directory()) {
         system_prompt.push_str(&index);
     }
     if let Some(project_root) = scope.project_root() {
@@ -2683,6 +2685,7 @@ async fn main() -> Result<()> {
                         &mut permission_rx,
                         &permission_handler,
                         memory.as_ref(),
+                        &profile_paths,
                         &mut memory_event_rx,
                         &mut mcp_runtime,
                         &keys,
@@ -2801,6 +2804,17 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_export_uses_supplied_profile_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = ProfilePaths::new(home.path());
+
+        let path = write_memory_export(profile.exports_directory(), &[]).unwrap();
+
+        assert_eq!(path.parent(), Some(profile.exports_directory()));
+        assert_eq!(fs::read_to_string(path).unwrap(), "[]");
+    }
 
     #[test]
     fn gemini_flag_selects_gemini_3_7_flash_through_openrouter() {
@@ -3002,7 +3016,7 @@ mod tests {
     #[test]
     fn structured_state_does_not_collide_with_legacy_input_history_file() {
         let home = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(".generalist_history");
+        let legacy = home.path().join(".generalist_history"); // profile-path-allow: legacy fixture
         fs::write(&legacy, "old input history\n").unwrap();
 
         let store = HistoryStore::open(home.path().to_path_buf(), WorkspaceScope::Global).unwrap();
@@ -3425,15 +3439,20 @@ mod tests {
     #[test]
     fn registry_has_permissioned_archive_tools() {
         let home = tempfile::tempdir().unwrap();
-        let history =
-            HistoryStore::open(home.path().to_path_buf(), WorkspaceScope::Global).unwrap();
+        let profile = ProfilePaths::new(home.path());
+        let history = HistoryStore::open_profile(&profile, WorkspaceScope::Global).unwrap();
         let memory = EpisodicMemory::open_scoped(
-            home.path().join("episodes.sqlite3"),
+            profile.memory_database().to_path_buf(),
             WorkspaceScope::Global,
         )
         .unwrap();
-        let registry =
-            build_registry(&MemoryPermissionHandler::new(), &history, Some(&memory)).unwrap();
+        let registry = build_registry(
+            profile.todo_file(),
+            &MemoryPermissionHandler::new(),
+            &history,
+            Some(&memory),
+        )
+        .unwrap();
         for expected in [
             "search_memories",
             "read_memory",

@@ -12,6 +12,7 @@ The core is small and deliberate:
 - [`agent`] — [`Agent`], the request → tool → result loop, reporting progress
   through [`AgentEvent`] callbacks
 - [`permissions`] — pluggable [`ToolPermissionHandler`] implementations
+- [`profile`] — one immutable layout for profile-scoped configuration and storage
 - [`tools`] — a batteries-included tool set (bash, file ops, web, ...)
 
 ## Quick start
@@ -60,6 +61,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model_trace;
 pub mod permissions;
+pub mod profile;
 pub mod provider;
 pub mod runtime;
 pub mod scope;
@@ -96,6 +98,7 @@ pub use permissions::{
     PermissionChoice, PermissionDecision, PermissionPrompt, PermissionRequest, PermissionUiEvent,
     PolicyPermissions, RememberedPermissionPolicy, ToolExecutionRequest, ToolPermissionHandler,
 };
+pub use profile::ProfilePaths;
 pub use provider::Provider;
 pub use runtime::{
     CancelHandle, DeliveryMode, PromptClaim, PromptId, PromptQueue, PromptSource, QueuedPrompt,

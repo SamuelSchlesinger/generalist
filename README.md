@@ -108,7 +108,10 @@ Pre-scoping flat history and the legacy `~/.chatbot_history` and
 stores; there is no implicit migration or compatibility fallback. Set
 `GENERALIST_HOME` to an alternate directory for an isolated profile or
 reproducible harness run; all of the paths above, plus `.generalist.env`, MCP
-configuration, and skills, are then resolved beneath that directory.
+configuration, skills, exports, and the todo list are then resolved beneath
+that directory. The profile root is resolved once at startup, before
+`.generalist.env` is loaded, so changing `GENERALIST_HOME` inside that file
+does not relocate only part of the running profile.
 
 Ordinary completions have no fixed 16,000-token default. Anthropic requires a
 numeric `max_tokens`, so Generalist retrieves and caches the selected model's
