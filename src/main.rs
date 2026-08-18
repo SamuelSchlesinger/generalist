@@ -33,7 +33,7 @@ use display_channel::*;
 
 const AUTOSAVE_NAME: &str = "autosave";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
-const DEFAULT_LOCAL_MODEL: &str = "qwen3.6:35b-a3b";
+const DEFAULT_LOCAL_MODEL: &str = "qwen3.8:latest";
 const THIRD_PARTY_LICENSES: &str = include_str!("../THIRD_PARTY_LICENSES.txt");
 
 fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {

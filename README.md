@@ -23,7 +23,7 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 ./target/release/generalist --gemini                  # google/gemini-3.7-flash
 
 # Local models need no key:
-./target/release/generalist --local                    # qwen3.6:35b-a3b
+./target/release/generalist --local                    # qwen3.8:latest
 ./target/release/generalist --local qwen2.5-coder:32b  # or name one
 ```
 
@@ -35,7 +35,7 @@ local-model behavior.
 
 `--local [model]` skips provider selection and uses `http://localhost:11434/v1`; set
 `OPENAI_BASE_URL` for other local servers. Tool calling requires a tool-capable model
-(`qwen3.6`, `qwen3`, `qwen2.5-coder`, `devstral`).
+(`qwen3.8`, `qwen3.6`, `qwen3`, `qwen2.5-coder`, `devstral`).
 
 Optional binaries: `z3` (constraint solver), `patch` (file editing; present on any Unix).
 
