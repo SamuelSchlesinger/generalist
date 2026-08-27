@@ -1,0 +1,25 @@
+name: Latest compatible dependencies
+
+on:
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unlocked-install:
+    name: Fresh unlocked install
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `cargo install` intentionally ignores Cargo.lock unless --locked is
+      # supplied. This catches semver-compatible dependency API drift while
+      # the normal push and pull-request gates remain reproducible.
+      - name: Compile against latest compatible dependencies
+        run: cargo install --path . --debug --root "$RUNNER_TEMP/generalist-install"
