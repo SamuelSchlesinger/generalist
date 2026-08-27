@@ -204,11 +204,11 @@ impl Tool for FirecrawlExtractTool {
             }
             scrape_options.formats = Some(formats);
 
-            // Set up JSON extraction options
+            // Set only the behavior we own; optional SDK fields retain their
+            // defaults when compatible Firecrawl releases add new options.
             let json_options = JsonOptions {
                 schema: Some(schema),
-                system_prompt: None,
-                prompt: None,
+                ..Default::default()
             };
             scrape_options.json_options = Some(json_options);
         }
