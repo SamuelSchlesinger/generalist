@@ -102,7 +102,8 @@ pub enum LocalCommand<'a> {
     Clear,
     Save(Option<&'a str>),
     Load(Option<&'a str>),
-    Model,
+    /// Select interactively, or switch directly using the preserved argument.
+    Model(Option<&'a str>),
     Mcp(McpCommand<'a>),
     Copy(CopyCommand),
     Permissions(PermissionCommand<'a>),
@@ -313,8 +314,8 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/model",
-        usage: "/model",
-        description: "switch API or model",
+        usage: "/model [model|provider [model]]",
+        description: "select or directly switch API/model",
         kind: CommandKind::Model,
         subcommands: NO_SUBCOMMANDS,
     },
@@ -541,6 +542,7 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
             | CommandKind::Usage
             | CommandKind::Save
             | CommandKind::Load
+            | CommandKind::Model
     ) && !arguments.is_empty()
     {
         return Some(LocalCommand::Unknown(trimmed));
@@ -553,7 +555,7 @@ pub fn parse_local_command(text: &str) -> Option<LocalCommand<'_>> {
         CommandKind::Clear => LocalCommand::Clear,
         CommandKind::Save => LocalCommand::Save((!arguments.is_empty()).then_some(arguments)),
         CommandKind::Load => LocalCommand::Load((!arguments.is_empty()).then_some(arguments)),
-        CommandKind::Model => LocalCommand::Model,
+        CommandKind::Model => LocalCommand::Model((!arguments.is_empty()).then_some(arguments)),
         CommandKind::Mcp => {
             let (action, value) = split_action(arguments);
             let mcp = if arguments.is_empty() || action.eq_ignore_ascii_case("status") {
@@ -966,6 +968,22 @@ mod tests {
         assert_eq!(
             parse_local_command("/LOAD release checkpoint"),
             Some(LocalCommand::Load(Some("release checkpoint")))
+        );
+    }
+
+    #[test]
+    fn model_command_preserves_optional_direct_selection() {
+        assert_eq!(
+            parse_local_command("/model"),
+            Some(LocalCommand::Model(None))
+        );
+        assert_eq!(
+            parse_local_command("/model z-ai/glm-5.3-flash"),
+            Some(LocalCommand::Model(Some("z-ai/glm-5.3-flash")))
+        );
+        assert_eq!(
+            parse_local_command("/MODEL openrouter z-ai/glm-5.3-flash"),
+            Some(LocalCommand::Model(Some("openrouter z-ai/glm-5.3-flash")))
         );
     }
 

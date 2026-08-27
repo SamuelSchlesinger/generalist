@@ -994,6 +994,8 @@ fn apply_runtime_event(
 struct CliArgs {
     local_model: Option<String>,
     gemini: bool,
+    provider: Option<String>,
+    model: Option<String>,
     global_scope: bool,
     max_tokens: Option<u32>,
     show_licenses: bool,
@@ -1001,13 +1003,15 @@ struct CliArgs {
 
 fn print_usage() {
     println!(
-        "Usage: generalist [--global] [--gemini] [--local [model]] [--max-tokens <count>] [--licenses]"
+        "Usage: generalist [--global] [--provider <name> [--model <id>]] [--gemini] [--local [model]] [--max-tokens <count>] [--licenses]"
     );
     println!();
     println!("  --global          Use the explicit cross-project history/memory scope");
     println!("                    (default: project scope discovered from the working directory)");
     println!("  --gemini          Use Gemini 3.7 Flash through OpenRouter");
     println!("                    (requires OPENROUTER_API_KEY; --local takes precedence)");
+    println!("  --provider NAME   Use anthropic, openai, or openrouter without prompting");
+    println!("  --model ID        Model for --provider (provider default when omitted)");
     println!("  --local [model]   Run against a local OpenAI-compatible server");
     println!(
         "                    (default {}, override with OPENAI_BASE_URL).",
@@ -1036,6 +1040,8 @@ fn parse_max_tokens(value: &str) -> std::result::Result<u32, String> {
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
     let mut local_model = None;
     let mut gemini = false;
+    let mut provider = None;
+    let mut model = None;
     let mut global_scope = false;
     let mut max_tokens = None;
     let mut show_licenses = false;
@@ -1045,6 +1051,34 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
             "--global" => global_scope = true,
             "--gemini" => gemini = true,
             "--licenses" => show_licenses = true,
+            "--provider" => {
+                let Some(value) = args.next() else {
+                    eprintln!(
+                        "{} --provider missing value",
+                        style("Invalid argument:").for_stderr().red()
+                    );
+                    print_usage();
+                    std::process::exit(1);
+                };
+                provider = Some(value);
+            }
+            value if value.starts_with("--provider=") => {
+                provider = Some(value["--provider=".len()..].to_string());
+            }
+            "--model" => {
+                let Some(value) = args.next() else {
+                    eprintln!(
+                        "{} --model missing value",
+                        style("Invalid argument:").for_stderr().red()
+                    );
+                    print_usage();
+                    std::process::exit(1);
+                };
+                model = Some(value);
+            }
+            value if value.starts_with("--model=") => {
+                model = Some(value["--model=".len()..].to_string());
+            }
             "--local" => {
                 let model = match args.peek() {
                     Some(next) if !next.starts_with('-') => args.next().unwrap(),
@@ -1096,6 +1130,8 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
     CliArgs {
         local_model,
         gemini,
+        provider,
+        model,
         global_scope,
         max_tokens,
         show_licenses,
@@ -1106,16 +1142,66 @@ fn parse_args() -> CliArgs {
     parse_args_from(env::args().skip(1))
 }
 
-fn forced_provider_and_model(cli: &CliArgs) -> Option<(String, String)> {
-    if let Some(model) = &cli.local_model {
-        Some(("openai".to_string(), model.clone()))
-    } else if cli.gemini {
-        Some((
-            "openrouter".to_string(),
-            openrouter::GEMINI_3_7_FLASH_MODEL.to_string(),
-        ))
+fn normalized_provider_id(provider: &str) -> Option<&'static str> {
+    if provider.eq_ignore_ascii_case("anthropic") {
+        Some("anthropic")
+    } else if provider.eq_ignore_ascii_case("openai") {
+        Some("openai")
+    } else if provider.eq_ignore_ascii_case("openrouter") {
+        Some("openrouter")
     } else {
         None
+    }
+}
+
+fn validated_model_id(model: &str) -> std::result::Result<&str, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        Err("model ID cannot be empty".to_string())
+    } else if model.chars().any(char::is_whitespace) {
+        Err("model ID cannot contain whitespace".to_string())
+    } else {
+        Ok(model)
+    }
+}
+
+fn provider_default_model(provider: &str) -> std::result::Result<String, String> {
+    match provider {
+        "anthropic" => Ok(anthropic::SUGGESTED_MODELS[0].to_string()),
+        "openrouter" => Ok(openrouter::DEFAULT_MODEL.to_string()),
+        "openai" => Ok(env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string())),
+        _ => Err(format!("unknown provider '{provider}'")),
+    }
+}
+
+fn forced_provider_and_model(
+    cli: &CliArgs,
+) -> std::result::Result<Option<(String, String)>, String> {
+    let uses_generic_selection = cli.provider.is_some() || cli.model.is_some();
+    if uses_generic_selection && (cli.local_model.is_some() || cli.gemini) {
+        return Err("--provider/--model cannot be combined with --local or --gemini".to_string());
+    }
+    if cli.model.is_some() && cli.provider.is_none() {
+        return Err("--model requires --provider".to_string());
+    }
+
+    if let Some(model) = &cli.local_model {
+        Ok(Some(("openai".to_string(), model.clone())))
+    } else if cli.gemini {
+        Ok(Some((
+            "openrouter".to_string(),
+            openrouter::GEMINI_3_7_FLASH_MODEL.to_string(),
+        )))
+    } else if let Some(provider) = &cli.provider {
+        let provider = normalized_provider_id(provider)
+            .ok_or_else(|| format!("unknown provider '{provider}'"))?;
+        let model = match &cli.model {
+            Some(model) => validated_model_id(model)?.to_string(),
+            None => provider_default_model(provider)?,
+        };
+        Ok(Some((provider.to_string(), model)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -1140,21 +1226,48 @@ async fn choose_provider(
 
 async fn choose_model(ui: &mut TerminalUi, provider: &str) -> Result<Option<String>> {
     if provider == "anthropic" {
-        let models = anthropic::SUGGESTED_MODELS
-            .iter()
-            .map(|model| model.to_string())
-            .collect::<Vec<_>>();
-        Ok(terminal(ui.select("Select model", &models).await)?.map(|index| models[index].clone()))
+        choose_suggested_or_custom_model(ui, "Anthropic model ID", anthropic::SUGGESTED_MODELS)
+            .await
     } else if provider == "openrouter" {
-        let models = openrouter::SUGGESTED_MODELS
-            .iter()
-            .map(|model| model.to_string())
-            .collect::<Vec<_>>();
-        Ok(terminal(ui.select("Select model", &models).await)?.map(|index| models[index].clone()))
+        choose_suggested_or_custom_model(ui, "OpenRouter model ID", openrouter::SUGGESTED_MODELS)
+            .await
     } else {
         let default = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
-        terminal(ui.prompt("Model name", &default).await)
+        let Some(model) = terminal(ui.prompt("Model name", &default).await)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            validated_model_id(&model)
+                .map_err(Error::Other)?
+                .to_string(),
+        ))
     }
+}
+
+async fn choose_suggested_or_custom_model(
+    ui: &mut TerminalUi,
+    prompt_title: &str,
+    suggested: &[&str],
+) -> Result<Option<String>> {
+    let mut choices = suggested
+        .iter()
+        .map(|model| model.to_string())
+        .collect::<Vec<_>>();
+    choices.push("Enter another model ID…".to_string());
+    let Some(index) = terminal(ui.select("Select model", &choices).await)? else {
+        return Ok(None);
+    };
+    if index < suggested.len() {
+        return Ok(Some(suggested[index].to_string()));
+    }
+    let Some(model) = terminal(ui.prompt(prompt_title, "").await)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        validated_model_id(&model)
+            .map_err(Error::Other)?
+            .to_string(),
+    ))
 }
 
 async fn choose_provider_and_model(
@@ -1169,6 +1282,83 @@ async fn choose_provider_and_model(
         return Ok(None);
     };
     Ok(Some((provider, model)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelTarget<'a> {
+    Interactive,
+    ProviderPicker(&'static str),
+    Direct {
+        provider: &'static str,
+        model: &'a str,
+    },
+}
+
+fn parse_model_target<'a>(
+    current_provider: &str,
+    request: Option<&'a str>,
+) -> std::result::Result<ModelTarget<'a>, String> {
+    let Some(request) = request else {
+        return Ok(ModelTarget::Interactive);
+    };
+    let parts = request.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [] => Ok(ModelTarget::Interactive),
+        [value] => {
+            if let Some(provider) = normalized_provider_id(value) {
+                Ok(ModelTarget::ProviderPicker(provider))
+            } else {
+                let provider = normalized_provider_id(current_provider)
+                    .ok_or_else(|| format!("unknown current provider '{current_provider}'"))?;
+                Ok(ModelTarget::Direct {
+                    provider,
+                    model: validated_model_id(value)?,
+                })
+            }
+        }
+        [provider, model] => {
+            let provider = normalized_provider_id(provider)
+                .ok_or_else(|| format!("unknown provider '{provider}'"))?;
+            Ok(ModelTarget::Direct {
+                provider,
+                model: validated_model_id(model)?,
+            })
+        }
+        _ => Err("usage: /model [model|provider [model]]".to_string()),
+    }
+}
+
+fn ensure_provider_available(
+    provider: &str,
+    available: &[&'static str],
+) -> std::result::Result<(), String> {
+    if available.contains(&provider) {
+        Ok(())
+    } else {
+        Err(format!("provider '{provider}' is not configured"))
+    }
+}
+
+async fn resolve_model_target(
+    ui: &mut TerminalUi,
+    keys: &ApiKeys,
+    available: &[&'static str],
+    current_provider: &str,
+    request: Option<&str>,
+) -> Result<Option<(String, String)>> {
+    match parse_model_target(current_provider, request).map_err(Error::Other)? {
+        ModelTarget::Interactive => choose_provider_and_model(ui, keys, available).await,
+        ModelTarget::ProviderPicker(provider) => {
+            ensure_provider_available(provider, available).map_err(Error::Other)?;
+            Ok(choose_model(ui, provider)
+                .await?
+                .map(|model| (provider.to_string(), model)))
+        }
+        ModelTarget::Direct { provider, model } => {
+            ensure_provider_available(provider, available).map_err(Error::Other)?;
+            Ok(Some((provider.to_string(), model.to_string())))
+        }
+    }
 }
 
 fn enqueue_submission(
@@ -1716,22 +1906,26 @@ async fn execute_command(
                 }
             }
         }
-        LocalCommand::Model => {
-            if let Some((provider_name, model)) =
-                choose_provider_and_model(ctx.ui, keys, available).await?
-            {
-                match build_provider(keys, &provider_name, model) {
-                    Ok(provider) => {
-                        agent.set_provider(provider);
-                        ctx.ui.set_session(
-                            agent.provider().display_name(),
-                            agent.provider().model(),
-                            agent.registry.tool_names().len(),
-                        );
-                        ctx.ui.info("Model switched.");
+        LocalCommand::Model(request) => {
+            let selection =
+                resolve_model_target(ctx.ui, keys, available, agent.provider().id(), request).await;
+            match selection {
+                Ok(Some((provider_name, model))) => {
+                    match build_provider(keys, &provider_name, model) {
+                        Ok(provider) => {
+                            agent.set_provider(provider);
+                            ctx.ui.set_session(
+                                agent.provider().display_name(),
+                                agent.provider().model(),
+                                agent.registry.tool_names().len(),
+                            );
+                            ctx.ui.info("Model switched.");
+                        }
+                        Err(error) => ctx.ui.error(&format!("Failed to switch model: {error}")),
                     }
-                    Err(error) => ctx.ui.error(&format!("Failed to switch model: {error}")),
                 }
+                Ok(None) => {}
+                Err(error) => ctx.ui.error(&format!("Failed to switch model: {error}")),
             }
         }
         LocalCommand::Mcp(McpCommand::Status) => {
@@ -1956,15 +2150,30 @@ async fn main() -> Result<()> {
         }
         keys.openai.get_or_insert_with(|| "unused".to_string());
     }
-    if cli.gemini && cli.local_model.is_none() && keys.openrouter.is_none() {
+    let forced_provider_and_model = forced_provider_and_model(&cli).unwrap_or_else(|error| {
         eprintln!(
-            "{} --gemini requires OPENROUTER_API_KEY (in the environment or {}).",
+            "{} {error}",
             style("Configuration error:").for_stderr().red(),
-            profile_paths.environment_file().display()
         );
         std::process::exit(1);
-    }
+    });
     let available = keys.available_providers();
+    if let Some((provider, _)) = &forced_provider_and_model {
+        if !available.contains(&provider.as_str()) {
+            let required = match provider.as_str() {
+                "anthropic" => "ANTHROPIC_API_KEY",
+                "openrouter" => "OPENROUTER_API_KEY",
+                "openai" => "OPENAI_API_KEY or OPENAI_BASE_URL",
+                _ => "the provider's API key",
+            };
+            eprintln!(
+                "{} provider '{provider}' requires {required} (in the environment or {}).",
+                style("Configuration error:").for_stderr().red(),
+                profile_paths.environment_file().display()
+            );
+            std::process::exit(1);
+        }
+    }
     if available.is_empty() {
         eprintln!("{}", style("No API key found.").for_stderr().red());
         eprintln!(
@@ -2004,7 +2213,7 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let provider_and_model = match forced_provider_and_model(&cli) {
+    let provider_and_model = match forced_provider_and_model {
         Some(requested) => Some(requested),
         None => match default_remote_provider_and_model(&keys) {
             Some(default) => Some(default),
@@ -2256,10 +2465,10 @@ mod tests {
         assert_eq!(cli.max_tokens, Some(4096));
         assert_eq!(
             forced_provider_and_model(&cli),
-            Some((
+            Ok(Some((
                 "openrouter".to_string(),
                 "google/gemini-3.7-flash".to_string()
-            ))
+            )))
         );
     }
 
@@ -2283,8 +2492,124 @@ mod tests {
 
         assert_eq!(
             forced_provider_and_model(&cli),
-            Some(("openai".to_string(), "custom-local-model".to_string()))
+            Ok(Some((
+                "openai".to_string(),
+                "custom-local-model".to_string()
+            )))
         );
+    }
+
+    #[test]
+    fn explicit_provider_and_model_support_arbitrary_openrouter_slugs() {
+        let cli = parse_args_from(
+            ["--provider", "OpenRouter", "--model=z-ai/glm-5.3-flash"]
+                .into_iter()
+                .map(str::to_string),
+        );
+
+        assert_eq!(
+            forced_provider_and_model(&cli),
+            Ok(Some((
+                "openrouter".to_string(),
+                "z-ai/glm-5.3-flash".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn explicit_provider_uses_its_stable_default_when_model_is_omitted() {
+        let cli = parse_args_from(["--provider=openrouter"].into_iter().map(str::to_string));
+
+        assert_eq!(
+            forced_provider_and_model(&cli),
+            Ok(Some((
+                "openrouter".to_string(),
+                "moonshotai/kimi-k3".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn generic_selection_rejects_ambiguous_or_conflicting_flags() {
+        let model_only = parse_args_from(
+            ["--model", "z-ai/glm-5.3-flash"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(
+            forced_provider_and_model(&model_only),
+            Err("--model requires --provider".to_string())
+        );
+
+        let conflicting = parse_args_from(
+            ["--gemini", "--provider", "openrouter"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(
+            forced_provider_and_model(&conflicting),
+            Err("--provider/--model cannot be combined with --local or --gemini".to_string())
+        );
+    }
+
+    #[test]
+    fn direct_model_targets_are_explicit_and_whitespace_bounded() {
+        assert_eq!(
+            parse_model_target("openrouter", None),
+            Ok(ModelTarget::Interactive)
+        );
+        assert_eq!(
+            parse_model_target("anthropic", Some("openrouter")),
+            Ok(ModelTarget::ProviderPicker("openrouter"))
+        );
+        assert_eq!(
+            parse_model_target("openrouter", Some("z-ai/glm-5.3-flash")),
+            Ok(ModelTarget::Direct {
+                provider: "openrouter",
+                model: "z-ai/glm-5.3-flash"
+            })
+        );
+        assert_eq!(
+            parse_model_target("anthropic", Some("openrouter z-ai/glm-5.3-flash")),
+            Ok(ModelTarget::Direct {
+                provider: "openrouter",
+                model: "z-ai/glm-5.3-flash"
+            })
+        );
+        assert!(parse_model_target("openrouter", Some("openrouter one two")).is_err());
+        assert_eq!(
+            ensure_provider_available("openrouter", &["openrouter", "anthropic"]),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_provider_available("openrouter", &["anthropic"]),
+            Err("provider 'openrouter' is not configured".to_string())
+        );
+    }
+
+    #[test]
+    fn switched_arbitrary_openrouter_model_is_preserved_in_saved_state() {
+        let initial = OpenAiProvider::new(
+            "unused".to_string(),
+            generalist::provider::openai::DEFAULT_BASE_URL.to_string(),
+            "gpt-4o".to_string(),
+        )
+        .unwrap();
+        let mut agent = Agent::new(Box::new(initial), ToolRegistry::new(), "test");
+        let switched =
+            OpenRouterProvider::new("unused".to_string(), "z-ai/glm-5.3-flash".to_string())
+                .unwrap();
+        agent.set_provider(Box::new(switched));
+
+        let state = make_saved_state(
+            &agent,
+            &MemoryPermissionHandler::new(),
+            &PromptQueue::default(),
+            &WorkspaceScope::Global,
+        );
+
+        assert_eq!(state.provider, "openrouter");
+        assert_eq!(state.model, "z-ai/glm-5.3-flash");
     }
 
     #[test]

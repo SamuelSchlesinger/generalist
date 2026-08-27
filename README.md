@@ -9,7 +9,7 @@ an agent loop that reports progress through event callbacks.
 ## Install and run
 
 ```bash
-cargo build --release
+cargo build --release --locked
 
 # Keys go in the environment or ~/.generalist.env:
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.generalist.env
@@ -22,14 +22,21 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 # Gemini through OpenRouter (requires OPENROUTER_API_KEY):
 ./target/release/generalist --gemini                  # google/gemini-3.7-flash
 
+# Any configured provider/model, without an interactive prompt:
+./target/release/generalist --provider openrouter --model z-ai/glm-5.3-flash
+
 # Local models need no key:
 ./target/release/generalist --local                    # qwen3.8:latest
 ./target/release/generalist --local qwen2.5-coder:32b  # or name one
 ```
 
 When `OPENROUTER_API_KEY` is configured, normal remote startup defaults to
-OpenRouter's `moonshotai/kimi-k3`. Use `/model` to switch to another configured
-API. `--gemini` bypasses selection and uses OpenRouter's
+OpenRouter's `moonshotai/kimi-k3`. Use `/model` to switch interactively,
+`/model <model>` to switch the current API directly, or
+`/model <provider> <model>` to switch both. The Anthropic and OpenRouter pickers
+offer curated models plus an arbitrary model-ID prompt. `--provider` and
+`--model` provide the same explicit selection at startup. `--gemini` remains a
+convenience alias that uses OpenRouter's
 `google/gemini-3.7-flash`. `--local` always takes precedence and keeps the
 local-model behavior.
 
@@ -65,7 +72,8 @@ until the model calls the host-owned `update_goal(status="complete")` control.
 objective, and `/goal clear` stops and removes it. Escape, a provider error,
 refusal, or permission denial pauses automatic continuation without discarding
 the objective; edit the goal or send another prompt to resume. Other commands
-are `/save [name]`, `/load [name]`, `/history`, `/model`, `/compact`, `/clear`, `/memory`,
+are `/save [name]`, `/load [name]`, `/history`,
+`/model [model|provider [model]]`, `/compact`, `/clear`, `/memory`,
 `/help`, `/permissions`, `/tools`, `/mcp`, `/usage`, `/copy`, and `/exit`.
 
 History-valid boundaries, the active goal, queue, named sessions, and persisted
