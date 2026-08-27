@@ -88,4 +88,46 @@ mod tests {
             ]
         );
     }
+
+    #[tokio::test]
+    #[ignore = "live OpenRouter catalog check; exercised by the scheduled workflow"]
+    async fn suggested_models_exist_and_support_tools_in_live_catalog() {
+        let response = reqwest::get(format!("{DEFAULT_BASE_URL}/models"))
+            .await
+            .expect("OpenRouter models request");
+        let status = response.status();
+        let body = response.bytes().await.expect("OpenRouter models body");
+        assert!(
+            status.is_success(),
+            "OpenRouter models request failed with {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&body).expect("OpenRouter models JSON");
+        let models = catalog
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .expect("OpenRouter models data array");
+
+        for suggested in SUGGESTED_MODELS {
+            let model = models
+                .iter()
+                .find(|model| {
+                    model.get("id").and_then(serde_json::Value::as_str) == Some(suggested)
+                })
+                .unwrap_or_else(|| panic!("suggested OpenRouter model '{suggested}' is missing"));
+            let supports_tools = model
+                .get("supported_parameters")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parameters| {
+                    parameters
+                        .iter()
+                        .any(|parameter| parameter.as_str() == Some("tools"))
+                });
+            assert!(
+                supports_tools,
+                "suggested OpenRouter model '{suggested}' does not advertise tool support"
+            );
+        }
+    }
 }
