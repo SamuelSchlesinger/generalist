@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-native-speculative-decode",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "dense": true,
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "language_layer_count": 64,
+    "mtp_layer_count": 1
+  },
+  "runtime": {
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399",
+    "metallib_sha256": "2f431692c8eda5ed01bd9585d92ab94d195770282957765f2566018aa2dd9277"
+  },
+  "hardware": {
+    "model": "MacBook Pro Mac16,8",
+    "chip": "Apple M4 Pro",
+    "unified_memory_gib": 48
+  },
+  "protocol": {
+    "prompt": "exact recurrence_ten_steps coding-agent chat fixture shared with the Ollama depth-control experiment",
+    "prompt_sha256": "231763bebfa8d71fb89820343d150cefddab3554783946289c1e0f54a9be3bf4",
+    "prompt_tokens": 101,
+    "generated_tokens": 192,
+    "timed_decode_tokens": 191,
+    "replicas_per_geometry": 3,
+    "mode_order": "rotated one position per replica",
+    "decoding": "greedy argmax",
+    "reasoning": {
+      "enabled": true,
+      "effort": "medium",
+      "think_template": true
+    },
+    "semantic_contract": "every complete token-id stream equals ordinary greedy target decoding",
+    "output_token_sha256": "774e7013b0da3ea0a37242baed49f748cae2e136cf3c4f94ff2d31326ee6b52c"
+  },
+  "prefill_experiment": {
+    "baseline": {
+      "maximum_chunk_tokens": 8,
+      "target_prompt_tokens_per_second": "34.8298"
+    },
+    "candidate": {
+      "maximum_chunk_tokens": 512,
+      "actual_chunks": 1,
+      "target_prompt_tokens_per_second": "91.6896",
+      "output_exact": true
+    },
+    "ollama_reference": {
+      "same_prompt": true,
+      "target_prompt_tokens_per_second": "88.244"
+    },
+    "candidate_speedup": "2.632504349724"
+  },
+  "stage_profile": {
+    "fixed_depth": 2,
+    "generated_tokens": 64,
+    "verification_qmv_results_per_simdgroup": 2,
+    "total_milliseconds": "2302.305",
+    "proposal_milliseconds": "87.777",
+    "verification_milliseconds": "2018.845",
+    "replay_milliseconds": "68.904",
+    "correction_milliseconds": "125.539",
+    "verification_share": "0.876879909482"
+  },
+  "geometry_experiment": {
+    "fixed_depth": 2,
+    "baseline_results_per_simdgroup": 2,
+    "candidate_results_per_simdgroup": 4,
+    "measurement_columns": [
+      "r2_decode_milliseconds",
+      "r4_decode_milliseconds",
+      "r2_verification_milliseconds",
+      "r4_verification_milliseconds"
+    ],
+    "runs": [
+      ["6735.170", "6545.977", "6012.887", "5820.511"],
+      ["7076.215", "6982.908", "6323.657", "6216.383"],
+      ["7584.885", "7230.422", "6806.989", "6457.713"]
+    ],
+    "timing_status": "accepted paired interleaved",
+    "absolute_rates_are_thermally_sensitive": true,
+    "r2_median_tokens_per_second": "26.991831084838",
+    "r4_median_tokens_per_second": "27.352501278837",
+    "paired_median_decode_speedup": "1.028902179155",
+    "paired_median_verification_speedup": "1.033051393598",
+    "candidate_decode_wins": 3,
+    "candidate_verification_wins": 3,
+    "drafted": 128,
+    "accepted": 126,
+    "acceptance": "0.984375",
+    "complete_output_exact": true,
+    "output_token_sha256": "774e7013b0da3ea0a37242baed49f748cae2e136cf3c4f94ff2d31326ee6b52c"
+  },
+  "conclusion": {
+    "default_fixed_depth": 2,
+    "ordinary_decode_results_per_simdgroup": 2,
+    "batched_verification_results_per_simdgroup": 4,
+    "promotion_scope": "multi-row target verification and rejection replay only",
+    "dominant_next_bottleneck": "batched target verification",
+    "reasoning_remains_enabled": true
+  }
+}

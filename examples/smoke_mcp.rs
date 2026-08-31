@@ -6,7 +6,7 @@
 //!    from inside a code-mode script (`tools.tickerfacts_get_fundamentals`).
 //!
 //! Run with: `cargo run --example smoke_mcp [model]`
-//! Requires Ollama on localhost:11434 (default model: qwen3:30b) and network
+//! Requires Ollama on localhost:11434 (default model: qwen3.8:27b-mlx) and network
 //! access to tickerfacts.com.
 
 use generalist::mcp::{register_servers, McpConfig};
@@ -19,7 +19,7 @@ const MCP_URL: &str = "https://tickerfacts.com/mcp";
 async fn main() -> generalist::Result<()> {
     let model = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwen3:30b".to_string());
+        .unwrap_or_else(|| "qwen3.8:27b-mlx".to_string());
 
     // Stage 1: infrastructure, no model involved.
     let config: McpConfig = serde_json::from_str(&format!(

@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-cached-metal-dispatch-profile",
+  "recorded_at": "2026-08-31T10:38:32Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "language_blob_count": 851,
+    "loaded_array_count": 1653,
+    "layer_count": 64,
+    "linear_attention_layer_count": 48,
+    "full_attention_layer_count": 16
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399",
+    "macos": "26.5.2 (25F84)",
+    "xcode": "26.2 (17C52)",
+    "metal_compiler": "32023.864"
+  },
+  "oracle": {
+    "position_zero": {
+      "input_token_id": 42,
+      "output_token_id": 1219,
+      "hidden_fingerprint": "6dfc18bc2b1c2044",
+      "logits_fingerprint": "4efefa793523b51f"
+    },
+    "position_one": {
+      "input_token_id": 1219,
+      "output_token_id": 73,
+      "hidden_fingerprint": "66245d3b40e34351",
+      "logits_fingerprint": "f1c93f5eefb964c8"
+    },
+    "position_128": {
+      "input_token_id": 13,
+      "output_token_id": 457,
+      "hidden_fingerprint": "ec8df38e485727c3",
+      "logits_fingerprint": "b992c48f0705f8e4"
+    },
+    "fifteen_token_continuation": [
+      73,
+      3706,
+      23102,
+      288,
+      37105,
+      163283,
+      627,
+      288,
+      728,
+      13373,
+      84,
+      1110,
+      469,
+      39111,
+      35306
+    ],
+    "position_1_through_127_continuation_fingerprint": "e1185ef3ebbb60ae"
+  },
+  "trace_protocol": {
+    "warm_cached_steps": 8,
+    "step_boundary_pipeline": "argmax_bfloat16",
+    "kernel_counts": "exact ordered dispatch records",
+    "gpu_timing": "union of Xcode metal-gpu-intervals per cached step",
+    "warning": "Xcode GPU timing is a cross-run observation; paired wall-clock replicas are the promoted speed evidence"
+  },
+  "dynamic_norm_baseline": {
+    "first_step_encoders": 84,
+    "steady_step_encoders": 82,
+    "first_step_dispatches": 2794,
+    "steady_step_dispatches": 2792,
+    "eight_step_dispatches": 22338,
+    "eight_step_selected_kernel_counts": {
+      "vs_Addbfloat16": 1288,
+      "v_copyfloat32bfloat16": 4488,
+      "nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0": 2824
+    },
+    "median_gpu_busy_milliseconds": "69.543",
+    "median_gpu_span_milliseconds": "69.767"
+  },
+  "precomputed_norm_candidate": {
+    "shifted_norm_weight_count": 161,
+    "first_step_encoders": 84,
+    "steady_step_encoders": 82,
+    "first_step_dispatches": 2472,
+    "steady_step_dispatches": 2470,
+    "eight_step_dispatches": 19762,
+    "eight_step_selected_kernel_counts": {
+      "vs_Addbfloat16": 0,
+      "v_copyfloat32bfloat16": 3200,
+      "nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0": 2824
+    },
+    "median_gpu_busy_milliseconds": "66.882",
+    "median_gpu_span_milliseconds": "67.517"
+  },
+  "packed_mlp_candidate": {
+    "packed_gate_up_layer_count": 64,
+    "first_step_encoders": 68,
+    "steady_step_encoders": 66,
+    "first_step_dispatches": 2280,
+    "steady_step_dispatches": 2278,
+    "eight_step_dispatches": 18226,
+    "eight_step_selected_kernel_counts": {
+      "v_copybfloat16float32": 3073,
+      "v_copyfloat32bfloat16": 2688,
+      "vs_Multiplyfloat32": 1408,
+      "vv_Multiplyfloat32": 1280,
+      "nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0": 2312
+    },
+    "median_gpu_busy_milliseconds": "66.385",
+    "median_gpu_span_milliseconds": "66.728"
+  },
+  "exact_scale_candidate": {
+    "nvfp4_matvecs_per_cached_token": 289,
+    "rounding_contract": "F32 accumulator to BF16, multiply the rounded value by its F32 global scale, then convert to BF16",
+    "first_step_encoders": 68,
+    "steady_step_encoders": 66,
+    "first_step_dispatches": 1413,
+    "steady_step_dispatches": 1411,
+    "eight_step_dispatches": 11290,
+    "eight_step_selected_kernel_counts": {
+      "v_copybfloat16float32": 769,
+      "v_copyfloat32bfloat16": 384,
+      "vs_Multiplyfloat32": 0,
+      "vv_Multiplyfloat32": 384,
+      "nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0_hgs_exact": 2312
+    },
+    "median_gpu_busy_milliseconds": "66.063",
+    "median_gpu_span_milliseconds": "66.325"
+  },
+  "narrow_qmv_candidate": {
+    "results_per_simdgroup": 2,
+    "minimum_output_width": 4096,
+    "nvfp4_matvecs_per_cached_token": 289,
+    "narrow_matvecs_per_cached_token": 257,
+    "wide_matvecs_per_cached_token": 32,
+    "first_step_encoders": 68,
+    "steady_step_encoders": 66,
+    "first_step_dispatches": 1413,
+    "steady_step_dispatches": 1411,
+    "eight_step_dispatches": 11290,
+    "eight_step_selected_kernel_counts": {
+      "nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_r_2_batch_0_hgs_exact": 2056,
+      "nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0_hgs_exact": 256
+    },
+    "median_gpu_busy_milliseconds": "65.663",
+    "median_gpu_span_milliseconds": "66.013"
+  },
+  "effects": {
+    "precomputed_norm": {
+      "dispatches_removed_per_cached_token": 322,
+      "steady_dispatch_reduction": "0.115329512894",
+      "cross_run_gpu_busy_speedup": "1.039786489638",
+      "numerical_result": "bit-exact at both initial full-tensor checkpoints and across the continuation"
+    },
+    "packed_mlp": {
+      "dispatches_removed_per_cached_token": 192,
+      "qmv_dispatches_removed_per_cached_token": 64,
+      "steady_dispatch_reduction_from_precomputed_norm": "0.077732793522",
+      "numerical_result": "bit-exact through the position-128 full-tensor checkpoint and continuation fingerprint"
+    },
+    "exact_global_scale": {
+      "dispatches_removed_per_cached_token": 867,
+      "dispatches_removed_per_nvfp4_matvec": 3,
+      "steady_dispatch_reduction_from_packed_mlp": "0.380597014925",
+      "cross_run_gpu_busy_speedup": "1.004874135295",
+      "numerical_result": "bit-exact through three independent 127-position paired runs and all frozen full-tensor checkpoints"
+    },
+    "narrow_qmv_geometry": {
+      "dispatches_removed_per_cached_token": 0,
+      "matvecs_retiled_per_cached_token": 257,
+      "cross_run_gpu_busy_speedup": "1.006091710705",
+      "numerical_result": "bit-exact through four independent 127-position paired runs and all frozen full-tensor checkpoints"
+    },
+    "cumulative": {
+      "dispatches_removed_per_cached_token": 1381,
+      "steady_dispatch_reduction_from_dynamic_norm": "0.494627507163"
+    }
+  },
+  "wall_clock_experiments": {
+    "precomputed_norm": {
+      "focused_rounds": 127,
+      "timing_status": "accepted",
+      "candidate_median_milliseconds": "69.858",
+      "baseline_median_milliseconds": "70.034",
+      "median_speedup": "1.002527",
+      "paired_median_speedup": "1.000587",
+      "paired_median_difference_microseconds": "40.958",
+      "candidate_wins": 70,
+      "initial_control_milliseconds": "71.415",
+      "post_control_milliseconds": "71.064",
+      "conclusion": "wall-clock neutral; earlier 15-round gains were noise-scale"
+    },
+    "packed_mlp": {
+      "focused_rounds": 127,
+      "timing_status": "accepted",
+      "candidate_median_milliseconds": "69.975",
+      "baseline_median_milliseconds": "70.100",
+      "median_speedup": "1.001775",
+      "paired_median_speedup": "1.002680",
+      "paired_median_difference_microseconds": "186.208",
+      "candidate_wins": 74,
+      "initial_control_milliseconds": "71.255",
+      "post_control_milliseconds": "70.939",
+      "conclusion": "small positive result with memory-neutral resident packing"
+    },
+    "exact_global_scale_replicas": [
+      {
+        "rounds": 127,
+        "timing_status": "accepted",
+        "candidate_median_milliseconds": "68.331",
+        "baseline_median_milliseconds": "69.999",
+        "median_speedup": "1.024416",
+        "paired_median_speedup": "1.025312",
+        "paired_median_difference_microseconds": "1718.792",
+        "candidate_wins": 125,
+        "initial_control_milliseconds": "71.695",
+        "post_control_milliseconds": "71.842"
+      },
+      {
+        "rounds": 127,
+        "timing_status": "accepted",
+        "candidate_median_milliseconds": "68.185",
+        "baseline_median_milliseconds": "69.934",
+        "median_speedup": "1.025641",
+        "paired_median_speedup": "1.023959",
+        "paired_median_difference_microseconds": "1637.792",
+        "candidate_wins": 123,
+        "initial_control_milliseconds": "71.269",
+        "post_control_milliseconds": "71.121"
+      },
+      {
+        "rounds": 127,
+        "timing_status": "accepted",
+        "candidate_median_milliseconds": "68.202",
+        "baseline_median_milliseconds": "69.946",
+        "median_speedup": "1.025568",
+        "paired_median_speedup": "1.025925",
+        "paired_median_difference_microseconds": "1762.583",
+        "candidate_wins": 124,
+        "initial_control_milliseconds": "68.858",
+        "post_control_milliseconds": "70.451"
+      }
+    ],
+    "narrow_qmv_replicas": [
+      {
+        "rounds": 127,
+        "timing_status": "accepted",
+        "candidate_median_milliseconds": "67.600",
+        "baseline_median_milliseconds": "68.216",
+        "median_speedup": "1.009103",
+        "paired_median_speedup": "1.010018",
+        "paired_median_difference_microseconds": "677.541",
+        "candidate_wins": 106,
+        "initial_control_milliseconds": "69.316",
+        "post_control_milliseconds": "69.171"
+      },
+      {
+        "rounds": 127,
+        "timing_status": "accepted",
+        "candidate_median_milliseconds": "67.604",
+        "baseline_median_milliseconds": "68.240",
+        "median_speedup": "1.009405",
+        "paired_median_speedup": "1.010187",
+        "paired_median_difference_microseconds": "685.042",
+        "candidate_wins": 111,
+        "initial_control_milliseconds": "69.517",
+        "post_control_milliseconds": "68.899"
+      },
+      {
+        "rounds": 127,
+        "timing_status": "accepted",
+        "candidate_median_milliseconds": "67.601",
+        "baseline_median_milliseconds": "68.153",
+        "median_speedup": "1.008174",
+        "paired_median_speedup": "1.007341",
+        "paired_median_difference_microseconds": "496.333",
+        "candidate_wins": 101,
+        "initial_control_milliseconds": "69.155",
+        "post_control_milliseconds": "71.579"
+      },
+      {
+        "rounds": 127,
+        "timing_status": "accepted",
+        "candidate_median_milliseconds": "68.016",
+        "baseline_median_milliseconds": "68.554",
+        "median_speedup": "1.007908",
+        "paired_median_speedup": "1.009854",
+        "paired_median_difference_microseconds": "665.083",
+        "candidate_wins": 106,
+        "initial_control_milliseconds": "69.790",
+        "post_control_milliseconds": "68.914"
+      }
+    ],
+    "promotion_validation": {
+      "measured_rounds": 7,
+      "timing_status": "accepted",
+      "zero_state_median_milliseconds": "69.055",
+      "cached_argmax_median_milliseconds": "68.261",
+      "cached_argmax_tokens_per_second": "14.650",
+      "post_control_milliseconds": "68.768"
+    }
+  },
+  "finding": {
+    "result": "promote exact fused NVFP4 global scaling and two-result QMV geometry; retain the unfused and four-result graphs as oracles",
+    "measured_wall_clock_gain": "exact scale fusion measured 2.396% to 2.593% paired gains; narrower QMV geometry added 0.734% to 1.019% across four accepted 127-position replicas",
+    "dispatch_result": "steady cached decode fell from 2792 to 1411 dispatches across the cumulative exact surgeries",
+    "next_bottleneck": "289 NVFP4 matrix-vector dispatches per cached token, now split into 257 narrow and 32 wide kernels"
+  }
+}

@@ -12,6 +12,15 @@ readme = "README.md"
 keywords = ["agent", "llm", "ai", "chatbot", "tools"]
 categories = ["command-line-utilities"]
 
+[features]
+default = []
+# Builds the in-process inference provider and validated model-pack boundary.
+# Native MLX linkage remains an explicit machine-specific build step.
+embedded-mlx = ["dep:ring", "dep:tokenizers"]
+# Links the machine-built static MLX/MLX-C archives into Generalist. Enabling
+# this requires the pinned source/build paths documented in native/mlx.
+embedded-mlx-native = ["embedded-mlx"]
+
 [dependencies]
 reqwest = { version = "0.13", features = ["json", "query"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -31,7 +40,69 @@ uuid = { version = "1.24.0", features = ["v4", "v5"] }
 tempfile = "3.27"
 firecrawl = "2.12.1"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+ring = { version = "0.17.14", optional = true }
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"], optional = true }
 
 [[bin]]
 name = "generalist"
 path = "src/main.rs"
+
+[[example]]
+name = "embedded_model_probe"
+path = "examples/embedded_model_probe.rs"
+required-features = ["embedded-mlx"]
+
+[[example]]
+name = "embedded_native_probe"
+path = "examples/embedded_native_probe.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_decode_benchmark"
+path = "examples/embedded_decode_benchmark.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_decode_trace"
+path = "examples/embedded_decode_trace.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_decode_ab"
+path = "examples/embedded_decode_ab.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_mtp_checkpoint"
+path = "examples/embedded_mtp_checkpoint.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_speculative_benchmark"
+path = "examples/embedded_speculative_benchmark.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_speculative_trace"
+path = "examples/embedded_speculative_trace.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_prefix_cache_benchmark"
+path = "examples/embedded_prefix_cache_benchmark.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_provider_benchmark"
+path = "examples/embedded_provider_benchmark.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "embedded_ollama_benchmark"
+path = "examples/embedded_ollama_benchmark.rs"
+required-features = ["embedded-mlx-native"]
+
+[[example]]
+name = "smoke_embedded"
+path = "examples/smoke_embedded.rs"
+required-features = ["embedded-mlx-native"]

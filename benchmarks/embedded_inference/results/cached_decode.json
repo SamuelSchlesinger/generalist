@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-token42-1219-cached-decode",
+  "recorded_at": "2026-08-31T08:08:19Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "embedding_name": "model.language_model.embed_tokens.weight",
+    "final_norm_name": "model.language_model.norm.weight",
+    "lm_head_name": "lm_head.weight",
+    "language_blob_count": 851,
+    "loaded_array_count": 1653
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399"
+  },
+  "operation": {
+    "input_token_ids": [
+      42,
+      1219
+    ],
+    "output_token_ids": [
+      1219,
+      73
+    ],
+    "positions": [
+      0,
+      1
+    ],
+    "layer_count": 64,
+    "linear_attention_layer_count": 48,
+    "full_attention_layer_count": 16,
+    "hidden_width": 5120,
+    "vocabulary_width": 248320,
+    "hidden_dtype": 12,
+    "logits_dtype": 12,
+    "conv_state_shape": [
+      1,
+      3,
+      10240
+    ],
+    "conv_state_dtype": 12,
+    "delta_state_shape": [
+      1,
+      48,
+      128,
+      128
+    ],
+    "delta_state_dtype": 10,
+    "kv_buffer_shape": [
+      1,
+      4,
+      256,
+      256
+    ],
+    "kv_buffer_dtype": 12,
+    "kv_growth_step": 256,
+    "rope_theta": "10000000",
+    "rope_dimension": 64,
+    "attention_scale": "0.0625",
+    "full_attention_path": "generic-cached-sdpa",
+    "state_commit": "single-synchronized-transaction",
+    "evaluated_roots_per_step": 129,
+    "silu_execution": "mlx-compiled-shapeless-graph",
+    "swiglu_execution": "mlx-compiled-shapeless-graph",
+    "fingerprint": "fnv1a64-little-endian-f32"
+  },
+  "generalist": {
+    "steps": [
+      {
+        "position": 0,
+        "input_token_id": 42,
+        "output_token_id": 1219,
+        "hidden": {
+          "dtype": 12,
+          "elements": 5120,
+          "sum": "82.351737976074",
+          "squared_sum": "18375.334290960629",
+          "first": "-0.523437500",
+          "middle": "-8.937500000",
+          "last": "-0.179687500",
+          "fingerprint": "6dfc18bc2b1c2044"
+        },
+        "logits": {
+          "dtype": 12,
+          "elements": 248320,
+          "sum": "-114099.678878903389",
+          "squared_sum": "753699.560238623875",
+          "first": "4.593750000",
+          "middle": "-1.382812500",
+          "last": "0.443359375",
+          "fingerprint": "4efefa793523b51f"
+        }
+      },
+      {
+        "position": 1,
+        "input_token_id": 1219,
+        "output_token_id": 73,
+        "hidden": {
+          "dtype": 12,
+          "elements": 5120,
+          "sum": "-2.603607177734",
+          "squared_sum": "17182.186691443436",
+          "first": "0.222656250",
+          "middle": "-0.648437500",
+          "last": "-2.968750000",
+          "fingerprint": "66245d3b40e34351"
+        },
+        "logits": {
+          "dtype": 12,
+          "elements": 248320,
+          "sum": "-456082.550441503525",
+          "squared_sum": "1646237.056649758946",
+          "first": "6.312500000",
+          "middle": "-0.859375000",
+          "last": "-2.343750000",
+          "fingerprint": "f1c93f5eefb964c8"
+        }
+      }
+    ]
+  },
+  "ollama": {
+    "steps": [
+      {
+        "position": 0,
+        "input_token_id": 42,
+        "output_token_id": 1219,
+        "hidden": {
+          "dtype": 12,
+          "elements": 5120,
+          "sum": "82.351737976074",
+          "squared_sum": "18375.334290960629",
+          "first": "-0.523437500",
+          "middle": "-8.937500000",
+          "last": "-0.179687500",
+          "fingerprint": "6dfc18bc2b1c2044"
+        },
+        "logits": {
+          "dtype": 12,
+          "elements": 248320,
+          "sum": "-114099.678878903389",
+          "squared_sum": "753699.560238623875",
+          "first": "4.593750000",
+          "middle": "-1.382812500",
+          "last": "0.443359375",
+          "fingerprint": "4efefa793523b51f"
+        }
+      },
+      {
+        "position": 1,
+        "input_token_id": 1219,
+        "output_token_id": 73,
+        "hidden": {
+          "dtype": 12,
+          "elements": 5120,
+          "sum": "-2.603607177734",
+          "squared_sum": "17182.186691443436",
+          "first": "0.222656250",
+          "middle": "-0.648437500",
+          "last": "-2.968750000",
+          "fingerprint": "66245d3b40e34351"
+        },
+        "logits": {
+          "dtype": 12,
+          "elements": 248320,
+          "sum": "-456082.550441503525",
+          "squared_sum": "1646237.056649758946",
+          "first": "6.312500000",
+          "middle": "-0.859375000",
+          "last": "-2.343750000",
+          "fingerprint": "f1c93f5eefb964c8"
+        }
+      }
+    ]
+  },
+  "comparison": {
+    "exact": true,
+    "state_transition_exact": true,
+    "cache_reset_exact": true,
+    "positions": [
+      0,
+      1
+    ],
+    "stages": [
+      "hidden",
+      "logits"
+    ]
+  },
+  "performance_observation": {
+    "scope": "two-token-greedy-cached-decode-with-full-tensor-summaries",
+    "checkpoint_summaries_included": true,
+    "timing_status": "accepted",
+    "clean_exact_zero_state_reference_milliseconds": "72.549",
+    "observed_exact_zero_state_median_milliseconds": "72.549",
+    "maximum_accepted_control_slowdown": "1.65",
+    "generalist_step0_milliseconds": "75.031",
+    "generalist_step1_milliseconds": "75.021",
+    "ollama_step0_milliseconds": "100.341",
+    "ollama_step1_milliseconds": "75.367",
+    "generalist_step1_tokens_per_second": "13.329",
+    "ollama_step1_tokens_per_second": "13.269",
+    "generalist_step1_speedup": "1.004612",
+    "warning": "contemporaneous single run including hidden/logit summaries; use the control-gated argmax benchmark for steady-state throughput claims"
+  },
+  "parity_finding": {
+    "first_divergent_layer_before_fix": 62,
+    "first_divergent_stage_before_fix": "mlp.swiglu",
+    "cause": "an unfused equivalent expression inserted a BF16 rounding boundary absent from Ollama's compiled shapeless SwiGLU",
+    "fix": "compile shapeless SiLU and SwiGLU graphs and reuse their outputs at Ollama's execution boundaries",
+    "result": "exact hidden states, logits, and greedy tokens through the second cached position"
+  }
+}

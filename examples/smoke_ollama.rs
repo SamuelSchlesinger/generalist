@@ -3,7 +3,7 @@
 //!
 //! Run with: `cargo run --example smoke_ollama [model]`
 //! Requires Ollama running on localhost:11434 with a tool-capable model
-//! (default: qwen3:30b).
+//! (default: qwen3.8:27b-mlx).
 
 use generalist::provider::OpenAiProvider;
 use generalist::tools::CalculatorTool;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 async fn main() -> generalist::Result<()> {
     let model = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwen3:30b".to_string());
+        .unwrap_or_else(|| "qwen3.8:27b-mlx".to_string());
 
     // Ollama ignores the API key but the header must be present.
     let provider = OpenAiProvider::new(
@@ -22,7 +22,6 @@ async fn main() -> generalist::Result<()> {
         "http://localhost:11434/v1".into(),
         model.clone(),
     )?;
-
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(CalculatorTool))?;
 

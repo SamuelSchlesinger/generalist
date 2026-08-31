@@ -26,7 +26,8 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 ./target/release/generalist --provider openrouter --model z-ai/glm-5.3-flash
 
 # Local models need no key:
-./target/release/generalist --local                    # qwen3.8:latest
+ollama pull qwen3.8:27b-mlx
+./target/release/generalist --local                    # qwen3.8:27b-mlx
 ./target/release/generalist --local qwen2.5-coder:32b  # or name one
 ```
 
@@ -44,11 +45,128 @@ local-model behavior.
 `OPENAI_BASE_URL` for other local servers. Tool calling requires a tool-capable model
 (`qwen3.8`, `qwen3.6`, `qwen3`, `qwen2.5-coder`, `devstral`).
 
+The default is Qwen3.8 27B dense in Ollama's Metal/MLX format. Generalist preserves
+the model server's reasoning and sampling defaults; it does not trade reasoning away
+for a better latency number. Non-reasoning benchmark runs are retained only as controls.
+The [local reasoning benchmark](benchmarks/local_reasoning/README.md) measures
+reasoning quality, completion, prefill, and decode speed for runtime and model-surgery work.
+
+The measured local profile uses a 32,768-token Ollama allocation. Set the Ollama
+app's context slider to 32k, or start a CLI-managed server with
+`OLLAMA_CONTEXT_LENGTH=32768 ollama serve`. This matters on high-memory Macs because
+Ollama may otherwise choose a much larger automatic allocation. Generalist compacts
+this model's conversation at 24k while keeping the newest 8k tokens.
+
+### Embedded Qwen3.8 on Apple Silicon
+
+`--embedded` bypasses the Ollama process and HTTP/JSON transport. It runs the
+dense `qwen3.8:27b-mlx` language model and its MTP head inside Generalist on a
+dedicated `QOS_CLASS_USER_INITIATED` inference thread. Reasoning remains enabled
+at the model template's `xhigh` setting. The current production path uses
+deterministic greedy target verification with an online MTP controller that
+chooses draft depths two through four from measured acceptance and wall time.
+It does not expose rejected research toggles or silently substitute a
+no-reasoning mode.
+
+The target verifier always evaluates the complete 248,320-row language head.
+The cheaper proposal head uses the first 65,536 ordinary token rows, Qwen's
+control-token rows, and up to 256 distinct high-ID rows drawn from the current
+prompt. If the generated stream sustains high-ID tokens missing from that
+adaptive head, proposals switch to the full vocabulary for the rest of the
+turn. Draft choices can change acceptance and scheduling, but every committed
+token is checked by the full target model. The promoted exact-scale wide-QMV
+kernel is mathematically equivalent to the independent-row oracle; its
+parallel reduction tree is not required to be bit-identical.
+
+The embedded provider keeps at most two exact target/MTP checkpoints: the
+conservative committed prompt boundary and, when parser-normalized assistant
+history matches the generated token stream, the longer completed-response
+boundary. Normal user turns, retries, and internal tool rounds restore the
+longest exact prefix and prefill only the new suffix. Compaction, steering
+rewrites, tool changes, or any other prefix mismatch automatically fall back
+to a full reset. `/usage` reports reused prompt tokens as cache reads.
+Prefill runs in 64-token native transactions and checks interruption between
+them, so Ctrl+C stops new GPU submission promptly instead of waiting for an
+entire long history. The model weights remain resident while the provider is
+alive, but an idle provider submits no Metal work and should not keep the
+machine hot. Active 27B inference is deliberately throughput-oriented and can
+saturate Metal enough to warm the machine; prefix reuse shortens that load,
+while Ctrl+C stops it after the current bounded native transaction.
+Cancellation and completed turns release their temporary decode state while
+retaining only the two bounded reusable branches; the model weights themselves
+stay resident to avoid a costly reload.
+
+On the checked M4 Pro comparison, the exact production-rendered xhigh-reasoning
+prompt measured 32.559 versus 30.014 warm decode tok/s for embedded and Ollama,
+and 32.229 versus 28.961 end-to-end tok/s. Embedded time to first content was
+70.558 ms versus 188.281 ms. These are three-replica paired medians under gated
+normal desktop load, not clean-room maximum-throughput numbers: each sample
+ran in a fresh process and passed CPU/GPU/memory gates, but telemetry was only
+captured before and after inference and thermal pressure was not available.
+The frozen protocol and raw observations live in
+`benchmarks/embedded_inference/results/embedded_vs_ollama.json`.
+Future captures additionally reject non-nominal macOS thermal state, any
+pre-sample background process above 50% of one CPU core, or less than 80% CPU
+idle over the complete child run; the original result keeps its original,
+weaker evidence label. A failed pre-sample gate aborts before either 27B model
+is loaded. GPU admission discards one priming AGX statistics read, then uses
+the maximum of three fresh samples spaced 250 ms apart; this avoids stale
+first-window false rejections while still rejecting intermittent GPU work.
+
+This is an opt-in, machine-built feature for Apple Silicon macOS. Install the
+model artifact and Metal compiler, then use the repository's complete build
+entrypoint:
+
+```bash
+ollama pull qwen3.8:27b-mlx
+xcodebuild -downloadComponent MetalToolchain  # once, if not already installed
+make embedded
+
+./target/release/generalist --embedded
+# Equivalent explicit spelling:
+./target/release/generalist --provider embedded --model qwen3.8:27b-mlx
+```
+
+To install the feature-enabled executable through Cargo instead of leaving it
+under `target/release`, use:
+
+```bash
+make install-embedded
+generalist --embedded
+```
+
+`make embedded` checks out the pinned MLX and MLX-C revisions, applies the six
+ordered Generalist patches, builds and verifies the static native stack, and
+passes its paths to Cargo. It reuses
+`$XDG_CACHE_HOME/generalist/embedded-mlx` when `XDG_CACHE_HOME` is set, otherwise
+`$HOME/Library/Caches/generalist/embedded-mlx`. Set
+`GENERALIST_MLX_WORK_ROOT` to choose another persistent location. The build
+requires `cargo`, `cmake`, `git`, and Xcode's `xcrun`.
+
+The resulting executable embeds the 167 MB `mlx.metallib` and statically links
+MLX/MLX-C; the roughly 18 GB model weights remain external and mmap-friendly.
+A source builder needs the cache only for later rebuilds. A user of a prebuilt
+binary never needs the native source or build paths.
+
+The default model lookup honors `OLLAMA_MODELS`, then uses
+`$HOME/.ollama/models`. A nonstandard pack can be selected by setting both
+`GENERALIST_EMBEDDED_MANIFEST` and `GENERALIST_EMBEDDED_BLOB_ROOT`; its config
+and tokenizer must still match the exact dense 27B engine contract. The Ollama
+daemon does not need to be running. `--local` remains the separate
+OpenAI-compatible/Ollama path.
+
+The Metal library is included in the executable, materialized to a verified
+digest-addressed temporary file at startup, and covered along with the static
+native dependencies by `generalist --licenses`. Full native build details,
+pins, promoted optimizations, and benchmark commands are in
+[`native/mlx/README.md`](native/mlx/README.md).
+
 Optional binaries: `z3` (constraint solver), `patch` (file editing; present on any Unix).
 
 Smoke tests, all live end-to-end: `cargo run --example smoke` (Anthropic),
-`smoke_openrouter` (Kimi K3), `smoke_ollama` (local tool loop), and
-`smoke_codemode` (local code-mode bridge).
+`smoke_openrouter` (Kimi K3), `smoke_ollama` (local tool loop),
+`smoke_codemode` (local code-mode bridge), and `smoke_embedded` (the in-process
+MLX agent path).
 
 ## Usage
 
@@ -363,8 +481,9 @@ Follows what pi, opencode, and Claude Code converged on:
   execution.
 - When context passes a threshold (default 150k tokens, configurable), older
   history is summarized in place and recent turns stay verbatim. `/compact`
-  triggers it manually. Local models with small context windows may want a much
-  lower `compaction_threshold_tokens`.
+  triggers it manually. The Qwen3.8 local runtime profile compacts at 24k and
+  keeps the most recent 8k tokens, leaving headroom under Ollama's active 32k
+  context allocation.
 
 ## Code mode
 
@@ -456,7 +575,7 @@ async fn main() -> generalist::Result<()> {
     let provider = OpenAiProvider::new(
         "unused".into(),
         "http://localhost:11434/v1".into(),
-        "qwen3.6:35b-a3b".into(),
+        "qwen3.8:27b-mlx".into(),
     )?;
 
     let mut registry = ToolRegistry::new();

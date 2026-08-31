@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-token42-embedding-layer0-rmsnorm",
+  "recorded_at": "2026-08-31T06:35:00Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "embedding_name": "model.language_model.embed_tokens.weight",
+    "embedding_sha256": "10986d0f406a9fc981e29dc2bf90157ff505ddc74bdb19aef52a40d283247db6",
+    "norm_name": "model.language_model.layers.0.input_layernorm.weight",
+    "norm_sha256": "ee8700267f26047c63e54902301adeca2d8c0a26784c0242190f689f7ed06114"
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399"
+  },
+  "operation": {
+    "token_id": 42,
+    "width": 5120,
+    "embedding_dtype": 12,
+    "normalized_dtype": 12,
+    "epsilon": "0.000001",
+    "shift_norm_weight_by_one": true,
+    "fingerprint": "fnv1a64-little-endian-f32"
+  },
+  "generalist": {
+    "embedding": {
+      "sum": "-1.508854345419",
+      "squared_sum": "1.059841324650",
+      "first": "-0.025512695",
+      "middle": "-0.021362305",
+      "last": "0.008728027",
+      "fingerprint": "622be28d25408cb0"
+    },
+    "normalized": {
+      "sum": "-97.883594393730",
+      "squared_sum": "5040.863182364837",
+      "first": "-1.851562500",
+      "middle": "-1.507812500",
+      "last": "0.542968750",
+      "fingerprint": "532fd92e242a53b7"
+    }
+  },
+  "ollama": {
+    "embedding": {
+      "sum": "-1.508854345419",
+      "squared_sum": "1.059841324650",
+      "first": "-0.025512695",
+      "middle": "-0.021362305",
+      "last": "0.008728027",
+      "fingerprint": "622be28d25408cb0"
+    },
+    "normalized": {
+      "sum": "-97.883594393730",
+      "squared_sum": "5040.863182364837",
+      "first": "-1.851562500",
+      "middle": "-1.507812500",
+      "last": "0.542968750",
+      "fingerprint": "532fd92e242a53b7"
+    }
+  },
+  "comparison": {
+    "exact": true,
+    "element_count": 5120,
+    "stages": ["embedding", "normalized"]
+  }
+}

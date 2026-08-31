@@ -1,3 +1,43 @@
+# Dense Qwen3.8 Metal/MLX selection — 2026-08-31
+
+This section is an artifact/backend selection control, not the target reasoning
+workload. It is retained because it established that the Metal/MLX artifact was
+worth carrying forward before the reasoning-on harness existed. Production
+evaluation is in [`../../local_reasoning/results/README.md`](../../local_reasoning/results/README.md).
+
+The complete ten-task `json_tool_implicit` runs compare Ollama's ordinary
+`qwen3.8:latest` GGUF artifact with the official `qwen3.8:27b-mlx` artifact.
+Both used the same transport, `temperature=0`, `seed=1`, an explicitly
+non-production `reasoning.effort=none` control, and a 1,200-token output limit.
+
+| Model | Exact-call passes | Median latency | Mean input tokens | Mean output tokens |
+|---|---:|---:|---:|---:|
+| `qwen3.8:latest` | 9/10 | 13,526.8 ms | 628.5 | 73.8 |
+| `qwen3.8:27b-mlx` | 9/10 | 7,466.9 ms | 625.9 | 79.3 |
+
+The MLX artifact reduced median end-to-end latency by 44.8% without changing
+the exact-call pass count in this small paired engineering comparison. The
+authoritative runs are `20260831T034935Z-...jsonl` and
+`20260831T040322Z-...jsonl`; both ended with `status=complete`.
+
+A production-shaped follow-up left reasoning effort unset, as Generalist now
+does. `20260831T052124Z-ollama-qwen3.8-27b-mlx.jsonl` passed the exact tool-call
+check in 10.521 s and the Ollama response contained a non-empty 218-character
+reasoning field. This confirms reasoning is active through the OpenAI-compatible
+transport; the native reasoning benchmark remains the source for token-level
+throughput measurements.
+
+Two diagnostics bound the reasoning/performance tradeoff. On four
+escaping-heavy tasks, `reasoning.effort=minimal` passed 4/4 but took 37,161.7
+ms median (`20260831T040507Z-...jsonl`). With reasoning omitted, the full
+corpus passed 8/10 at 17,358.4 ms median and produced 423.6 output tokens on
+average (`20260831T040813Z-...jsonl`). Explicitly disabling reasoning on that
+same unpinned sampling profile reduced the median to 7,131.5 ms and mean output
+to 78.9 tokens, with the same 8/10 pass count
+(`20260831T041217Z-...jsonl`). The non-reasoning runs are speed controls, not
+production candidates: Generalist keeps reasoning enabled. These are policy
+measurements for this agent corpus, not general reasoning-quality claims.
+
 # Local baseline — 2026-08-04
 
 These files are retained as append-only evidence from

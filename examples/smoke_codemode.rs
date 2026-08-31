@@ -3,7 +3,7 @@
 //! generated `tools` bridge, instead of issuing direct tool calls.
 //!
 //! Run with: `cargo run --example smoke_codemode [model]`
-//! Requires Ollama on localhost:11434 (default model: qwen3:30b).
+//! Requires Ollama on localhost:11434 (default model: qwen3.8:27b-mlx).
 
 use generalist::provider::OpenAiProvider;
 use generalist::tools::CalculatorTool;
@@ -14,14 +14,13 @@ use std::sync::Arc;
 async fn main() -> generalist::Result<()> {
     let model = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwen3:30b".to_string());
+        .unwrap_or_else(|| "qwen3.8:27b-mlx".to_string());
 
     let provider = OpenAiProvider::new(
         "ollama".into(),
         "http://localhost:11434/v1".into(),
         model.clone(),
     )?;
-
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(CalculatorTool))?;
 

@@ -1,0 +1,436 @@
+diff --git a/mlx/backend/metal/kernels/fp_quantized.h b/mlx/backend/metal/kernels/fp_quantized.h
+index 6e77569f..9a9c2f81 100644
+--- a/mlx/backend/metal/kernels/fp_quantized.h
++++ b/mlx/backend/metal/kernels/fp_quantized.h
+@@ -321,12 +321,31 @@ METAL_FUNC void fp_qmv_quad_impl(
+   }
+ }
+ 
++template <typename T, bool has_global_scale, bool exact_global_scale>
++METAL_FUNC T fp_qmv_scaled_output(
++    float value,
++    const device float* global_scale,
++    int global_scale_size,
++    int output_row,
++    float inv_scale_enc) {
++  if constexpr (exact_global_scale) {
++    T rounded = static_cast<T>(value);
++    const int scale_index = global_scale_size == 1 ? 0 : output_row;
++    return static_cast<T>(static_cast<float>(rounded) * global_scale[scale_index]);
++  } else if constexpr (has_global_scale) {
++    return static_cast<T>(value * inv_scale_enc);
++  } else {
++    return static_cast<T>(value);
++  }
++}
++
+ template <
+     typename T,
+     int group_size,
+     int bits,
+     bool has_global_scale = false,
+-    int results_per_simdgroup = 4>
++    int results_per_simdgroup = 4,
++    bool exact_global_scale = false>
+ METAL_FUNC void fp_qmv_fast_impl(
+     const device uint32_t* w,
+     const device uint8_t* scales,
+@@ -335,6 +354,7 @@ METAL_FUNC void fp_qmv_fast_impl(
+     device T* y,
+     const constant int& in_vec_size,
+     const constant int& out_vec_size,
++    int global_scale_size,
+     uint3 tid [[threadgroup_position_in_grid]],
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+     uint simd_lid [[thread_index_in_simdgroup]]) {
+@@ -380,23 +400,32 @@ METAL_FUNC void fp_qmv_fast_impl(
+   }
+ 
+   float inv_scale_enc = 1.0f;
+-  if constexpr (has_global_scale) {
++  if constexpr (has_global_scale && !exact_global_scale) {
+     inv_scale_enc = *global_scale / (F8E4M3_MAX * F4E2M1_MAX);
+   }
+ 
+   for (int row = 0; row < results_per_simdgroup; row++) {
+     result[row] = simd_sum(result[row]);
+     if (simd_lid == 0) {
+-      if constexpr (has_global_scale) {
+-        y[row] = static_cast<T>(result[row] * inv_scale_enc);
+-      } else {
+-        y[row] = static_cast<T>(result[row]);
+-      }
++      y[row] = fp_qmv_scaled_output<
++          T,
++          has_global_scale,
++          exact_global_scale>(
++          result[row],
++          global_scale,
++          global_scale_size,
++          out_row + row,
++          inv_scale_enc);
+     }
+   }
+ }
+ 
+-template <typename T, int group_size, int bits, bool has_global_scale = false>
++template <
++    typename T,
++    int group_size,
++    int bits,
++    bool has_global_scale = false,
++    bool exact_global_scale = false>
+ METAL_FUNC void fp_qmv_impl(
+     const device uint32_t* w,
+     const device uint8_t* scales,
+@@ -405,6 +434,7 @@ METAL_FUNC void fp_qmv_impl(
+     device T* y,
+     const constant int& in_vec_size,
+     const constant int& out_vec_size,
++    int global_scale_size,
+     uint3 tid [[threadgroup_position_in_grid]],
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+     uint simd_lid [[thread_index_in_simdgroup]]) {
+@@ -437,7 +467,7 @@ METAL_FUNC void fp_qmv_impl(
+   }
+ 
+   float inv_scale_enc = 1.0f;
+-  if constexpr (has_global_scale) {
++  if constexpr (has_global_scale && !exact_global_scale) {
+     inv_scale_enc = *global_scale / (F8E4M3_MAX * F4E2M1_MAX);
+   }
+ 
+@@ -491,11 +521,15 @@ METAL_FUNC void fp_qmv_impl(
+          row++) {
+       result[row] = simd_sum(result[row]);
+       if (simd_lid == 0) {
+-        if constexpr (has_global_scale) {
+-          y[row] = static_cast<T>(result[row] * inv_scale_enc);
+-        } else {
+-          y[row] = static_cast<T>(result[row]);
+-        }
++        y[row] = fp_qmv_scaled_output<
++            T,
++            has_global_scale,
++            exact_global_scale>(
++            result[row],
++            global_scale,
++            global_scale_size,
++            out_row + row,
++            inv_scale_enc);
+       }
+     }
+   }
+@@ -543,11 +577,15 @@ METAL_FUNC void fp_qmv_impl(
+     for (int row = 0; row < results_per_simdgroup; row++) {
+       result[row] = simd_sum(result[row]);
+       if (simd_lid == 0) {
+-        if constexpr (has_global_scale) {
+-          y[row] = static_cast<T>(result[row] * inv_scale_enc);
+-        } else {
+-          y[row] = static_cast<T>(result[row]);
+-        }
++        y[row] = fp_qmv_scaled_output<
++            T,
++            has_global_scale,
++            exact_global_scale>(
++            result[row],
++            global_scale,
++            global_scale_size,
++            used_out_row + row,
++            inv_scale_enc);
+       }
+     }
+   }
+@@ -1172,7 +1210,8 @@ template <
+     int bits,
+     bool batched,
+     bool has_global_scale = false,
+-    int results_per_simdgroup = 4>
++    int results_per_simdgroup = 4,
++    bool exact_global_scale = false>
+ [[kernel]] void fp_qmv_fast(
+     const device uint32_t* w,
+     const device uint8_t* scales,
+@@ -1181,6 +1220,7 @@ template <
+     device T* y,
+     const constant int& in_vec_size,
+     const constant int& out_vec_size,
++    const constant int& global_scale_size,
+     const constant int& x_batch_ndims,
+     const constant int* x_shape,
+     const constant int64_t* x_strides,
+@@ -1213,7 +1253,8 @@ template <
+       group_size,
+       bits,
+       has_global_scale,
+-      results_per_simdgroup>(
++      results_per_simdgroup,
++      exact_global_scale>(
+       w,
+       scales,
+       global_scale,
+@@ -1221,6 +1262,7 @@ template <
+       y,
+       in_vec_size,
+       out_vec_size,
++      global_scale_size,
+       tid,
+       simd_gid,
+       simd_lid);
+@@ -1231,7 +1273,9 @@ template <
+     int group_size,
+     int bits,
+     bool batched,
+-    bool has_global_scale = false>
++    bool has_global_scale = false,
++    int results_per_simdgroup = 4,
++    bool exact_global_scale = false>
+ [[kernel]] void fp_qmv(
+     const device uint32_t* w,
+     const device uint8_t* scales,
+@@ -1240,6 +1284,7 @@ template <
+     device T* y,
+     const constant int& in_vec_size,
+     const constant int& out_vec_size,
++    const constant int& global_scale_size,
+     const constant int& x_batch_ndims,
+     const constant int* x_shape,
+     const constant int64_t* x_strides,
+@@ -1267,7 +1312,7 @@ template <
+         s_strides,
+         tid);
+   }
+-  fp_qmv_impl<T, group_size, bits, has_global_scale>(
++  fp_qmv_impl<T, group_size, bits, has_global_scale, exact_global_scale>(
+       w,
+       scales,
+       global_scale,
+@@ -1275,6 +1320,7 @@ template <
+       y,
+       in_vec_size,
+       out_vec_size,
++      global_scale_size,
+       tid,
+       simd_gid,
+       simd_lid);
+@@ -1602,6 +1648,7 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
+       y,
+       in_vec_size,
+       out_vec_size,
++      1,
+       tid,
+       simd_gid,
+       simd_lid);
+@@ -1661,6 +1708,7 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
+       y,
+       in_vec_size,
+       out_vec_size,
++      1,
+       tid,
+       simd_gid,
+       simd_lid);
+diff --git a/mlx/backend/metal/kernels/fp_quantized.metal b/mlx/backend/metal/kernels/fp_quantized.metal
+index d8d46228..23633b02 100644
+--- a/mlx/backend/metal/kernels/fp_quantized.metal
++++ b/mlx/backend/metal/kernels/fp_quantized.metal
+@@ -81,6 +81,30 @@
+   instantiate_quantized_qmv_fast(mode, type, 2, 1, group_size, bits) \
+   instantiate_quantized_qmv_fast(mode, type, 2, 0, group_size, bits)
+ 
++#define instantiate_quantized_qmv_exact(mode, name, type, batched, group_size, bits) \
++  instantiate_kernel( \
++      #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_hgs_exact", \
++      fp_ ## name, \
++      type, \
++      group_size, \
++      bits, \
++      batched, \
++      true, \
++      4, \
++      true)
++
++#define instantiate_quantized_qmv_fast_r2_exact(mode, type, batched, group_size, bits) \
++  instantiate_kernel( \
++      #mode "_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_2_batch_" #batched "_hgs_exact", \
++      fp_qmv_fast, \
++      type, \
++      group_size, \
++      bits, \
++      batched, \
++      true, \
++      2, \
++      true)
++
+ #define instantiate_quantized_quad(mode, name, type, D, batched, group_size, bits) \
+   instantiate_kernel( \
+       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_d_" #D "_batch_" #batched, \
+@@ -221,4 +245,10 @@
+ instantiate_quantized_types(float)
+ instantiate_quantized_types(bfloat16_t)
+ instantiate_quantized_types(float16_t)
++instantiate_quantized_qmv_exact(nvfp4, qmv_fast, bfloat16_t, 0, 16, 4)
++instantiate_quantized_qmv_exact(nvfp4, qmv_fast, bfloat16_t, 1, 16, 4)
++instantiate_quantized_qmv_exact(nvfp4, qmv, bfloat16_t, 0, 16, 4)
++instantiate_quantized_qmv_exact(nvfp4, qmv, bfloat16_t, 1, 16, 4)
++instantiate_quantized_qmv_fast_r2_exact(nvfp4, bfloat16_t, 0, 16, 4)
++instantiate_quantized_qmv_fast_r2_exact(nvfp4, bfloat16_t, 1, 16, 4)
+     // clang-format on
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index f463be56..a7b58094 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -472,7 +472,8 @@ void qmv(
+     int K,
+     metal::Device& d,
+     const Stream& s,
+-    const std::string& mode) {
++    const std::string& mode,
++    bool exact_global_scale) {
+   int B = out.size() / M / N;
+ 
+   int bn = 8;
+@@ -501,7 +502,7 @@ void qmv(
+       bits,
+       use_narrow_qmv ? "_r_2" : "",
+       B > 1 ? "_batch_1" : "_batch_0",
+-      global_scale ? "_hgs" : "");
++      global_scale ? (exact_global_scale ? "_hgs_exact" : "_hgs") : "");
+   auto kernel = get_quantized_kernel_wrapped(
+       d,
+       kname,
+@@ -512,7 +513,8 @@ void qmv(
+       bits,
+       B > 1,
+       global_scale.has_value(),
+-      results_per_simdgroup);
++      results_per_simdgroup,
++      exact_global_scale);
+ 
+   auto& compute_encoder = metal::get_command_encoder(s);
+   compute_encoder.set_compute_pipeline_state(kernel);
+@@ -529,6 +531,9 @@ void qmv(
+   compute_encoder.set_output_array(out, c++);
+   compute_encoder.set_bytes(K, c++);
+   compute_encoder.set_bytes(N, c++);
++  const int global_scale_size =
++      global_scale ? static_cast<int>(global_scale->size()) : 0;
++  compute_encoder.set_bytes(global_scale_size, c++);
+   add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
+ 
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+@@ -1749,7 +1754,8 @@ void dispatch_qmv(
+     int K,
+     metal::Device& d,
+     const Stream& s,
+-    const std::string& mode) {
++    const std::string& mode,
++    bool exact_global_scale = false) {
+   // It is a qmv with a small inner dimension so route to qmv_quad kernel
+   if ((K == 128 || K == 64) && is_power_of_2(bits) && !global_scale) {
+     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+@@ -1775,7 +1781,8 @@ void dispatch_qmv(
+       K,
+       d,
+       s,
+-      mode);
++      mode,
++      exact_global_scale);
+ }
+ 
+ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -1793,9 +1800,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   std::optional<array> global_scale = std::nullopt;
+   if (has_global_scale_) {
+     if (mode_ != QuantizationMode::Nvfp4 || inputs.size() != 4 ||
+-        inputs[3].dtype() != float32 || inputs[3].size() != 1) {
++        inputs[3].dtype() != float32) {
+       throw std::invalid_argument(
+-          "[quantized_matmul] fused decode requires one encoded F32 NVFP4 global scale.");
++          "[quantized_matmul] fused decode requires an F32 NVFP4 global scale.");
+     }
+     global_scale = inputs[3];
+   } else if (inputs.size() == 4) {
+@@ -1808,6 +1815,18 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   int M = non_batched ? x.size() / K : x.shape(-2);
+   int N = out.shape(-1);
+ 
++  if (global_scale &&
++      (exact_global_scale_
++           ? (global_scale->size() != 1 && global_scale->size() != N)
++           : global_scale->size() != 1)) {
++    throw std::invalid_argument(
++        "[quantized_matmul] exact fused decode requires one global scale or one per output row.");
++  }
++  if (exact_global_scale_ && !has_global_scale_) {
++    throw std::invalid_argument(
++        "[quantized_matmul] exact global scale requires fused global-scale input.");
++  }
++
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+   auto mode = quantization_mode_to_string(mode_);
+   // It is a matrix matrix product.
+@@ -1856,7 +1875,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+         K,
+         d,
+         s,
+-        mode);
++        mode,
++        exact_global_scale_);
+     return;
+   }
+ 
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+index 4bf79f57..ef102743 100644
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -3616,7 +3616,8 @@ bool QuantizedMatmul::is_equivalent(const Primitive& other) const {
+   const QuantizedMatmul& qm_other = static_cast<const QuantizedMatmul&>(other);
+   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
+       mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_ &&
+-      has_global_scale_ == qm_other.has_global_scale_;
++      has_global_scale_ == qm_other.has_global_scale_ &&
++      exact_global_scale_ == qm_other.exact_global_scale_;
+ }
+ 
+ std::vector<Shape> QuantizedMatmul::output_shapes(
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+index 8450593a..e06994b2 100644
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1621,13 +1621,15 @@ class QuantizedMatmul : public UnaryPrimitive {
+       int bits,
+       QuantizationMode mode,
+       bool transpose,
+-      bool has_global_scale = false)
++      bool has_global_scale = false,
++      bool exact_global_scale = false)
+       : UnaryPrimitive(stream),
+         group_size_(group_size),
+         bits_(bits),
+         mode_(mode),
+         transpose_(transpose),
+-        has_global_scale_(has_global_scale) {}
++        has_global_scale_(has_global_scale),
++        exact_global_scale_(exact_global_scale) {}
+ 
+   void eval_cpu(const std::vector<array>& inputs, array& out) override;
+   void eval_gpu(const std::vector<array>& inputs, array& out) override;
+@@ -1639,7 +1641,8 @@ class QuantizedMatmul : public UnaryPrimitive {
+   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+   auto state() const {
+     return std::make_tuple(
+-        group_size_, bits_, mode_, transpose_, has_global_scale_);
++        group_size_, bits_, mode_, transpose_, has_global_scale_,
++        exact_global_scale_);
+   }
+ 
+  private:
+@@ -1648,6 +1651,7 @@ class QuantizedMatmul : public UnaryPrimitive {
+   QuantizationMode mode_;
+   bool transpose_;
+   bool has_global_scale_;
++  bool exact_global_scale_;
+ };
+ 
+ class QQMatmul : public UnaryPrimitive {

@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-token42-full-decode-zero-state",
+  "recorded_at": "2026-08-31T07:24:57Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "embedding_name": "model.language_model.embed_tokens.weight",
+    "final_norm_name": "model.language_model.norm.weight",
+    "lm_head_name": "lm_head.weight",
+    "language_blob_count": 851,
+    "loaded_array_count": 1653
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399"
+  },
+  "operation": {
+    "token_id": 42,
+    "output_token_id": 1219,
+    "layer_count": 64,
+    "linear_attention_layer_count": 48,
+    "full_attention_layer_count": 16,
+    "hidden_width": 5120,
+    "vocabulary_width": 248320,
+    "hidden_dtype": 12,
+    "logits_dtype": 12,
+    "initial_conv_state": "zero",
+    "initial_delta_state": "zero",
+    "initial_kv_cache": "empty",
+    "full_attention_first_token_specialization": "one-key-softmax-is-one",
+    "fingerprint": "fnv1a64-little-endian-f32"
+  },
+  "generalist": {
+    "output_token_id": 1219,
+    "hidden": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "82.351737976074",
+      "squared_sum": "18375.334290960629",
+      "first": "-0.523437500",
+      "middle": "-8.937500000",
+      "last": "-0.179687500",
+      "fingerprint": "6dfc18bc2b1c2044"
+    },
+    "logits": {
+      "dtype": 12,
+      "elements": 248320,
+      "sum": "-114099.678878903389",
+      "squared_sum": "753699.560238623875",
+      "first": "4.593750000",
+      "middle": "-1.382812500",
+      "last": "0.443359375",
+      "fingerprint": "4efefa793523b51f"
+    }
+  },
+  "ollama": {
+    "output_token_id": 1219,
+    "hidden": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "82.351737976074",
+      "squared_sum": "18375.334290960629",
+      "first": "-0.523437500",
+      "middle": "-8.937500000",
+      "last": "-0.179687500",
+      "fingerprint": "6dfc18bc2b1c2044"
+    },
+    "logits": {
+      "dtype": 12,
+      "elements": 248320,
+      "sum": "-114099.678878903389",
+      "squared_sum": "753699.560238623875",
+      "first": "4.593750000",
+      "middle": "-1.382812500",
+      "last": "0.443359375",
+      "fingerprint": "4efefa793523b51f"
+    }
+  },
+  "comparison": {
+    "exact": true,
+    "output_token_exact": true,
+    "stages": [
+      "hidden",
+      "logits"
+    ]
+  },
+  "performance_observation": {
+    "scope": "single-token-zero-state-native-probe",
+    "native_shim_optimization": "O3",
+    "model_load_milliseconds": "104.471",
+    "cold_decode_milliseconds": "4982.163",
+    "warm_decode_milliseconds": "2805.827",
+    "warning": "first-token latency only; not steady-state cached decode throughput"
+  },
+  "optimization_target": {
+    "baseline": "persistent exact 64-layer graph with custom causal-conv and gated-delta Metal kernels",
+    "candidates": [
+      "evaluate at layer boundaries to control graph compilation and retention",
+      "prepack every MLP gate and up projection into one NVFP4 launch",
+      "retain recurrent and KV caches for steady-state token decoding",
+      "fuse exact post-qmm global scaling only after numerical and reasoning gates"
+    ]
+  }
+}

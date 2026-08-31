@@ -1,0 +1,139 @@
+diff --git a/mlx/backend/cpu/quantized.cpp b/mlx/backend/cpu/quantized.cpp
+--- a/mlx/backend/cpu/quantized.cpp
++++ b/mlx/backend/cpu/quantized.cpp
+@@ -922,6 +922,10 @@ void fp_bs_qmm_dispatch(
+ } // namespace
+ 
+ void QuantizedMatmul::eval_cpu(const std::vector<array>& inputs, array& out) {
++  if (has_global_scale_) {
++    throw std::runtime_error(
++        "[quantized_matmul] fused global-scale decode requires Metal.");
++  }
+   auto& x_pre = inputs[0];
+   auto& w_pre = inputs[1];
+   auto& scales_pre = inputs[2];
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1790,7 +1790,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   array w = ensure_row_contiguous_matrix(inputs[1], d, s);
+   array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
+   std::optional<array> biases = std::nullopt;
+-  if (inputs.size() == 4) {
++  std::optional<array> global_scale = std::nullopt;
++  if (has_global_scale_) {
++    if (mode_ != QuantizationMode::Nvfp4 || inputs.size() != 4 ||
++        inputs[3].dtype() != float32 || inputs[3].size() != 1) {
++      throw std::invalid_argument(
++          "[quantized_matmul] fused decode requires one encoded F32 NVFP4 global scale.");
++    }
++    global_scale = inputs[3];
++  } else if (inputs.size() == 4) {
+     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
+   }
+ 
+@@ -1804,6 +1812,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+   auto mode = quantization_mode_to_string(mode_);
+   // It is a matrix matrix product.
+   if (M >= vector_limit) {
++    if (global_scale) {
++      throw std::invalid_argument(
++          "[quantized_matmul] fused global scale is restricted to decode-shaped matvecs.");
++    }
+     // Use split-K qmm for small M with transposed weights (non-batched only)
+     int B = out.size() / M / N;
+     if (transpose_ && B == 1) {
+@@ -1835,7 +1847,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+         w,
+         scales,
+         biases,
+-        std::nullopt,
++        global_scale,
+         out,
+         group_size_,
+         bits_,
+@@ -1848,6 +1860,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+     return;
+   }
+ 
++  if (global_scale) {
++    throw std::invalid_argument(
++        "[quantized_matmul] fused global scale requires transposed weights.");
++  }
++
+   // Run of the mill qvm
+   if (K < 1024) {
+     qvm(x,
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -3520,6 +3520,10 @@ std::vector<array> QuantizedMatmul::vjp(
+     const std::vector<array>& cotangents,
+     const std::vector<int>& argnums,
+     const std::vector<array>&) {
++  if (has_global_scale_) {
++    throw std::runtime_error(
++        "[QuantizedMatmul::vjp] fused global-scale decode is inference-only.");
++  }
+   std::vector<array> vjps;
+ 
+   // We rely on the fact that w is always 2D so transpose is simple
+@@ -3587,6 +3591,10 @@ std::vector<array> QuantizedMatmul::jvp(
+     const std::vector<array>& primals,
+     const std::vector<array>& tangents,
+     const std::vector<int>& argnums) {
++  if (has_global_scale_) {
++    throw std::runtime_error(
++        "[QuantizedMatmul::jvp] fused global-scale decode is inference-only.");
++  }
+   if (argnums.size() > 1 || argnums[0] != 0) {
+     throw std::runtime_error(
+         "[QuantizedMatmul::jvp] No JVP wrt the quantized matrix yet.");
+@@ -3607,7 +3615,8 @@ std::vector<array> QuantizedMatmul::jvp(
+ bool QuantizedMatmul::is_equivalent(const Primitive& other) const {
+   const QuantizedMatmul& qm_other = static_cast<const QuantizedMatmul&>(other);
+   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
+-      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_;
++      mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_ &&
++      has_global_scale_ == qm_other.has_global_scale_;
+ }
+ 
+ std::vector<Shape> QuantizedMatmul::output_shapes(
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1620,12 +1620,14 @@ class QuantizedMatmul : public UnaryPrimitive {
+       int group_size,
+       int bits,
+       QuantizationMode mode,
+-      bool transpose)
++      bool transpose,
++      bool has_global_scale = false)
+       : UnaryPrimitive(stream),
+         group_size_(group_size),
+         bits_(bits),
+         mode_(mode),
+-        transpose_(transpose) {}
++        transpose_(transpose),
++        has_global_scale_(has_global_scale) {}
+ 
+   void eval_cpu(const std::vector<array>& inputs, array& out) override;
+   void eval_gpu(const std::vector<array>& inputs, array& out) override;
+@@ -1636,7 +1638,8 @@ class QuantizedMatmul : public UnaryPrimitive {
+   bool is_equivalent(const Primitive& other) const override;
+   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+   auto state() const {
+-    return std::make_tuple(group_size_, bits_, mode_, transpose_);
++    return std::make_tuple(
++        group_size_, bits_, mode_, transpose_, has_global_scale_);
+   }
+ 
+  private:
+@@ -1644,6 +1647,7 @@ class QuantizedMatmul : public UnaryPrimitive {
+   int bits_;
+   QuantizationMode mode_;
+   bool transpose_;
++  bool has_global_scale_;
+ };
+ 
+ class QQMatmul : public UnaryPrimitive {

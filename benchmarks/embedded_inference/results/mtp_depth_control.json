@@ -1,0 +1,328 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-ollama-mtp-depth-control",
+  "recorded_at": "2026-08-31",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "dense": true,
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "mtp_tensor_count": 15,
+    "mtp_storage_bytes": 238934656
+  },
+  "hardware": {
+    "model": "MacBook Pro Mac16,8",
+    "chip": "Apple M4 Pro",
+    "cpu_cores": 14,
+    "performance_cores": 10,
+    "efficiency_cores": 4,
+    "unified_memory_gib": 48,
+    "macos": "26.5.2 (25F84)"
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399",
+    "fixed_depth_runner_sha256": "c036eea14ab1aed5a5d5bb045c7157faed6a1b4a125c354e5da2a523e8b13e6e",
+    "libmlxc_sha256": "81f81e589207516921d7d2afc237b8e0bca7d6e6cd65c2855047bcff58b45919",
+    "metallib_sha256": "a75f17b35986bab6b7e47f0c83db95708c81e9c9506cee2e5e93b69950952be8",
+    "instrumentation": "OLLAMA_MLX_FIXED_DRAFT_DEPTH changes only the depth controller selection; negative or absent preserves the production adaptive policy"
+  },
+  "protocol": {
+    "endpoint": "POST /v1/completions on a dedicated local mlx-engine runner",
+    "prompt_sha256": "b8a7e124d1e98f98491bae795a9c82bb6b510a1ea1febeed5e44c344ea96a9f9",
+    "prompt_tokens": 36,
+    "generated_tokens": 192,
+    "temperature": 0,
+    "seed": 42,
+    "replicas_per_mode": 3,
+    "fixed_mode_warmup_tokens": 64,
+    "adaptive_mode_warmup_tokens": 192,
+    "mode_order": [
+      "fixed0",
+      "fixed1",
+      "fixed2",
+      "fixed3",
+      "adaptive"
+    ],
+    "output_sha256": "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286",
+    "semantic_contract": "concatenated streamed Content bytes must match at every depth",
+    "timing_source": "runner-reported EvalDuration",
+    "timing_status": "accepted",
+    "machine_state": "no GHC, Cabal, Ollama model runner, or other known build workload active before launch"
+  },
+  "measurement_columns": [
+    "eval_count",
+    "eval_duration_ns",
+    "tokens_per_second",
+    "prompt_eval_duration_ns",
+    "iterations",
+    "drafted",
+    "accepted",
+    "acceptance",
+    "avg_draft",
+    "max_draft",
+    "avg_accepted",
+    "output_sha256"
+  ],
+  "modes": [
+    {
+      "name": "fixed0",
+      "fixed_depth": 0,
+      "median_tokens_per_second": "14.843114608939961",
+      "median_speedup_over_fixed0": "1.0",
+      "runs": [
+        [
+          192,
+          12683711709,
+          "15.13752475655547",
+          295491250,
+          192,
+          0,
+          0,
+          "0.00",
+          "0.00",
+          0,
+          "0.00",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          12935290541,
+          "14.843114608939961",
+          11541,
+          192,
+          0,
+          0,
+          "0.00",
+          "0.00",
+          0,
+          "0.00",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          12955193875,
+          "14.820310823021163",
+          9625,
+          192,
+          0,
+          0,
+          "0.00",
+          "0.00",
+          0,
+          "0.00",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ]
+      ]
+    },
+    {
+      "name": "fixed1",
+      "fixed_depth": 1,
+      "median_tokens_per_second": "23.41360932409539",
+      "median_speedup_over_fixed0": "1.57741",
+      "runs": [
+        [
+          192,
+          7901340459,
+          "24.299674339599292",
+          297191083,
+          107,
+          106,
+          85,
+          "0.80",
+          "0.99",
+          1,
+          "0.79",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          8234017042,
+          "23.317901702249113",
+          9542,
+          108,
+          105,
+          84,
+          "0.80",
+          "0.97",
+          1,
+          "0.78",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          8200358917,
+          "23.41360932409539",
+          10541,
+          108,
+          105,
+          84,
+          "0.80",
+          "0.97",
+          1,
+          "0.78",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ]
+      ]
+    },
+    {
+      "name": "fixed2",
+      "fixed_depth": 2,
+      "median_tokens_per_second": "26.646314463339206",
+      "median_speedup_over_fixed0": "1.79520",
+      "runs": [
+        [
+          192,
+          6909420375,
+          "27.788148582579186",
+          251736750,
+          85,
+          167,
+          107,
+          "0.64",
+          "1.96",
+          2,
+          "1.26",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          7225372083,
+          "26.57302596938107",
+          21417,
+          86,
+          165,
+          106,
+          "0.64",
+          "1.92",
+          2,
+          "1.23",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          7205499292,
+          "26.646314463339206",
+          10333,
+          86,
+          165,
+          106,
+          "0.64",
+          "1.92",
+          2,
+          "1.23",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ]
+      ]
+    },
+    {
+      "name": "fixed3",
+      "fixed_depth": 3,
+      "median_tokens_per_second": "26.164155889992667",
+      "median_speedup_over_fixed0": "1.76271",
+      "runs": [
+        [
+          192,
+          7052627542,
+          "27.223896180054364",
+          239470833,
+          74,
+          217,
+          118,
+          "0.54",
+          "2.93",
+          3,
+          "1.59",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          7345351917,
+          "26.13897906724351",
+          17166,
+          75,
+          214,
+          117,
+          "0.55",
+          "2.85",
+          3,
+          "1.56",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          7338283750,
+          "26.164155889992667",
+          20250,
+          75,
+          214,
+          117,
+          "0.55",
+          "2.85",
+          3,
+          "1.56",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ]
+      ]
+    },
+    {
+      "name": "adaptive",
+      "fixed_depth": null,
+      "median_tokens_per_second": "26.554391993931695",
+      "median_speedup_over_fixed0": "1.78900",
+      "runs": [
+        [
+          192,
+          6886505833,
+          "27.880612411586117",
+          274451875,
+          84,
+          168,
+          108,
+          "0.64",
+          "2.00",
+          3,
+          "1.29",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          7232799791,
+          "26.545736858209686",
+          11042,
+          86,
+          166,
+          106,
+          "0.64",
+          "1.93",
+          3,
+          "1.23",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ],
+        [
+          192,
+          7230442333,
+          "26.554391993931695",
+          9917,
+          86,
+          166,
+          106,
+          "0.64",
+          "1.93",
+          3,
+          "1.23",
+          "9961e80513ff919f8d729bc881a596aa722bafc33f554883073e30882bfa1286"
+        ]
+      ]
+    }
+  ],
+  "conclusion": {
+    "base_decode_parity": true,
+    "generalist_prior_tokens_per_second": "14.650",
+    "ollama_fixed0_median_tokens_per_second": "14.843114608939961",
+    "priority": "implement MTP drafting plus fused multi-token target verification in Generalist",
+    "reason": "Ollama's non-speculative path is within 1.3 percent of Generalist's prior production measurement, while exact MTP raises the same runner's median by 79.5 percent at fixed depth two; fixed depth three loses to depth two as acceptance falls."
+  }
+}

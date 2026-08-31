@@ -1,0 +1,111 @@
+diff --git a/x/mlxrunner/speculate_depth.go b/x/mlxrunner/speculate_depth.go
+index b4a5558..ca03906 100644
+--- a/x/mlxrunner/speculate_depth.go
++++ b/x/mlxrunner/speculate_depth.go
+@@ -2,7 +2,10 @@ package mlxrunner
+ 
+ import (
+ 	"fmt"
++	"log/slog"
++	"os"
+ 	"slices"
++	"strconv"
+ 	"strings"
+ 	"time"
+ )
+@@ -33,6 +36,10 @@ type depthController struct {
+ 	acc    *acceptanceModel
+ 	probed bool // the previous round drafted a probe
+ 
++	// fixed is an experimental override for benchmarking the actual cost curve.
++	// A negative value preserves the adaptive production controller.
++	fixed int
++
+ 	// drafterLimit is the deepest draft this model's drafter can produce, 0 when
+ 	// nothing bounds it. A depth the drafter never produces is never measured,
+ 	// and an unmeasured depth would always look best, pinning the search there.
+@@ -50,7 +57,23 @@ type depthController struct {
+ }
+ 
+ func newDepthController() *depthController {
+-	return &depthController{cost: newCostModel(), acc: newAcceptanceModel(), probeInterval: depthProbeInterval}
++	c := &depthController{
++		cost:          newCostModel(),
++		acc:           newAcceptanceModel(),
++		fixed:         -1,
++		probeInterval: depthProbeInterval,
++	}
++	if raw := os.Getenv("OLLAMA_MLX_FIXED_DRAFT_DEPTH"); raw != "" {
++		depth, err := strconv.Atoi(raw)
++		if err != nil || depth < 0 {
++			slog.Warn("ignoring invalid fixed speculative draft depth", "value", raw)
++		} else {
++			c.fixed = depth
++			c.scheduled = depth
++			slog.Info("using fixed speculative draft depth", "depth", depth)
++		}
++	}
++	return c
+ }
+ 
+ func (c *depthController) frontier() int { return c.acc.frontier() }
+@@ -72,6 +95,14 @@ func (c *depthController) limit() int {
+ // change, giving the new selection a full interval to settle. The chosen depth is
+ // recorded in c.scheduled for the next request's open to consume.
+ func (c *depthController) next() (depth int) {
++	if c.fixed >= 0 {
++		depth = c.fixed
++		if c.drafterLimit > 0 {
++			depth = min(depth, c.drafterLimit)
++		}
++		c.scheduled = depth
++		return depth
++	}
+ 	defer func() { c.scheduled = depth }()
+ 	sel := c.selected()
+ 	if sel != c.lastSelected {
+diff --git a/x/mlxrunner/speculate_depth_test.go b/x/mlxrunner/speculate_depth_test.go
+index 36a6f0e..7ec2f5f 100644
+--- a/x/mlxrunner/speculate_depth_test.go
++++ b/x/mlxrunner/speculate_depth_test.go
+@@ -134,6 +134,40 @@ func TestDepthControllerExploresBeforeCostReady(t *testing.T) {
+ 	}
+ }
+ 
++func TestDepthControllerFixedDepthOverride(t *testing.T) {
++	t.Setenv("OLLAMA_MLX_FIXED_DRAFT_DEPTH", "5")
++	c := newDepthController()
++	if c.scheduled != 5 {
++		t.Fatalf("initial scheduled depth = %d, want 5", c.scheduled)
++	}
++	for range 20 {
++		if got := c.next(); got != 5 {
++			t.Fatalf("fixed next depth = %d, want 5", got)
++		}
++		c.cost.observe(5, 10*time.Millisecond)
++		c.acc.observe(5, 0)
++	}
++	if got := c.next(); got != 5 {
++		t.Fatalf("acceptance data changed fixed depth to %d, want 5", got)
++	}
++
++	c.drafterLimit = 3
++	if got := c.next(); got != 3 {
++		t.Fatalf("fixed depth ignored drafter limit: got %d, want 3", got)
++	}
++}
++
++func TestDepthControllerInvalidFixedDepthFallsBackToAdaptive(t *testing.T) {
++	t.Setenv("OLLAMA_MLX_FIXED_DRAFT_DEPTH", "not-a-depth")
++	c := newDepthController()
++	if c.fixed != -1 {
++		t.Fatalf("invalid override selected fixed depth %d", c.fixed)
++	}
++	if got := c.next(); got != 0 {
++		t.Fatalf("adaptive warmup started at depth %d, want 0", got)
++	}
++}
++
+ func TestDepthControllerClimbsOutwardWithinFrontier(t *testing.T) {
+ 	// The bug this guards: on a near-flat-cost forward the inherited optimistic
+ 	// acceptance (1 for unmeasured positions) makes deep depths look best, so an

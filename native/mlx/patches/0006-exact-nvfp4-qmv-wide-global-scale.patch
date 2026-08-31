@@ -1,0 +1,272 @@
+diff --git a/mlx/backend/metal/kernels/fp_quantized.h b/mlx/backend/metal/kernels/fp_quantized.h
+index 9a9c2f81..ed4b512f 100644
+--- a/mlx/backend/metal/kernels/fp_quantized.h
++++ b/mlx/backend/metal/kernels/fp_quantized.h
+@@ -595,15 +595,23 @@ METAL_FUNC void fp_qmv_impl(
+ // [2, vector_limit) band between qmv (M==1) and qmm. Each thread owns one
+ // output row that k_lanes lanes reduce over K; the vecs_per_tg vectors are
+ // streamed so each weight group is dequantized once and reused across them.
+-template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
++template <
++    typename T,
++    int group_size,
++    int bits,
++    int vecs_per_tg,
++    int k_lanes,
++    bool exact_global_scale = false>
+ METAL_FUNC void fp_qmv_wide_impl(
+     const device uint32_t* w,
+     const device uint8_t* scales,
++    const device float* global_scale,
+     const device T* x,
+     device T* y,
+     const constant int& in_vec_size,
+     const constant int& out_vec_size,
+     const constant int& M,
++    const constant int& global_scale_size,
+     uint3 tid [[threadgroup_position_in_grid]],
+     uint simd_gid [[simdgroup_index_in_threadgroup]],
+     uint simd_lid [[thread_index_in_simdgroup]]) {
+@@ -704,7 +712,11 @@ METAL_FUNC void fp_qmv_wide_impl(
+   if (k_lane == 0 && out_row < out_vec_size) {
+     for (int v = 0; v < vecs_per_tg; v++) {
+       if (vec0 + v < M) {
+-        y[(vec0 + v) * out_vec_size + out_row] = static_cast<T>(result[v]);
++        y[(vec0 + v) * out_vec_size + out_row] = fp_qmv_scaled_output<
++            T,
++            exact_global_scale,
++            exact_global_scale>(
++            result[v], global_scale, global_scale_size, out_row, 1.0f);
+       }
+     }
+   }
+@@ -1332,15 +1344,18 @@ template <
+     int bits,
+     int vecs_per_tg,
+     int k_lanes,
+-    bool batched>
++    bool batched,
++    bool exact_global_scale = false>
+ [[kernel]] void fp_qmv_wide(
+     const device uint32_t* w,
+     const device uint8_t* scales,
++    const device float* global_scale,
+     const device T* x,
+     device T* y,
+     const constant int& in_vec_size,
+     const constant int& out_vec_size,
+     const constant int& M,
++    const constant int& global_scale_size,
+     const constant int& x_batch_ndims,
+     const constant int* x_shape,
+     const constant int64_t* x_strides,
+@@ -1367,8 +1382,25 @@ template <
+         s_strides,
+         tid);
+   }
+-  fp_qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes>(
+-      w, scales, x, y, in_vec_size, out_vec_size, M, tid, simd_gid, simd_lid);
++  fp_qmv_wide_impl<
++      T,
++      group_size,
++      bits,
++      vecs_per_tg,
++      k_lanes,
++      exact_global_scale>(
++      w,
++      scales,
++      global_scale,
++      x,
++      y,
++      in_vec_size,
++      out_vec_size,
++      M,
++      global_scale_size,
++      tid,
++      simd_gid,
++      simd_lid);
+ }
+ 
+ template <
+diff --git a/mlx/backend/metal/kernels/fp_quantized.metal b/mlx/backend/metal/kernels/fp_quantized.metal
+index fe42d7d8..aa349805 100644
+--- a/mlx/backend/metal/kernels/fp_quantized.metal
++++ b/mlx/backend/metal/kernels/fp_quantized.metal
+@@ -126,6 +126,18 @@
+       k_lanes,       \
+       batched)
+ 
++#define instantiate_quantized_wide_exact(mode, name, type, vecs_per_tg, k_lanes, group_size, bits, batched) \
++  instantiate_kernel( \
++      #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_nv_" #vecs_per_tg "_kl_" #k_lanes "_batch_" #batched "_hgs_exact", \
++      fp_ ## name,    \
++      type,    \
++      group_size,      \
++      bits,       \
++      vecs_per_tg,       \
++      k_lanes,       \
++      batched,       \
++      true)
++
+ #define instantiate_quantized_split_k(mode, name, type, split_k, group_size, bits) \
+   instantiate_kernel( \
+       #mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_spk_" #split_k, \
+@@ -190,6 +202,16 @@
+   instantiate_quantized_wide_wrap(mode, qmv_wide, type, 4, 16, group_size, bits) \
+   instantiate_quantized_wide_wrap(mode, qmv_wide, type, 5, 16, group_size, bits)
+ 
++#define instantiate_quantized_wide_exact_wrap(mode, name, type, vecs_per_tg, k_lanes, group_size, bits) \
++  instantiate_quantized_wide_exact(mode, name, type, vecs_per_tg, k_lanes, group_size, bits, 0)         \
++  instantiate_quantized_wide_exact(mode, name, type, vecs_per_tg, k_lanes, group_size, bits, 1)
++
++#define instantiate_quantized_all_wide_exact(type, mode, group_size, bits) \
++  instantiate_quantized_wide_exact_wrap(mode, qmv_wide, type, 2, 16, group_size, bits) \
++  instantiate_quantized_wide_exact_wrap(mode, qmv_wide, type, 3, 16, group_size, bits) \
++  instantiate_quantized_wide_exact_wrap(mode, qmv_wide, type, 4, 16, group_size, bits) \
++  instantiate_quantized_wide_exact_wrap(mode, qmv_wide, type, 5, 16, group_size, bits)
++
+ #define instantiate_quantized_all_splitk(type, mode, group_size, bits) \
+   instantiate_quantized_split_k(mode, qvm_split_k, type, 8, group_size, bits) \
+   instantiate_quantized_split_k(mode, qvm_split_k, type, 32, group_size, bits) \
+@@ -255,4 +277,5 @@ instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 2, 0, 16, 4)
+ instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 2, 1, 16, 4)
+ instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 8, 0, 16, 4)
+ instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 8, 1, 16, 4)
++instantiate_quantized_all_wide_exact(bfloat16_t, nvfp4, 16, 4)
+     // clang-format on
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index ae10e094..6ceb9719 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -564,6 +564,7 @@ void qmv_wide(
+     const array& w,
+     const array& scales,
+     const std::optional<array>& biases,
++    const std::optional<array>& global_scale,
+     array& out,
+     int group_size,
+     int bits,
+@@ -572,7 +573,8 @@ void qmv_wide(
+     int K,
+     metal::Device& d,
+     const Stream& s,
+-    const std::string& mode) {
++    const std::string& mode,
++    bool exact_global_scale) {
+   // vecs_per_tg is the per-threadgroup input-vector tile. Each tile re-reads
+   // the weights, so use the fewest tiles, then the smallest tile that fills
+   // them.
+@@ -610,18 +612,32 @@ void qmv_wide(
+       vecs_per_tg,
+       "_kl_",
+       k_lanes,
+-      batched ? "_batch_1" : "_batch_0");
+-  auto kernel = get_quantized_kernel_wrapped(
+-      d,
+-      kname,
+-      "qmv_wide",
+-      mode,
+-      type_string,
+-      group_size,
+-      bits,
+-      vecs_per_tg,
+-      k_lanes,
+-      batched);
++      batched ? "_batch_1" : "_batch_0",
++      global_scale ? "_hgs_exact" : "");
++  auto kernel = mode == "affine"
++      ? get_quantized_kernel_wrapped(
++            d,
++            kname,
++            "qmv_wide",
++            mode,
++            type_string,
++            group_size,
++            bits,
++            vecs_per_tg,
++            k_lanes,
++            batched)
++      : get_quantized_kernel_wrapped(
++            d,
++            kname,
++            "qmv_wide",
++            mode,
++            type_string,
++            group_size,
++            bits,
++            vecs_per_tg,
++            k_lanes,
++            batched,
++            exact_global_scale);
+ 
+   auto& compute_encoder = metal::get_command_encoder(s);
+   compute_encoder.set_compute_pipeline_state(kernel);
+@@ -629,15 +645,31 @@ void qmv_wide(
+   int c = 0;
+   compute_encoder.set_input_array(w, c++);
+   compute_encoder.set_input_array(scales, c++);
+-  if (biases) {
++  if (mode == "affine") {
+     compute_encoder.set_input_array(*biases, c++);
++    compute_encoder.set_input_array(x, c++);
++    compute_encoder.set_output_array(out, c++);
++    compute_encoder.set_bytes(K, c++);
++    compute_encoder.set_bytes(N, c++);
++    compute_encoder.set_bytes(M, c++);
++    add_strides_and_shapes(
++        compute_encoder, !batched, x, w, scales, biases, c);
++  } else {
++    if (global_scale) {
++      compute_encoder.set_input_array(*global_scale, c);
++    }
++    c = 3;
++    compute_encoder.set_input_array(x, c++);
++    compute_encoder.set_output_array(out, c++);
++    compute_encoder.set_bytes(K, c++);
++    compute_encoder.set_bytes(N, c++);
++    compute_encoder.set_bytes(M, c++);
++    const int global_scale_size =
++        global_scale ? static_cast<int>(global_scale->size()) : 0;
++    compute_encoder.set_bytes(global_scale_size, c++);
++    add_strides_and_shapes(
++        compute_encoder, !batched, x, w, scales, biases, c);
+   }
+-  compute_encoder.set_input_array(x, c++);
+-  compute_encoder.set_output_array(out, c++);
+-  compute_encoder.set_bytes(K, c++);
+-  compute_encoder.set_bytes(N, c++);
+-  compute_encoder.set_bytes(M, c++);
+-  add_strides_and_shapes(compute_encoder, !batched, x, w, scales, biases, c);
+ 
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+ }
+@@ -1778,8 +1810,27 @@ void dispatch_qmv(
+ 
+   // Small batch so route to qmv_wide, which reuses each weight group across the
+   // M vectors.
+-  if (M >= 2 && use_qmv_wide(mode, d) && !global_scale) {
+-    qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
++  const bool exact_wide_global_scale = global_scale && exact_global_scale &&
++      qmv_results_per_simdgroup == 0 && mode == "nvfp4" &&
++      out.size() / M / N == 1;
++  if (M >= 2 && use_qmv_wide(mode, d) &&
++      (!global_scale || exact_wide_global_scale)) {
++    qmv_wide(
++        x,
++        w,
++        scales,
++        biases,
++        global_scale,
++        out,
++        group_size,
++        bits,
++        M,
++        N,
++        K,
++        d,
++        s,
++        mode,
++        exact_global_scale);
+     return;
+   }
+   qmv(x,

@@ -1,0 +1,123 @@
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index a7b58094..0b40d5f0 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -473,7 +473,8 @@ void qmv(
+     metal::Device& d,
+     const Stream& s,
+     const std::string& mode,
+-    bool exact_global_scale) {
++    bool exact_global_scale,
++    int qmv_results_per_simdgroup) {
+   int B = out.size() / M / N;
+ 
+   int bn = 8;
+@@ -485,8 +486,10 @@ void qmv(
+   bool fast = N % bn == 0 && K % qmv_fast_k_alignment(bits) == 0;
+   // A narrower output tile reduces register pressure for large
+   // floating-point quantized matrix-vector products on M5 Max GPUs.
+-  bool use_narrow_qmv = fast && N >= 4096 && d.get_architecture_gen() == 17 &&
+-      d.get_architecture().back() == 's' && mode == "nvfp4";
++  bool use_narrow_qmv = fast && N >= 4096 && mode == "nvfp4" &&
++      ((d.get_architecture_gen() == 17 &&
++        d.get_architecture().back() == 's') ||
++       qmv_results_per_simdgroup == 2);
+   int results_per_simdgroup = use_narrow_qmv ? 2 : 4;
+   bn = 2 * results_per_simdgroup;
+   MTL::Size group_dims(bk, 2, 1);
+@@ -1755,7 +1758,8 @@ void dispatch_qmv(
+     metal::Device& d,
+     const Stream& s,
+     const std::string& mode,
+-    bool exact_global_scale = false) {
++    bool exact_global_scale = false,
++    int qmv_results_per_simdgroup = 0) {
+   // It is a qmv with a small inner dimension so route to qmv_quad kernel
+   if ((K == 128 || K == 64) && is_power_of_2(bits) && !global_scale) {
+     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+@@ -1782,7 +1786,8 @@ void dispatch_qmv(
+       d,
+       s,
+       mode,
+-      exact_global_scale);
++      exact_global_scale,
++      qmv_results_per_simdgroup);
+ }
+ 
+ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -1826,6 +1831,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+     throw std::invalid_argument(
+         "[quantized_matmul] exact global scale requires fused global-scale input.");
+   }
++  if (qmv_results_per_simdgroup_ != 0 &&
++      qmv_results_per_simdgroup_ != 2) {
++    throw std::invalid_argument(
++        "[quantized_matmul] QMV geometry override must use two results per SIMD-group.");
++  }
+ 
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+   auto mode = quantization_mode_to_string(mode_);
+@@ -1876,7 +1886,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+         d,
+         s,
+         mode,
+-        exact_global_scale_);
++        exact_global_scale_,
++        qmv_results_per_simdgroup_);
+     return;
+   }
+ 
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+index ef102743..241dbaac 100644
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -3617,7 +3617,8 @@ bool QuantizedMatmul::is_equivalent(const Primitive& other) const {
+   return group_size_ == qm_other.group_size_ && bits_ == qm_other.bits_ &&
+       mode_ == qm_other.mode_ && transpose_ == qm_other.transpose_ &&
+       has_global_scale_ == qm_other.has_global_scale_ &&
+-      exact_global_scale_ == qm_other.exact_global_scale_;
++      exact_global_scale_ == qm_other.exact_global_scale_ &&
++      qmv_results_per_simdgroup_ == qm_other.qmv_results_per_simdgroup_;
+ }
+ 
+ std::vector<Shape> QuantizedMatmul::output_shapes(
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+index e06994b2..9b814da6 100644
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1622,14 +1622,16 @@ class QuantizedMatmul : public UnaryPrimitive {
+       QuantizationMode mode,
+       bool transpose,
+       bool has_global_scale = false,
+-      bool exact_global_scale = false)
++      bool exact_global_scale = false,
++      int qmv_results_per_simdgroup = 0)
+       : UnaryPrimitive(stream),
+         group_size_(group_size),
+         bits_(bits),
+         mode_(mode),
+         transpose_(transpose),
+         has_global_scale_(has_global_scale),
+-        exact_global_scale_(exact_global_scale) {}
++        exact_global_scale_(exact_global_scale),
++        qmv_results_per_simdgroup_(qmv_results_per_simdgroup) {}
+ 
+   void eval_cpu(const std::vector<array>& inputs, array& out) override;
+   void eval_gpu(const std::vector<array>& inputs, array& out) override;
+@@ -1642,7 +1644,7 @@ class QuantizedMatmul : public UnaryPrimitive {
+   auto state() const {
+     return std::make_tuple(
+         group_size_, bits_, mode_, transpose_, has_global_scale_,
+-        exact_global_scale_);
++        exact_global_scale_, qmv_results_per_simdgroup_);
+   }
+ 
+  private:
+@@ -1652,6 +1654,7 @@ class QuantizedMatmul : public UnaryPrimitive {
+   bool transpose_;
+   bool has_global_scale_;
+   bool exact_global_scale_;
++  int qmv_results_per_simdgroup_;
+ };
+ 
+ class QQMatmul : public UnaryPrimitive {

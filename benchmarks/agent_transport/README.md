@@ -71,17 +71,19 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s benchmarks/agent_transport -p 'test_*.py'
 ```
 
-The installed local comparison model is currently `qwen3.6:35b-a3b`:
+The production local model is currently the dense Qwen3.8 27B Metal/MLX build:
 
 ```sh
 python3 benchmarks/agent_transport/run.py \
   --provider ollama \
-  --model qwen3.6:35b-a3b \
+  --model qwen3.8:27b-mlx \
   --tag smoke \
-  --transport json_tool \
-  --transport plain_text \
-  --reasoning-effort none
+  --transport json_tool_implicit
 ```
+
+Leaving `--reasoning-effort` unset preserves model reasoning. Use
+`--reasoning-effort none` only for an explicitly labeled speed control, never
+as the production score.
 
 OpenRouter credentials are read only from `OPENROUTER_API_KEY`. A bounded
 smoke comparison for the two remote models is:

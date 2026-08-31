@@ -1,5 +1,7 @@
 use dialoguer::console::style;
 use generalist::mcp::{McpConfig, McpRegistrationOutcome, McpRegistrationReport};
+#[cfg(feature = "embedded-mlx-native")]
+use generalist::provider::embedded::EmbeddedProvider;
 use generalist::provider::{
     anthropic, openrouter, AnthropicProvider, OpenAiProvider, OpenRouterProvider, Provider,
 };
@@ -13,6 +15,7 @@ use generalist::{
     MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt, PermissionChoice,
     PermissionRequest, PermissionUiEvent, ProfilePaths, PromptQueue, PromptSource, Result,
     SavedState, ToolRegistry, TurnControl, TurnOutcome, UsageCommand, WorkspaceScope,
+    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS, DEFAULT_COMPACTION_THRESHOLD_TOKENS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -33,8 +36,13 @@ use display_channel::*;
 
 const AUTOSAVE_NAME: &str = "autosave";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
-const DEFAULT_LOCAL_MODEL: &str = "qwen3.8:latest";
+const DEFAULT_LOCAL_MODEL: &str = "qwen3.8:27b-mlx";
+const DEFAULT_EMBEDDED_MODEL: &str = "qwen3.8:27b-mlx";
+const LOCAL_QWEN_COMPACTION_THRESHOLD_TOKENS: u64 = 24_000;
+const LOCAL_QWEN_COMPACTION_KEEP_RECENT_TOKENS: u64 = 8_000;
 const THIRD_PARTY_LICENSES: &str = include_str!("../THIRD_PARTY_LICENSES.txt");
+#[cfg(feature = "embedded-mlx-native")]
+const EMBEDDED_MLX_LICENSES: &str = include_str!("../native/mlx/THIRD_PARTY_NOTICES.md");
 
 fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     let parent = path
@@ -87,6 +95,8 @@ impl ApiKeys {
 
     fn available_providers(&self) -> Vec<&'static str> {
         let mut providers = Vec::new();
+        #[cfg(generalist_mlx_native_linked)]
+        providers.push("embedded");
         if self.anthropic.is_some() {
             providers.push("anthropic");
         }
@@ -107,8 +117,43 @@ impl ApiKeys {
                 "OpenAI".to_string()
             }
             "openai" => "OpenAI-compatible".to_string(),
+            "embedded" => "Embedded MLX".to_string(),
             other => other.to_string(),
         }
+    }
+}
+
+fn is_qwen38_model(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    model == "qwen3.8" || model.starts_with("qwen3.8:")
+}
+
+fn is_loopback_endpoint(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+}
+
+fn uses_local_qwen_model(keys: &ApiKeys, provider: &str, model: &str) -> bool {
+    (provider == "embedded" && is_qwen38_model(model))
+        || (provider == "openai"
+            && is_loopback_endpoint(&keys.openai_base_url)
+            && is_qwen38_model(model))
+}
+
+fn apply_model_runtime_profile(agent: &mut Agent, keys: &ApiKeys) {
+    if uses_local_qwen_model(keys, agent.provider().id(), agent.provider().model()) {
+        agent.compaction_threshold_tokens = LOCAL_QWEN_COMPACTION_THRESHOLD_TOKENS;
+        agent.compaction_keep_recent_tokens = LOCAL_QWEN_COMPACTION_KEEP_RECENT_TOKENS;
+    } else {
+        agent.compaction_threshold_tokens = DEFAULT_COMPACTION_THRESHOLD_TOKENS;
+        agent.compaction_keep_recent_tokens = DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
     }
 }
 
@@ -138,6 +183,21 @@ fn build_provider(keys: &ApiKeys, provider: &str, model: String) -> Result<Box<d
                 .clone()
                 .ok_or_else(|| Error::Other("OPENROUTER_API_KEY is not set".to_string()))?;
             Ok(Box::new(OpenRouterProvider::new(key, model)?))
+        }
+        "embedded" => {
+            #[cfg(feature = "embedded-mlx-native")]
+            {
+                Ok(Box::new(EmbeddedProvider::qwen(model)?))
+            }
+            #[cfg(not(feature = "embedded-mlx-native"))]
+            {
+                let _ = model;
+                Err(Error::Other(
+                    "the embedded provider is not compiled into this binary; run `make embedded` \
+                     from the Generalist repository on Apple Silicon macOS"
+                        .to_string(),
+                ))
+            }
         }
         other => Err(Error::Other(format!("Unknown provider '{other}'"))),
     }
@@ -346,7 +406,10 @@ async fn load_named_session(
         ));
     }
     match build_provider(keys, &provider, model) {
-        Ok(provider) => agent.set_provider(provider),
+        Ok(provider) => {
+            agent.set_provider(provider);
+            apply_model_runtime_profile(agent, keys);
+        }
         Err(error) => ctx.ui.error(&format!(
             "Saved API '{provider}' is unavailable ({error}); keeping the current API."
         )),
@@ -993,6 +1056,7 @@ fn apply_runtime_event(
 
 struct CliArgs {
     local_model: Option<String>,
+    embedded_model: Option<String>,
     gemini: bool,
     provider: Option<String>,
     model: Option<String>,
@@ -1003,14 +1067,16 @@ struct CliArgs {
 
 fn print_usage() {
     println!(
-        "Usage: generalist [--global] [--provider <name> [--model <id>]] [--gemini] [--local [model]] [--max-tokens <count>] [--licenses]"
+        "Usage: generalist [--global] [--provider <name> [--model <id>]] [--gemini] [--local [model]] [--embedded [model]] [--max-tokens <count>] [--licenses]"
     );
     println!();
     println!("  --global          Use the explicit cross-project history/memory scope");
     println!("                    (default: project scope discovered from the working directory)");
     println!("  --gemini          Use Gemini 3.7 Flash through OpenRouter");
     println!("                    (requires OPENROUTER_API_KEY; --local takes precedence)");
-    println!("  --provider NAME   Use anthropic, openai, or openrouter without prompting");
+    println!(
+        "  --provider NAME   Use anthropic, openai, openrouter, or embedded without prompting"
+    );
     println!("  --model ID        Model for --provider (provider default when omitted)");
     println!("  --local [model]   Run against a local OpenAI-compatible server");
     println!(
@@ -1020,6 +1086,12 @@ fn print_usage() {
     println!(
         "                    Model defaults to {} if omitted.",
         DEFAULT_LOCAL_MODEL
+    );
+    println!("  --embedded [model] Run Qwen directly through the in-process MLX engine");
+    println!("                    (requires a binary built with embedded-mlx-native).");
+    println!(
+        "                    Model defaults to {} if omitted.",
+        DEFAULT_EMBEDDED_MODEL
     );
     println!("  --max-tokens N    Request at most N output tokens per ordinary completion");
     println!("                    (default: Anthropic model maximum; provider default elsewhere)");
@@ -1039,6 +1111,7 @@ fn parse_max_tokens(value: &str) -> std::result::Result<u32, String> {
 
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
     let mut local_model = None;
+    let mut embedded_model = None;
     let mut gemini = false;
     let mut provider = None;
     let mut model = None;
@@ -1089,6 +1162,16 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
             value if value.starts_with("--local=") => {
                 local_model = Some(value["--local=".len()..].to_string());
             }
+            "--embedded" => {
+                let model = match args.peek() {
+                    Some(next) if !next.starts_with('-') => args.next().unwrap(),
+                    _ => DEFAULT_EMBEDDED_MODEL.to_string(),
+                };
+                embedded_model = Some(model);
+            }
+            value if value.starts_with("--embedded=") => {
+                embedded_model = Some(value["--embedded=".len()..].to_string());
+            }
             "--max-tokens" => {
                 let Some(value) = args.next() else {
                     eprintln!(
@@ -1129,6 +1212,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
     }
     CliArgs {
         local_model,
+        embedded_model,
         gemini,
         provider,
         model,
@@ -1149,6 +1233,8 @@ fn normalized_provider_id(provider: &str) -> Option<&'static str> {
         Some("openai")
     } else if provider.eq_ignore_ascii_case("openrouter") {
         Some("openrouter")
+    } else if provider.eq_ignore_ascii_case("embedded") {
+        Some("embedded")
     } else {
         None
     }
@@ -1170,6 +1256,7 @@ fn provider_default_model(provider: &str) -> std::result::Result<String, String>
         "anthropic" => Ok(anthropic::SUGGESTED_MODELS[0].to_string()),
         "openrouter" => Ok(openrouter::DEFAULT_MODEL.to_string()),
         "openai" => Ok(env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string())),
+        "embedded" => Ok(DEFAULT_EMBEDDED_MODEL.to_string()),
         _ => Err(format!("unknown provider '{provider}'")),
     }
 }
@@ -1178,6 +1265,14 @@ fn forced_provider_and_model(
     cli: &CliArgs,
 ) -> std::result::Result<Option<(String, String)>, String> {
     let uses_generic_selection = cli.provider.is_some() || cli.model.is_some();
+    if cli.embedded_model.is_some()
+        && (uses_generic_selection || cli.local_model.is_some() || cli.gemini)
+    {
+        return Err(
+            "--embedded cannot be combined with --local, --gemini, --provider, or --model"
+                .to_string(),
+        );
+    }
     if uses_generic_selection && (cli.local_model.is_some() || cli.gemini) {
         return Err("--provider/--model cannot be combined with --local or --gemini".to_string());
     }
@@ -1185,7 +1280,9 @@ fn forced_provider_and_model(
         return Err("--model requires --provider".to_string());
     }
 
-    if let Some(model) = &cli.local_model {
+    if let Some(model) = &cli.embedded_model {
+        Ok(Some(("embedded".to_string(), model.clone())))
+    } else if let Some(model) = &cli.local_model {
         Ok(Some(("openai".to_string(), model.clone())))
     } else if cli.gemini {
         Ok(Some((
@@ -1225,7 +1322,9 @@ async fn choose_provider(
 }
 
 async fn choose_model(ui: &mut TerminalUi, provider: &str) -> Result<Option<String>> {
-    if provider == "anthropic" {
+    if provider == "embedded" {
+        Ok(Some(DEFAULT_EMBEDDED_MODEL.to_string()))
+    } else if provider == "anthropic" {
         choose_suggested_or_custom_model(ui, "Anthropic model ID", anthropic::SUGGESTED_MODELS)
             .await
     } else if provider == "openrouter" {
@@ -1914,6 +2013,7 @@ async fn execute_command(
                     match build_provider(keys, &provider_name, model) {
                         Ok(provider) => {
                             agent.set_provider(provider);
+                            apply_model_runtime_profile(agent, keys);
                             ctx.ui.set_session(
                                 agent.provider().display_name(),
                                 agent.provider().model(),
@@ -2134,6 +2234,8 @@ async fn main() -> Result<()> {
     let cli = parse_args();
     if cli.show_licenses {
         print!("{THIRD_PARTY_LICENSES}");
+        #[cfg(feature = "embedded-mlx-native")]
+        print!("\n{EMBEDDED_MLX_LICENSES}");
         return Ok(());
     }
     let profile_paths = ProfilePaths::discover(); // profile-path-allow: one startup resolution
@@ -2159,6 +2261,14 @@ async fn main() -> Result<()> {
     });
     let available = keys.available_providers();
     if let Some((provider, _)) = &forced_provider_and_model {
+        if provider == "embedded" && !cfg!(generalist_mlx_native_linked) {
+            eprintln!(
+                "{} the embedded MLX engine is not linked into this binary.",
+                style("Configuration error:").for_stderr().red()
+            );
+            eprintln!("Run `make embedded` from the Generalist repository on Apple Silicon macOS.");
+            std::process::exit(1);
+        }
         if !available.contains(&provider.as_str()) {
             let required = match provider.as_str() {
                 "anthropic" => "ANTHROPIC_API_KEY",
@@ -2187,6 +2297,7 @@ async fn main() -> Result<()> {
         );
         eprintln!("  OPENAI_BASE_URL=...     optional, e.g. {OLLAMA_BASE_URL} for Ollama");
         eprintln!("Or run against a local model directly: generalist --local <model>");
+        eprintln!("Or build the native MLX feature and run: generalist --embedded");
         std::process::exit(1);
     }
 
@@ -2291,6 +2402,7 @@ async fn main() -> Result<()> {
 
     let mut agent = Agent::new(provider, registry, system_prompt);
     agent.max_tokens = cli.max_tokens;
+    apply_model_runtime_profile(&mut agent, &keys);
     agent.set_goal(startup_goal);
     if !startup_history.is_empty() {
         agent.replace_history(startup_history);
@@ -2480,6 +2592,28 @@ mod tests {
         assert!(THIRD_PARTY_LICENSES.starts_with("THIRD-PARTY LICENSES\n"));
         assert!(THIRD_PARTY_LICENSES.contains("CDLA-Permissive-2.0"));
         assert!(THIRD_PARTY_LICENSES.contains("Unicode-3.0"));
+        #[cfg(feature = "embedded-mlx-native")]
+        for required_notice in [
+            "Copyright © 2023 Apple Inc.",
+            "Copyright (c) 2023 ml-explore",
+            "Copyright (c) Ollama",
+            "Copyright (c) 2013-2022 Niels Lohmann",
+            "Victor Zverovich and {fmt} contributors",
+            "Copyright (C) 2010-2022 Max-Planck-Society",
+            "Copyright (C) 2019-2020 Peter Bell",
+            "Copyright © 2018 the V8 project authors.",
+            "Copyright (c) 2012 Jakob Progsch",
+            "Copyright (c) 2015-2023 Norbert Juffa",
+            "Copyright 2020-2024 Apple Inc.",
+            "Copyright © 2025 Apple Inc.",
+            "Copyright © 2008-2013 NVIDIA Corporation",
+            "Copyright © 2013 Filipe RNC Maia",
+        ] {
+            assert!(
+                EMBEDDED_MLX_LICENSES.contains(required_notice),
+                "embedded native license output is missing {required_notice}"
+            );
+        }
     }
 
     #[test]
@@ -2496,6 +2630,160 @@ mod tests {
                 "openai".to_string(),
                 "custom-local-model".to_string()
             )))
+        );
+    }
+
+    #[test]
+    fn local_flag_defaults_to_the_dense_mlx_qwen_model() {
+        let cli = parse_args_from(["--local"].into_iter().map(str::to_string));
+
+        assert_eq!(cli.local_model.as_deref(), Some("qwen3.8:27b-mlx"));
+        assert_eq!(
+            forced_provider_and_model(&cli),
+            Ok(Some(("openai".to_string(), "qwen3.8:27b-mlx".to_string())))
+        );
+    }
+
+    #[test]
+    fn embedded_flag_defaults_to_the_specialized_dense_qwen_model() {
+        let cli = parse_args_from(["--embedded"].into_iter().map(str::to_string));
+
+        assert_eq!(cli.embedded_model.as_deref(), Some("qwen3.8:27b-mlx"));
+        assert_eq!(
+            forced_provider_and_model(&cli),
+            Ok(Some((
+                "embedded".to_string(),
+                "qwen3.8:27b-mlx".to_string()
+            )))
+        );
+
+        let explicit = parse_args_from(
+            ["--embedded=qwen3.8:27b-mlx"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(
+            forced_provider_and_model(&explicit),
+            forced_provider_and_model(&cli)
+        );
+    }
+
+    #[test]
+    fn embedded_selection_rejects_every_competing_provider_flag() {
+        for arguments in [
+            vec!["--embedded", "--local"],
+            vec!["--embedded", "--gemini"],
+            vec!["--embedded", "--provider", "openai"],
+            vec!["--embedded", "--model", "qwen3.8:27b-mlx"],
+        ] {
+            let cli = parse_args_from(arguments.into_iter().map(str::to_string));
+            assert_eq!(
+                forced_provider_and_model(&cli),
+                Err(
+                    "--embedded cannot be combined with --local, --gemini, --provider, or --model"
+                        .to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn local_qwen_detection_is_scoped_to_loopback_qwen38_endpoints() {
+        let local = ApiKeys {
+            anthropic: None,
+            openai: Some("unused".to_string()),
+            openrouter: None,
+            openai_base_url: OLLAMA_BASE_URL.to_string(),
+        };
+        assert!(uses_local_qwen_model(&local, "openai", "qwen3.8:27b-mlx"));
+        assert!(uses_local_qwen_model(
+            &local,
+            "openai",
+            "registry.example/qwen3.8:27b"
+        ));
+        assert!(!uses_local_qwen_model(&local, "openai", "qwen3.6:35b-a3b"));
+        assert!(!uses_local_qwen_model(
+            &local,
+            "openrouter",
+            "qwen3.8:27b-mlx"
+        ));
+        assert!(uses_local_qwen_model(&local, "embedded", "qwen3.8:27b-mlx"));
+
+        let loopback_ip = ApiKeys {
+            anthropic: None,
+            openai: Some("unused".to_string()),
+            openrouter: None,
+            openai_base_url: "http://127.0.0.1:11434/v1".to_string(),
+        };
+        assert!(uses_local_qwen_model(
+            &loopback_ip,
+            "openai",
+            "qwen3.8:27b-mlx"
+        ));
+
+        let remote_compatible = ApiKeys {
+            anthropic: None,
+            openai: Some("unused".to_string()),
+            openrouter: None,
+            openai_base_url: "https://inference.example/v1".to_string(),
+        };
+        assert!(!uses_local_qwen_model(
+            &remote_compatible,
+            "openai",
+            "qwen3.8:27b-mlx"
+        ));
+
+        let official = ApiKeys {
+            openai_base_url: generalist::provider::openai::DEFAULT_BASE_URL.to_string(),
+            ..local
+        };
+        assert!(!uses_local_qwen_model(
+            &official,
+            "openai",
+            "qwen3.8:27b-mlx"
+        ));
+    }
+
+    #[test]
+    fn qwen_runtime_profile_leaves_headroom_and_resets_after_model_switch() {
+        let keys = ApiKeys {
+            anthropic: None,
+            openai: Some("unused".to_string()),
+            openrouter: None,
+            openai_base_url: OLLAMA_BASE_URL.to_string(),
+        };
+        let local = OpenAiProvider::new(
+            "unused".to_string(),
+            OLLAMA_BASE_URL.to_string(),
+            "qwen3.8:27b-mlx".to_string(),
+        )
+        .unwrap();
+        let mut agent = Agent::new(Box::new(local), ToolRegistry::new(), "test");
+        apply_model_runtime_profile(&mut agent, &keys);
+        assert_eq!(
+            agent.compaction_threshold_tokens,
+            LOCAL_QWEN_COMPACTION_THRESHOLD_TOKENS
+        );
+        assert_eq!(
+            agent.compaction_keep_recent_tokens,
+            LOCAL_QWEN_COMPACTION_KEEP_RECENT_TOKENS
+        );
+
+        let remote = OpenAiProvider::new(
+            "unused".to_string(),
+            generalist::provider::openai::DEFAULT_BASE_URL.to_string(),
+            "gpt-4o".to_string(),
+        )
+        .unwrap();
+        agent.set_provider(Box::new(remote));
+        apply_model_runtime_profile(&mut agent, &keys);
+        assert_eq!(
+            agent.compaction_threshold_tokens,
+            DEFAULT_COMPACTION_THRESHOLD_TOKENS
+        );
+        assert_eq!(
+            agent.compaction_keep_recent_tokens,
+            DEFAULT_COMPACTION_KEEP_RECENT_TOKENS
         );
     }
 
@@ -3201,10 +3489,12 @@ mod tests {
             openai_base_url: generalist::provider::openai::DEFAULT_BASE_URL.into(),
         };
 
-        assert_eq!(
-            keys.available_providers(),
+        let expected = if cfg!(generalist_mlx_native_linked) {
+            vec!["openrouter", "embedded", "anthropic", "openai"]
+        } else {
             vec!["openrouter", "anthropic", "openai"]
-        );
+        };
+        assert_eq!(keys.available_providers(), expected);
         assert_eq!(
             default_remote_provider_and_model(&keys),
             Some(("openrouter".to_string(), "moonshotai/kimi-k3".to_string()))

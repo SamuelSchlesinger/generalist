@@ -1,0 +1,811 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-embedded-vs-ollama",
+  "recorded_at": "2026-08-31",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "dense": true,
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "language_layer_count": 64,
+    "mtp_layer_count": 1,
+    "vocabulary_rows": 248320
+  },
+  "runtime": {
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "ollama_version": "0.32.13",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399",
+    "metallib_sha256": "4a57cddc8401152b48f8baf4b935a06173f5d0fd6210e42c62b0161cf63cce1d",
+    "benchmark_source_sha256": "12ee22a2c7541dc58e89389bcb2b31c41f5556e734b21af7de52d396f1b94898",
+    "benchmark_binary_sha256": "7c7ed134c89b096cc76ee11a90f2569f65975ab1daf8eda0c190d76fda69ef56",
+    "captured_result_sha256": "984a5a172b01f6bbc45008127a96ae720241d547f0c9dd528c396ace88f9aa7d",
+    "patch_count": 6
+  },
+  "hardware": {
+    "model": "MacBook Pro Mac16,8",
+    "chip": "Apple M4 Pro",
+    "unified_memory_gib": 48,
+    "macos": "26.5.2 (25F84)"
+  },
+  "evidence_boundary": {
+    "benchmark_class": "gated-normal-desktop-load",
+    "continuous_inference_telemetry": false,
+    "thermal_pressure_recorded": false,
+    "per_process_background_limit_enforced": false,
+    "interpretation": "paired replicated performance under measured normal desktop load; not a clean-room maximum-throughput result"
+  },
+  "protocol": {
+    "content_contract": "both engines must emit reasoning and consume the fixed token budget; hashes are recorded as semantic-stability evidence but bit identity is not required",
+    "context_tokens": 32768,
+    "cooldown_milliseconds": 5000,
+    "environment_contract": {
+      "maximum_post_process_gpu_memory_bytes": 2147483648,
+      "maximum_pre_sample_gpu_utilization_percent": 5,
+      "minimum_pre_sample_cpu_idle_percent": 80.0,
+      "minimum_pre_sample_memory_free_percent": 50.0
+    },
+    "model": "qwen3.8:27b-mlx",
+    "ollama_model": {
+      "capabilities": [
+        "completion",
+        "vision",
+        "tools",
+        "thinking"
+      ],
+      "details": {
+        "families": null,
+        "family": "",
+        "format": "safetensors",
+        "parameter_size": "",
+        "parent_model": "",
+        "quantization_level": "nvfp4"
+      },
+      "digest": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+      "model": "qwen3.8:27b-mlx",
+      "modified_at": "2026-08-31T00:01:40.975053272-04:00",
+      "name": "qwen3.8:27b-mlx",
+      "size": 18174721847
+    },
+    "ollama_raw_prompt": true,
+    "ollama_reasoning_parse": "raw generation is split at Qwen's </think> delimiter with the same initial-thinking semantics as the embedded provider",
+    "ollama_think": true,
+    "order": "AB/BA rotating by replica",
+    "prompt_bytes": 632,
+    "prompt_sha256": "ea4ff9e96263f0e1232c1d5053c63be21891ddeef0db2640b524968e32f48179",
+    "prompt_source": "Generalist production Qwen renderer; exact bytes sent to Ollama /api/generate with raw=true",
+    "rate_scope": "approximate output tokens after first emitted reasoning/text delta divided by remaining client wall time",
+    "reasoning_effort": "xhigh",
+    "reasoning_required": true,
+    "replicas": 3,
+    "requested_output_tokens": 128,
+    "residency_isolation": "every engine sample runs in a fresh child process; process exit releases embedded MLX allocations; Ollama is explicitly unloaded before and after use",
+    "sampling": {
+      "min_p": 0,
+      "mode": "greedy",
+      "temperature": 0,
+      "top_k": 1,
+      "top_p": 1
+    },
+    "seed": 1,
+    "warm_measurement": "second identical request with the model resident and prompt prefix reusable"
+  },
+  "summary": {
+    "cross_engine_cold_content_matches": [
+      false,
+      false,
+      false
+    ],
+    "embedded_cold_warm_content_stable": true,
+    "embedded_warm_median_end_to_end_tokens_per_second": 32.228914251042966,
+    "embedded_warm_median_first_delta_milliseconds": 70.55779199999999,
+    "embedded_warm_median_tokens_per_second": 32.55888096278767,
+    "embedded_warm_spread_ratio": 1.0278816353944469,
+    "environment_preconditions_verified": true,
+    "evidence_grade": "replicated-stable",
+    "median_paired_embedded_over_ollama_end_to_end_speedup": 1.1135962894649516,
+    "median_paired_embedded_over_ollama_speedup": 1.0853773316280384,
+    "ollama_cold_warm_content_stable": false,
+    "ollama_warm_median_end_to_end_tokens_per_second": 28.961495634987863,
+    "ollama_warm_median_first_delta_milliseconds": 188.281416,
+    "ollama_warm_median_tokens_per_second": 30.01385008727628,
+    "ollama_warm_spread_ratio": 1.0043543771279866,
+    "paired_embedded_over_ollama_end_to_end_speedups": [
+      1.1429730652429355,
+      1.109036050424774,
+      1.1135962894649516
+    ],
+    "paired_embedded_over_ollama_speedups": [
+      1.1145493640497446,
+      1.0811484492236147,
+      1.0853773316280384
+    ],
+    "residency_isolation_verified": true
+  },
+  "samples": [
+    {
+      "engine": "embedded",
+      "environment_after": {
+        "cpu_idle_percent": 94.14,
+        "gpu_device_utilization_percent": 95,
+        "gpu_in_use_system_memory_bytes": 643547136,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          2.57080078125,
+          2.58837890625,
+          2.55810546875
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 18.3,
+            "pid": 75770,
+            "resident_mib": 19.421875
+          },
+          {
+            "command": "/Library/PrivilegedHelperTools/com.nordvpn.macos.helper",
+            "cpu_percent": 9.3,
+            "pid": 580,
+            "resident_mib": 20.234375
+          },
+          {
+            "command": "/Applications/Alacritty.app/Contents/MacOS/alacritty",
+            "cpu_percent": 7.8,
+            "pid": 96186,
+            "resident_mib": 45.75
+          }
+        ]
+      },
+      "environment_before": {
+        "cpu_idle_percent": 94.5,
+        "gpu_device_utilization_percent": 1,
+        "gpu_in_use_system_memory_bytes": 678854656,
+        "gpu_renderer_utilization_percent": 1,
+        "gpu_tiler_utilization_percent": 1,
+        "load_average": [
+          2.4326171875,
+          2.5673828125,
+          2.55078125
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 21.7,
+            "pid": 75770,
+            "resident_mib": 18.78125
+          },
+          {
+            "command": "/Applications/Alacritty.app/Contents/MacOS/alacritty",
+            "cpu_percent": 7.8,
+            "pid": 96186,
+            "resident_mib": 45.75
+          },
+          {
+            "command": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "cpu_percent": 5.7,
+            "pid": 412,
+            "resident_mib": 130.21875
+          }
+        ]
+      },
+      "order_position": 1,
+      "replica": 1,
+      "result": {
+        "cold": {
+          "approximate_post_first_delta_tokens_per_second": 31.11389489279196,
+          "cache_read_input_tokens": null,
+          "content_sha256": "d2124f21180b9fe2c06febfec3b647561c02a9267e2326e604470db011dd561d",
+          "end_to_end_output_tokens_per_second": 22.80414459983381,
+          "first_delta_milliseconds": 1531.237125,
+          "input_tokens": 107,
+          "ollama_server": null,
+          "output_tokens": 128,
+          "reasoning_bytes": 707,
+          "stop_reason": "MaxTokens",
+          "text_bytes": 0,
+          "total_milliseconds": 5613.014749999999
+        },
+        "cold_warm_content_match": true,
+        "model_load_milliseconds": 2623.1741250000005,
+        "shutdown_milliseconds": 10.371084,
+        "warm": {
+          "approximate_post_first_delta_tokens_per_second": 33.45191752745815,
+          "cache_read_input_tokens": 106,
+          "content_sha256": "d2124f21180b9fe2c06febfec3b647561c02a9267e2326e604470db011dd561d",
+          "end_to_end_output_tokens_per_second": 33.10220943994197,
+          "first_delta_milliseconds": 70.31750000000001,
+          "input_tokens": 1,
+          "ollama_server": null,
+          "output_tokens": 128,
+          "reasoning_bytes": 707,
+          "stop_reason": "MaxTokens",
+          "text_bytes": 0,
+          "total_milliseconds": 3866.811375
+        }
+      }
+    },
+    {
+      "engine": "ollama",
+      "environment_after": {
+        "cpu_idle_percent": 94.54,
+        "gpu_device_utilization_percent": 98,
+        "gpu_in_use_system_memory_bytes": 642760704,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          2.62255859375,
+          2.59765625,
+          2.56201171875
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 16.9,
+            "pid": 75770,
+            "resident_mib": 19.75
+          },
+          {
+            "command": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "cpu_percent": 6.9,
+            "pid": 412,
+            "resident_mib": 129.21875
+          },
+          {
+            "command": "/Applications/Alacritty.app/Contents/MacOS/alacritty",
+            "cpu_percent": 6.8,
+            "pid": 96186,
+            "resident_mib": 45.75
+          }
+        ]
+      },
+      "environment_before": {
+        "cpu_idle_percent": 93.4,
+        "gpu_device_utilization_percent": 1,
+        "gpu_in_use_system_memory_bytes": 821968896,
+        "gpu_renderer_utilization_percent": 1,
+        "gpu_tiler_utilization_percent": 1,
+        "load_average": [
+          2.44482421875,
+          2.5615234375,
+          2.548828125
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "cpu_percent": 16.9,
+            "pid": 9194,
+            "resident_mib": 100.03125
+          },
+          {
+            "command": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "cpu_percent": 12.9,
+            "pid": 412,
+            "resident_mib": 129.828125
+          },
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 12.7,
+            "pid": 75770,
+            "resident_mib": 19.0
+          }
+        ]
+      },
+      "order_position": 2,
+      "replica": 1,
+      "result": {
+        "cold": {
+          "approximate_post_first_delta_tokens_per_second": 28.07213662111554,
+          "cache_read_input_tokens": null,
+          "content_sha256": "2fe91be32df5463ffd2dbcfc3d68e4265ceba6e6bd3b93dfe17a9530b5ea59ac",
+          "end_to_end_output_tokens_per_second": 16.295060257509693,
+          "first_delta_milliseconds": 3331.082333,
+          "input_tokens": 107,
+          "ollama_server": {
+            "decode_tokens_per_second": 27.473806810107252,
+            "eval_count": 128,
+            "eval_milliseconds": 4658.983041,
+            "load_milliseconds": 2139.97325,
+            "prompt_eval_count": 107,
+            "prompt_eval_milliseconds": 1055.216542,
+            "total_milliseconds": 7854.739208
+          },
+          "output_tokens": 128,
+          "reasoning_bytes": 713,
+          "stop_reason": "length",
+          "text_bytes": 0,
+          "total_milliseconds": 7855.14125
+        },
+        "cold_warm_content_match": false,
+        "model_load_milliseconds": 2139.97325,
+        "shutdown_milliseconds": null,
+        "warm": {
+          "approximate_post_first_delta_tokens_per_second": 30.01385008727628,
+          "cache_read_input_tokens": null,
+          "content_sha256": "e034c005dbf86f671bd5fe157af60bbfb511488c0b5cc82b5773921233f8e3e8",
+          "end_to_end_output_tokens_per_second": 28.961495634987863,
+          "first_delta_milliseconds": 188.281416,
+          "input_tokens": 107,
+          "ollama_server": {
+            "decode_tokens_per_second": 29.685045721082513,
+            "eval_count": 128,
+            "eval_milliseconds": 4311.935417,
+            "load_milliseconds": 28.277791,
+            "prompt_eval_count": 107,
+            "prompt_eval_milliseconds": 78.396125,
+            "total_milliseconds": 4419.071166
+          },
+          "output_tokens": 128,
+          "reasoning_bytes": 709,
+          "stop_reason": "length",
+          "text_bytes": 0,
+          "total_milliseconds": 4419.66125
+        }
+      }
+    },
+    {
+      "engine": "ollama",
+      "environment_after": {
+        "cpu_idle_percent": 92.77,
+        "gpu_device_utilization_percent": 98,
+        "gpu_in_use_system_memory_bytes": 399196160,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          2.6201171875,
+          2.6044921875,
+          2.56591796875
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder",
+            "cpu_percent": 15.4,
+            "pid": 735,
+            "resident_mib": 30.984375
+          },
+          {
+            "command": "/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService",
+            "cpu_percent": 11.9,
+            "pid": 52307,
+            "resident_mib": 22.515625
+          },
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 11.0,
+            "pid": 75770,
+            "resident_mib": 19.671875
+          }
+        ]
+      },
+      "environment_before": {
+        "cpu_idle_percent": 94.98,
+        "gpu_device_utilization_percent": 0,
+        "gpu_in_use_system_memory_bytes": 181911552,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          2.892578125,
+          2.65380859375,
+          2.58203125
+        ],
+        "memory_free_percent": 92.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 22.3,
+            "pid": 75770,
+            "resident_mib": 19.0625
+          },
+          {
+            "command": "/Applications/Alacritty.app/Contents/MacOS/alacritty",
+            "cpu_percent": 5.1,
+            "pid": 96186,
+            "resident_mib": 45.75
+          },
+          {
+            "command": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "cpu_percent": 4.9,
+            "pid": 412,
+            "resident_mib": 129.65625
+          }
+        ]
+      },
+      "order_position": 1,
+      "replica": 2,
+      "result": {
+        "cold": {
+          "approximate_post_first_delta_tokens_per_second": 28.049076575247003,
+          "cache_read_input_tokens": null,
+          "content_sha256": "2fe91be32df5463ffd2dbcfc3d68e4265ceba6e6bd3b93dfe17a9530b5ea59ac",
+          "end_to_end_output_tokens_per_second": 17.188577320521073,
+          "first_delta_milliseconds": 2919.027667,
+          "input_tokens": 107,
+          "ollama_server": {
+            "decode_tokens_per_second": 27.45233976238177,
+            "eval_count": 128,
+            "eval_milliseconds": 4662.62625,
+            "load_milliseconds": 1742.240292,
+            "prompt_eval_count": 107,
+            "prompt_eval_milliseconds": 1041.061,
+            "total_milliseconds": 7446.467917
+          },
+          "output_tokens": 128,
+          "reasoning_bytes": 713,
+          "stop_reason": "length",
+          "text_bytes": 0,
+          "total_milliseconds": 7446.805958
+        },
+        "cold_warm_content_match": false,
+        "model_load_milliseconds": 1742.240292,
+        "shutdown_milliseconds": null,
+        "warm": {
+          "approximate_post_first_delta_tokens_per_second": 30.1150882528376,
+          "cache_read_input_tokens": null,
+          "content_sha256": "e034c005dbf86f671bd5fe157af60bbfb511488c0b5cc82b5773921233f8e3e8",
+          "end_to_end_output_tokens_per_second": 29.06029451314852,
+          "first_delta_milliseconds": 187.480167,
+          "input_tokens": 107,
+          "ollama_server": {
+            "decode_tokens_per_second": 29.787630773589715,
+            "eval_count": 128,
+            "eval_milliseconds": 4297.085625,
+            "load_milliseconds": 27.679083,
+            "prompt_eval_count": 107,
+            "prompt_eval_milliseconds": 78.208708,
+            "total_milliseconds": 4403.456333
+          },
+          "output_tokens": 128,
+          "reasoning_bytes": 709,
+          "stop_reason": "length",
+          "text_bytes": 0,
+          "total_milliseconds": 4404.635333
+        }
+      }
+    },
+    {
+      "engine": "embedded",
+      "environment_after": {
+        "cpu_idle_percent": 86.84,
+        "gpu_device_utilization_percent": 95,
+        "gpu_in_use_system_memory_bytes": 552468480,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          3.046875,
+          2.70849609375,
+          2.60400390625
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/Users/samuelschlesinger/.local/bin/claude",
+            "cpu_percent": 35.1,
+            "pid": 43782,
+            "resident_mib": 284.15625
+          },
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 27.0,
+            "pid": 75770,
+            "resident_mib": 19.34375
+          },
+          {
+            "command": "/usr/libexec/sysmond",
+            "cpu_percent": 13.9,
+            "pid": 1209,
+            "resident_mib": 2.984375
+          }
+        ]
+      },
+      "environment_before": {
+        "cpu_idle_percent": 89.43,
+        "gpu_device_utilization_percent": 0,
+        "gpu_in_use_system_memory_bytes": 580796416,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          2.490234375,
+          2.57763671875,
+          2.556640625
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine",
+            "cpu_percent": 70.7,
+            "pid": 54117,
+            "resident_mib": 660.15625
+          },
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 10.4,
+            "pid": 75770,
+            "resident_mib": 19.46875
+          },
+          {
+            "command": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "cpu_percent": 8.6,
+            "pid": 412,
+            "resident_mib": 129.796875
+          }
+        ]
+      },
+      "order_position": 2,
+      "replica": 2,
+      "result": {
+        "cold": {
+          "approximate_post_first_delta_tokens_per_second": 31.975804811878284,
+          "cache_read_input_tokens": null,
+          "content_sha256": "d2124f21180b9fe2c06febfec3b647561c02a9267e2326e604470db011dd561d",
+          "end_to_end_output_tokens_per_second": 24.87546658808222,
+          "first_delta_milliseconds": 1173.879084,
+          "input_tokens": 107,
+          "ollama_server": null,
+          "output_tokens": 128,
+          "reasoning_bytes": 707,
+          "stop_reason": "MaxTokens",
+          "text_bytes": 0,
+          "total_milliseconds": 5145.632125
+        },
+        "cold_warm_content_match": true,
+        "model_load_milliseconds": 1816.4985420000005,
+        "shutdown_milliseconds": 11.1025,
+        "warm": {
+          "approximate_post_first_delta_tokens_per_second": 32.55888096278767,
+          "cache_read_input_tokens": 106,
+          "content_sha256": "d2124f21180b9fe2c06febfec3b647561c02a9267e2326e604470db011dd561d",
+          "end_to_end_output_tokens_per_second": 32.228914251042966,
+          "first_delta_milliseconds": 70.9635,
+          "input_tokens": 1,
+          "ollama_server": null,
+          "output_tokens": 128,
+          "reasoning_bytes": 707,
+          "stop_reason": "MaxTokens",
+          "text_bytes": 0,
+          "total_milliseconds": 3971.588959
+        }
+      }
+    },
+    {
+      "engine": "embedded",
+      "environment_after": {
+        "cpu_idle_percent": 93.58,
+        "gpu_device_utilization_percent": 95,
+        "gpu_in_use_system_memory_bytes": 643448832,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          2.99609375,
+          2.724609375,
+          2.61181640625
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 24.5,
+            "pid": 75770,
+            "resident_mib": 19.421875
+          },
+          {
+            "command": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "cpu_percent": 7.6,
+            "pid": 412,
+            "resident_mib": 129.75
+          },
+          {
+            "command": "/Applications/Alacritty.app/Contents/MacOS/alacritty",
+            "cpu_percent": 7.5,
+            "pid": 96186,
+            "resident_mib": 45.765625
+          }
+        ]
+      },
+      "environment_before": {
+        "cpu_idle_percent": 94.0,
+        "gpu_device_utilization_percent": 0,
+        "gpu_in_use_system_memory_bytes": 158957568,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          3.123046875,
+          2.7294921875,
+          2.61181640625
+        ],
+        "memory_free_percent": 92.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 14.0,
+            "pid": 75770,
+            "resident_mib": 19.296875
+          },
+          {
+            "command": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "cpu_percent": 7.9,
+            "pid": 412,
+            "resident_mib": 129.875
+          },
+          {
+            "command": "/Applications/Alacritty.app/Contents/MacOS/alacritty",
+            "cpu_percent": 7.1,
+            "pid": 96186,
+            "resident_mib": 45.765625
+          }
+        ]
+      },
+      "order_position": 1,
+      "replica": 3,
+      "result": {
+        "cold": {
+          "approximate_post_first_delta_tokens_per_second": 30.709741732496283,
+          "cache_read_input_tokens": null,
+          "content_sha256": "d2124f21180b9fe2c06febfec3b647561c02a9267e2326e604470db011dd561d",
+          "end_to_end_output_tokens_per_second": 23.686261588077407,
+          "first_delta_milliseconds": 1268.480917,
+          "input_tokens": 107,
+          "ollama_server": null,
+          "output_tokens": 128,
+          "reasoning_bytes": 707,
+          "stop_reason": "MaxTokens",
+          "text_bytes": 0,
+          "total_milliseconds": 5403.976458
+        },
+        "cold_warm_content_match": true,
+        "model_load_milliseconds": 2897.570417,
+        "shutdown_milliseconds": 12.916458,
+        "warm": {
+          "approximate_post_first_delta_tokens_per_second": 32.544523003002254,
+          "cache_read_input_tokens": 106,
+          "content_sha256": "d2124f21180b9fe2c06febfec3b647561c02a9267e2326e604470db011dd561d",
+          "end_to_end_output_tokens_per_second": 32.218245387434315,
+          "first_delta_milliseconds": 70.55779199999999,
+          "input_tokens": 1,
+          "ollama_server": null,
+          "output_tokens": 128,
+          "reasoning_bytes": 707,
+          "stop_reason": "MaxTokens",
+          "text_bytes": 0,
+          "total_milliseconds": 3972.904125
+        }
+      }
+    },
+    {
+      "engine": "ollama",
+      "environment_after": {
+        "cpu_idle_percent": 91.72,
+        "gpu_device_utilization_percent": 100,
+        "gpu_in_use_system_memory_bytes": 816513024,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          2.7177734375,
+          2.67724609375,
+          2.59619140625
+        ],
+        "memory_free_percent": 91.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/sbin/launchd",
+            "cpu_percent": 44.8,
+            "pid": 1,
+            "resident_mib": 19.4375
+          },
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 33.4,
+            "pid": 75770,
+            "resident_mib": 19.65625
+          },
+          {
+            "command": "/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "cpu_percent": 13.5,
+            "pid": 9194,
+            "resident_mib": 100.71875
+          }
+        ]
+      },
+      "environment_before": {
+        "cpu_idle_percent": 89.88,
+        "gpu_device_utilization_percent": 0,
+        "gpu_in_use_system_memory_bytes": 978272256,
+        "gpu_renderer_utilization_percent": 0,
+        "gpu_tiler_utilization_percent": 0,
+        "load_average": [
+          2.8359375,
+          2.69580078125,
+          2.60205078125
+        ],
+        "memory_free_percent": 90.0,
+        "observation_errors": [],
+        "top_processes": [
+          {
+            "command": "/usr/libexec/spotlightknowledged.updater",
+            "cpu_percent": 23.6,
+            "pid": 75770,
+            "resident_mib": 19.53125
+          },
+          {
+            "command": "/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor",
+            "cpu_percent": 23.4,
+            "pid": 9194,
+            "resident_mib": 100.40625
+          },
+          {
+            "command": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "cpu_percent": 15.7,
+            "pid": 412,
+            "resident_mib": 129.78125
+          }
+        ]
+      },
+      "order_position": 2,
+      "replica": 3,
+      "result": {
+        "cold": {
+          "approximate_post_first_delta_tokens_per_second": 28.011569251871503,
+          "cache_read_input_tokens": null,
+          "content_sha256": "2fe91be32df5463ffd2dbcfc3d68e4265ceba6e6bd3b93dfe17a9530b5ea59ac",
+          "end_to_end_output_tokens_per_second": 12.739338084885624,
+          "first_delta_milliseconds": 5513.776833,
+          "input_tokens": 107,
+          "ollama_server": {
+            "decode_tokens_per_second": 27.410742451820013,
+            "eval_count": 128,
+            "eval_milliseconds": 4669.702042,
+            "load_milliseconds": 4339.288375,
+            "prompt_eval_count": 107,
+            "prompt_eval_milliseconds": 1037.787584,
+            "total_milliseconds": 10047.352542
+          },
+          "output_tokens": 128,
+          "reasoning_bytes": 713,
+          "stop_reason": "length",
+          "text_bytes": 0,
+          "total_milliseconds": 10047.617792
+        },
+        "cold_warm_content_match": false,
+        "model_load_milliseconds": 4339.288375,
+        "shutdown_milliseconds": null,
+        "warm": {
+          "approximate_post_first_delta_tokens_per_second": 29.984524325919264,
+          "cache_read_input_tokens": null,
+          "content_sha256": "e034c005dbf86f671bd5fe157af60bbfb511488c0b5cc82b5773921233f8e3e8",
+          "end_to_end_output_tokens_per_second": 28.931710434231224,
+          "first_delta_milliseconds": 188.693042,
+          "input_tokens": 107,
+          "ollama_server": {
+            "decode_tokens_per_second": 29.65610473956973,
+            "eval_count": 128,
+            "eval_milliseconds": 4316.143375,
+            "load_milliseconds": 28.727917,
+            "prompt_eval_count": 107,
+            "prompt_eval_milliseconds": 78.337292,
+            "total_milliseconds": 4423.689459
+          },
+          "output_tokens": 128,
+          "reasoning_bytes": 709,
+          "stop_reason": "length",
+          "text_bytes": 0,
+          "total_milliseconds": 4424.211292
+        }
+      }
+    }
+  ]
+}

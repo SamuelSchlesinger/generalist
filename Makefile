@@ -1,13 +1,13 @@
 SHELL := /bin/sh
 
-.PHONY: check lint test fmt format-staged clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks memory-evaluation hooks-check tla conformance setup hooks tla-tools doctor
+.PHONY: check lint test fmt format-staged clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks memory-evaluation hooks-check tla conformance embedded install-embedded setup hooks tla-tools doctor
 
 check: lint test
 
 lint: fmt clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks hooks-check tla
 
 test:
-	cargo test --all-targets --all-features --locked
+	GENERALIST_MLX_ALLOW_STUB=1 cargo test --all-targets --all-features --locked
 
 fmt:
 	cargo fmt --all -- --check
@@ -20,13 +20,13 @@ format-staged:
 	@python3 scripts/format_staged_rust.py
 
 clippy:
-	cargo clippy --all-targets --all-features --locked -- -D warnings
+	GENERALIST_MLX_ALLOW_STUB=1 cargo clippy --all-targets --all-features --locked -- -D warnings
 
 docs:
-	RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps --locked
+	GENERALIST_MLX_ALLOW_STUB=1 RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps --locked
 
 shellcheck:
-	shellcheck .githooks/pre-commit .githooks/pre-push scripts/*.sh
+	shellcheck .githooks/pre-commit .githooks/pre-push scripts/*.sh native/mlx/build_static_probe.sh
 
 profile-paths:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_profile_paths.py
@@ -41,6 +41,8 @@ memory-research:
 
 agent-benchmarks:
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks/agent_transport -p 'test_*.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks/local_reasoning -p 'test_*.py'
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks/embedded_inference -p 'test_*.py'
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks/episodic_memory -p 'test_*.py'
 
 memory-evaluation:
@@ -50,6 +52,7 @@ hooks-check:
 	test -x .githooks/pre-commit
 	test -x .githooks/pre-push
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_format_staged_rust.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_build_embedded.py
 
 tla:
 	./scripts/check-tla.sh
@@ -57,6 +60,12 @@ tla:
 
 conformance:
 	./scripts/check-model-conformance.sh
+
+embedded:
+	./scripts/build-embedded.sh
+
+install-embedded:
+	./scripts/build-embedded.sh --install
 
 setup: tla-tools hooks
 

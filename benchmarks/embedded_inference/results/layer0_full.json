@@ -1,0 +1,263 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-token42-layer0-full-zero-state",
+  "recorded_at": "2026-08-31T07:10:47Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "gdn_checkpoint": "qwen3.8-27b-mlx-token42-layer0-gdn-zero-state",
+    "gdn_norm_name": "model.language_model.layers.0.linear_attn.norm.weight",
+    "gdn_norm_sha256": "67fa17d8b32a162fcd25915b992b12e4f9ef13e27688f3e7eaf8b4b015ef5bb0",
+    "out_proj_name": "model.language_model.layers.0.linear_attn.out_proj.weight",
+    "out_proj_sha256": "59c209ae9abe955f8cf53077fadb32f51fb0c3f01eb5c35107aaa6d7c7510092",
+    "post_norm_name": "model.language_model.layers.0.post_attention_layernorm.weight",
+    "post_norm_sha256": "75334b4d224181aac9d49eee9a8dc67d41e98257444345438e5104d11905e764",
+    "mlp_gate_name": "model.language_model.layers.0.mlp.gate_proj.weight",
+    "mlp_gate_sha256": "e4d9195fe596ae73298ee3f117efc4531736615ac2c5bbf56a10be113f426d4f",
+    "mlp_up_name": "model.language_model.layers.0.mlp.up_proj.weight",
+    "mlp_up_sha256": "b395a556ecd80a93b34c318ca0672c1c5758e0bfd5f16dca96954430f1272804",
+    "mlp_down_name": "model.language_model.layers.0.mlp.down_proj.weight",
+    "mlp_down_sha256": "8c253369366a35c08b668cdac4d517ebfd67d3bf9997311a582b340f3025bc7d"
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399"
+  },
+  "operation": {
+    "token_id": 42,
+    "hidden_width": 5120,
+    "gdn_width": 6144,
+    "mlp_width": 17408,
+    "input_dtype": 12,
+    "output_dtype": 12,
+    "epsilon": "0.000001",
+    "shift_post_norm_weight_by_one": true,
+    "initial_recurrent_state": "zero",
+    "fingerprint": "fnv1a64-little-endian-f32"
+  },
+  "generalist": {
+    "gdn_norm": {
+      "dtype": 12,
+      "elements": 6144,
+      "sum": "431.927005980106",
+      "squared_sum": "2997.930138839299",
+      "first": "0.000339508",
+      "middle": "-0.008422852",
+      "last": "-0.000017881",
+      "fingerprint": "14c4161b281aa0a8"
+    },
+    "gated": {
+      "dtype": 12,
+      "elements": 6144,
+      "sum": "-12.075587945325",
+      "squared_sum": "20.472197596356",
+      "first": "0.000026822",
+      "middle": "0.001739502",
+      "last": "-0.000040054",
+      "fingerprint": "9eb6372dfa4a0bb2"
+    },
+    "attention_out": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "8.191057562828",
+      "squared_sum": "180.894947724019",
+      "first": "-0.023681641",
+      "middle": "-0.205078125",
+      "last": "-0.012512207",
+      "fingerprint": "2d78b952faf6361a"
+    },
+    "after_attention": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "6.662610054016",
+      "squared_sum": "181.898258167273",
+      "first": "-0.049316406",
+      "middle": "-0.226562500",
+      "last": "-0.003784180",
+      "fingerprint": "2a87bdffc0e5b68f"
+    },
+    "post_norm": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "-24.562760829926",
+      "squared_sum": "102.384076969144",
+      "first": "-0.183593750",
+      "middle": "-0.863281250",
+      "last": "-0.015625000",
+      "fingerprint": "155e641e7204e83d"
+    },
+    "mlp_gate": {
+      "dtype": 12,
+      "elements": 17408,
+      "sum": "-740.574639618397",
+      "squared_sum": "358.165694275196",
+      "first": "-0.189453125",
+      "middle": "0.018554688",
+      "last": "-0.267578125",
+      "fingerprint": "b83e2be7b102c33b"
+    },
+    "mlp_up": {
+      "dtype": 12,
+      "elements": 17408,
+      "sum": "-1.242167830467",
+      "squared_sum": "301.531939496563",
+      "first": "0.412109375",
+      "middle": "-0.096191406",
+      "last": "0.042480469",
+      "fingerprint": "af763d5e5b01e641"
+    },
+    "swiglu": {
+      "dtype": 12,
+      "elements": 17408,
+      "sum": "-0.955158294004",
+      "squared_sum": "4.250078919703",
+      "first": "-0.035156250",
+      "middle": "-0.000896454",
+      "last": "-0.004913330",
+      "fingerprint": "243936488508a49a"
+    },
+    "mlp_out": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "0.441857308149",
+      "squared_sum": "25.842376810108",
+      "first": "-0.014160156",
+      "middle": "-0.201171875",
+      "last": "-0.060302734",
+      "fingerprint": "e1665e7b9702c1e2"
+    },
+    "layer_out": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "7.044911623001",
+      "squared_sum": "330.793975903749",
+      "first": "-0.063476562",
+      "middle": "-0.427734375",
+      "last": "-0.063964844",
+      "fingerprint": "d228f552e37edd05"
+    }
+  },
+  "ollama": {
+    "gdn_norm": {
+      "dtype": 12,
+      "elements": 6144,
+      "sum": "431.927005980106",
+      "squared_sum": "2997.930138839299",
+      "first": "0.000339508",
+      "middle": "-0.008422852",
+      "last": "-0.000017881",
+      "fingerprint": "14c4161b281aa0a8"
+    },
+    "gated": {
+      "dtype": 12,
+      "elements": 6144,
+      "sum": "-12.075587945325",
+      "squared_sum": "20.472197596356",
+      "first": "0.000026822",
+      "middle": "0.001739502",
+      "last": "-0.000040054",
+      "fingerprint": "9eb6372dfa4a0bb2"
+    },
+    "attention_out": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "8.191057562828",
+      "squared_sum": "180.894947724019",
+      "first": "-0.023681641",
+      "middle": "-0.205078125",
+      "last": "-0.012512207",
+      "fingerprint": "2d78b952faf6361a"
+    },
+    "after_attention": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "6.662610054016",
+      "squared_sum": "181.898258167273",
+      "first": "-0.049316406",
+      "middle": "-0.226562500",
+      "last": "-0.003784180",
+      "fingerprint": "2a87bdffc0e5b68f"
+    },
+    "post_norm": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "-24.562760829926",
+      "squared_sum": "102.384076969144",
+      "first": "-0.183593750",
+      "middle": "-0.863281250",
+      "last": "-0.015625000",
+      "fingerprint": "155e641e7204e83d"
+    },
+    "mlp_gate": {
+      "dtype": 12,
+      "elements": 17408,
+      "sum": "-740.574639618397",
+      "squared_sum": "358.165694275196",
+      "first": "-0.189453125",
+      "middle": "0.018554688",
+      "last": "-0.267578125",
+      "fingerprint": "b83e2be7b102c33b"
+    },
+    "mlp_up": {
+      "dtype": 12,
+      "elements": 17408,
+      "sum": "-1.242167830467",
+      "squared_sum": "301.531939496563",
+      "first": "0.412109375",
+      "middle": "-0.096191406",
+      "last": "0.042480469",
+      "fingerprint": "af763d5e5b01e641"
+    },
+    "swiglu": {
+      "dtype": 12,
+      "elements": 17408,
+      "sum": "-0.955158294004",
+      "squared_sum": "4.250078919703",
+      "first": "-0.035156250",
+      "middle": "-0.000896454",
+      "last": "-0.004913330",
+      "fingerprint": "243936488508a49a"
+    },
+    "mlp_out": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "0.441857308149",
+      "squared_sum": "25.842376810108",
+      "first": "-0.014160156",
+      "middle": "-0.201171875",
+      "last": "-0.060302734",
+      "fingerprint": "e1665e7b9702c1e2"
+    },
+    "layer_out": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "7.044911623001",
+      "squared_sum": "330.793975903749",
+      "first": "-0.063476562",
+      "middle": "-0.427734375",
+      "last": "-0.063964844",
+      "fingerprint": "d228f552e37edd05"
+    }
+  },
+  "comparison": {
+    "exact": true,
+    "stages": [
+      "gdn_norm",
+      "gated",
+      "attention_out",
+      "after_attention",
+      "post_norm",
+      "mlp_gate",
+      "mlp_up",
+      "swiglu",
+      "mlp_out",
+      "layer_out"
+    ]
+  },
+  "optimization_target": {
+    "baseline": "separate exact NVFP4 gate and up projections followed by BF16 SwiGLU",
+    "candidate": "prepack gate and up into one persistent NVFP4 launch while retaining the exact layer oracle"
+  }
+}

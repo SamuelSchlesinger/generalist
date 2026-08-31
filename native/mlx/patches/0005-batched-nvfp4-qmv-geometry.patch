@@ -1,0 +1,92 @@
+diff --git a/mlx/backend/metal/kernels/fp_quantized.metal b/mlx/backend/metal/kernels/fp_quantized.metal
+--- a/mlx/backend/metal/kernels/fp_quantized.metal
++++ b/mlx/backend/metal/kernels/fp_quantized.metal
+@@ -93,16 +93,16 @@
+       4, \
+       true)
+ 
+-#define instantiate_quantized_qmv_fast_r2_exact(mode, type, batched, group_size, bits) \
++#define instantiate_quantized_qmv_fast_r_exact(mode, type, results, batched, group_size, bits) \
+   instantiate_kernel( \
+-      #mode "_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_2_batch_" #batched "_hgs_exact", \
++      #mode "_qmv_fast_" #type "_gs_" #group_size "_b_" #bits "_r_" #results "_batch_" #batched "_hgs_exact", \
+       fp_qmv_fast, \
+       type, \
+       group_size, \
+       bits, \
+       batched, \
+       true, \
+-      2, \
++      results, \
+       true)
+ 
+ #define instantiate_quantized_quad(mode, name, type, D, batched, group_size, bits) \
+@@ -249,6 +249,10 @@
+ instantiate_quantized_qmv_exact(nvfp4, qmv_fast, bfloat16_t, 1, 16, 4)
+ instantiate_quantized_qmv_exact(nvfp4, qmv, bfloat16_t, 0, 16, 4)
+ instantiate_quantized_qmv_exact(nvfp4, qmv, bfloat16_t, 1, 16, 4)
+-instantiate_quantized_qmv_fast_r2_exact(nvfp4, bfloat16_t, 0, 16, 4)
+-instantiate_quantized_qmv_fast_r2_exact(nvfp4, bfloat16_t, 1, 16, 4)
++instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 1, 0, 16, 4)
++instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 1, 1, 16, 4)
++instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 2, 0, 16, 4)
++instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 2, 1, 16, 4)
++instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 8, 0, 16, 4)
++instantiate_quantized_qmv_fast_r_exact(nvfp4, bfloat16_t, 8, 1, 16, 4)
+     // clang-format on
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -485,12 +485,22 @@
+   std::string type_string = get_type_string(x.dtype());
+   bool fast = N % bn == 0 && K % qmv_fast_k_alignment(bits) == 0;
+   // A narrower output tile reduces register pressure for large
+-  // floating-point quantized matrix-vector products on M5 Max GPUs.
+-  bool use_narrow_qmv = fast && N >= 4096 && mode == "nvfp4" &&
+-      ((d.get_architecture_gen() == 17 &&
+-        d.get_architecture().back() == 's') ||
+-       qmv_results_per_simdgroup == 2);
+-  int results_per_simdgroup = use_narrow_qmv ? 2 : 4;
++  // floating-point quantized matrix-vector products. Generalist exposes the
++  // full exact 1/2/4/8 family for machine-specific geometry sweeps. The
++  // wrapper selects r2 for single-token decode and r4 for batched verification.
++  const bool large_nvfp4 = fast && N >= 4096 && mode == "nvfp4";
++  const bool architecture_narrow =
++      d.get_architecture_gen() == 17 && d.get_architecture().back() == 's';
++  int results_per_simdgroup = 4;
++  if (large_nvfp4 && qmv_results_per_simdgroup != 0) {
++    results_per_simdgroup = qmv_results_per_simdgroup;
++  } else if (large_nvfp4 && architecture_narrow) {
++    results_per_simdgroup = 2;
++  }
++  const std::string results_suffix =
++      results_per_simdgroup == 4
++          ? ""
++          : "_r_" + std::to_string(results_per_simdgroup);
+   bn = 2 * results_per_simdgroup;
+   MTL::Size group_dims(bk, 2, 1);
+   MTL::Size grid_dims(M, (N + bn - 1) / bn, B);
+@@ -503,7 +513,7 @@
+       group_size,
+       "_b_",
+       bits,
+-      use_narrow_qmv ? "_r_2" : "",
++      results_suffix,
+       B > 1 ? "_batch_1" : "_batch_0",
+       global_scale ? (exact_global_scale ? "_hgs_exact" : "_hgs") : "");
+   auto kernel = get_quantized_kernel_wrapped(
+@@ -1832,9 +1842,12 @@
+         "[quantized_matmul] exact global scale requires fused global-scale input.");
+   }
+   if (qmv_results_per_simdgroup_ != 0 &&
+-      qmv_results_per_simdgroup_ != 2) {
++      qmv_results_per_simdgroup_ != 1 &&
++      qmv_results_per_simdgroup_ != 2 &&
++      qmv_results_per_simdgroup_ != 4 &&
++      qmv_results_per_simdgroup_ != 8) {
+     throw std::invalid_argument(
+-        "[quantized_matmul] QMV geometry override must use two results per SIMD-group.");
++        "[quantized_matmul] QMV geometry override must use 1, 2, 4, or 8 results per SIMD-group.");
+   }
+ 
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;

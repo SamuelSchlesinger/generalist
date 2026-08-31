@@ -57,6 +57,8 @@ pub mod error;
 pub mod execution;
 pub mod goal;
 pub mod history;
+#[cfg(feature = "embedded-mlx")]
+pub(crate) mod local_inference;
 pub mod mcp;
 pub mod memory;
 pub mod model_trace;
@@ -74,7 +76,10 @@ pub mod tools;
 pub mod tui;
 pub mod types;
 
-pub use agent::{history_tool_protocol_is_valid, Agent, AgentEvent, TurnOutcome};
+pub use agent::{
+    history_tool_protocol_is_valid, Agent, AgentEvent, TurnOutcome,
+    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS, DEFAULT_COMPACTION_THRESHOLD_TOKENS,
+};
 pub use clipboard::{conversation_transcript, latest_assistant_reasoning, latest_assistant_text};
 pub use command::{
     complete_local_command, is_local_command, parse_local_command, CommandCompletion, CommandSpec,

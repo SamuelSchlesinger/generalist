@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "description": "Small, exact-answer reasoning tasks for local inference optimization.",
+  "tasks": [
+    {
+      "id": "crt_three_moduli",
+      "tags": ["smoke", "number_theory"],
+      "prompt": "Find the smallest nonnegative integer x satisfying x = 2 (mod 7), x = 3 (mod 11), and x = 5 (mod 13).",
+      "expected": "135"
+    },
+    {
+      "id": "reverse_four_digits",
+      "tags": ["smoke", "constraint"],
+      "prompt": "Find the four-digit positive integer x whose decimal digit reversal is exactly 4x. The first and last digits must both be nonzero.",
+      "expected": "2178"
+    },
+    {
+      "id": "recurrence_ten_steps",
+      "tags": ["smoke", "arithmetic"],
+      "prompt": "Let a_0 = 3 and a_(n+1) = 2*a_n + n. Compute a_10.",
+      "expected": "4085"
+    },
+    {
+      "id": "weighted_shortest_path",
+      "tags": ["graph", "planning"],
+      "prompt": "An undirected weighted graph has edges A-B=4, A-C=2, C-B=1, B-D=5, C-D=8, C-E=10, D-E=2, and B-E=7. What is the minimum total weight of a path from A to E?",
+      "expected": "10"
+    }
+  ]
+}

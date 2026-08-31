@@ -24,6 +24,9 @@ use crate::tool::ToolRegistry;
 use crate::types::{estimate_tokens, CompletionLimits, Message};
 use std::borrow::Cow;
 
+pub const DEFAULT_COMPACTION_THRESHOLD_TOKENS: u64 = 150_000;
+pub const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
+
 mod compaction;
 mod completion;
 mod dispatch;
@@ -104,8 +107,8 @@ impl Agent {
             max_tool_result_chars: 40_000,
             max_retries: 3,
             code_mode: true,
-            compaction_threshold_tokens: 150_000,
-            compaction_keep_recent_tokens: 20_000,
+            compaction_threshold_tokens: DEFAULT_COMPACTION_THRESHOLD_TOKENS,
+            compaction_keep_recent_tokens: DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
             last_context_tokens: None,
             history_revision: 0,
             estimated_tokens_cache: std::cell::Cell::new(None),

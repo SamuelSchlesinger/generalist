@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-token42-layer0-gdn-zero-state",
+  "recorded_at": "2026-08-31T07:03:01Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "projection_checkpoint": "qwen3.8-27b-mlx-token42-layer0-packed-projections",
+    "conv_name": "model.language_model.layers.0.linear_attn.conv1d.weight",
+    "conv_sha256": "f6ecbc300b887993a408385797542a58764830c053e121a3ef4370c572b583bf",
+    "dt_bias_name": "model.language_model.layers.0.linear_attn.dt_bias",
+    "dt_bias_sha256": "c8d1c5ce5f45749f47d82e757932c0935d485bebcd1f764a9ea9821a6cda6595",
+    "a_log_name": "model.language_model.layers.0.linear_attn.A_log",
+    "a_log_sha256": "25184debf86873a92c58e20716c7934fddd1e88ab556126719fcef7b025a7fac"
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399"
+  },
+  "operation": {
+    "token_id": 42,
+    "batch": 1,
+    "tokens": 1,
+    "conv_channels": 10240,
+    "conv_kernel_width": 4,
+    "key_heads": 16,
+    "key_dim": 128,
+    "value_heads": 48,
+    "value_dim": 128,
+    "input_dtype": 12,
+    "state_dtype": 10,
+    "epsilon": "0.000001",
+    "initial_conv_state": "zero",
+    "initial_delta_state": "zero",
+    "fingerprint": "fnv1a64-little-endian-f32"
+  },
+  "generalist": {
+    "conv_out": {
+      "dtype": 12,
+      "elements": 10240,
+      "sum": "490.798843879602",
+      "squared_sum": "3375.597018852431",
+      "first": "-0.010498047",
+      "middle": "-0.003555298",
+      "last": "-0.000051022",
+      "fingerprint": "248922385c902922"
+    },
+    "conv_state": {
+      "dtype": 12,
+      "elements": 30720,
+      "sum": "-396.359180450439",
+      "squared_sum": "200134.013254729914",
+      "first": "0.000000000",
+      "middle": "0.000000000",
+      "last": "-0.251953125",
+      "fingerprint": "e6eb7e3881d435ee"
+    },
+    "a_exp": {
+      "dtype": 10,
+      "elements": 48,
+      "sum": "2.308873828733",
+      "squared_sum": "0.259997863733",
+      "first": "0.040635023",
+      "middle": "0.003839167",
+      "last": "0.099013411",
+      "fingerprint": "5ece74fcb44ece90"
+    },
+    "gdn_out": {
+      "dtype": 12,
+      "elements": 6144,
+      "sum": "5.962054204460",
+      "squared_sum": "1.914461476897",
+      "first": "0.000000440",
+      "middle": "-0.000356674",
+      "last": "-0.000000021",
+      "fingerprint": "45f01e8c76462fbf"
+    },
+    "delta_state": {
+      "dtype": 10,
+      "elements": 786432,
+      "sum": "267.842395585814",
+      "squared_sum": "2206.977303572606",
+      "first": "-0.000000560",
+      "middle": "-0.000012288",
+      "last": "-0.000000023",
+      "fingerprint": "82661b044e701a2a"
+    }
+  },
+  "ollama": {
+    "conv_out": {
+      "dtype": 12,
+      "elements": 10240,
+      "sum": "490.798843879602",
+      "squared_sum": "3375.597018852431",
+      "first": "-0.010498047",
+      "middle": "-0.003555298",
+      "last": "-0.000051022",
+      "fingerprint": "248922385c902922"
+    },
+    "conv_state": {
+      "dtype": 12,
+      "elements": 30720,
+      "sum": "-396.359180450439",
+      "squared_sum": "200134.013254729914",
+      "first": "0.000000000",
+      "middle": "0.000000000",
+      "last": "-0.251953125",
+      "fingerprint": "e6eb7e3881d435ee"
+    },
+    "a_exp": {
+      "dtype": 10,
+      "elements": 48,
+      "sum": "2.308873828733",
+      "squared_sum": "0.259997863733",
+      "first": "0.040635023",
+      "middle": "0.003839167",
+      "last": "0.099013411",
+      "fingerprint": "5ece74fcb44ece90"
+    },
+    "gdn_out": {
+      "dtype": 12,
+      "elements": 6144,
+      "sum": "5.962054204460",
+      "squared_sum": "1.914461476897",
+      "first": "0.000000440",
+      "middle": "-0.000356674",
+      "last": "-0.000000021",
+      "fingerprint": "45f01e8c76462fbf"
+    },
+    "delta_state": {
+      "dtype": 10,
+      "elements": 786432,
+      "sum": "267.842395585814",
+      "squared_sum": "2206.977303572606",
+      "first": "-0.000000560",
+      "middle": "-0.000012288",
+      "last": "-0.000000023",
+      "fingerprint": "82661b044e701a2a"
+    }
+  },
+  "comparison": {
+    "exact": true,
+    "stages": ["conv_out", "conv_state", "a_exp", "gdn_out", "delta_state"]
+  },
+  "optimization_target": {
+    "baseline": "Generalist-owned Metal depthwise-conv-SiLU and one-token GDN kernels with Ollama-compatible rounding",
+    "candidate": "persist compiled pipelines and recurrent buffers, then tune launch geometry and state layout under this oracle"
+  }
+}

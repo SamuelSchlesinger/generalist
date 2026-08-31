@@ -1,0 +1,3 @@
+# Unified diffs encode context lines with a leading space. Treating the
+# stored patch itself as source would report those required markers as errors.
+*.patch -whitespace

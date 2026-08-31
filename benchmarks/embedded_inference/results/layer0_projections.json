@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-token42-layer0-packed-projections",
+  "recorded_at": "2026-08-31T06:53:41Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "embedding_name": "model.language_model.embed_tokens.weight",
+    "embedding_sha256": "10986d0f406a9fc981e29dc2bf90157ff505ddc74bdb19aef52a40d283247db6",
+    "norm_name": "model.language_model.layers.0.input_layernorm.weight",
+    "norm_sha256": "ee8700267f26047c63e54902301adeca2d8c0a26784c0242190f689f7ed06114",
+    "qkv_name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+    "qkv_sha256": "46256a4834040a6bc66a237a060f502e6e4e5a1f3bd7c1efaea11a31d9aa2452",
+    "z_name": "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+    "z_sha256": "7ea915fdeda36e280ffc257fc711a3850fee98642e661fda1c1db3532f15b626",
+    "beta_name": "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+    "beta_sha256": "c3e76e749ccaba35057fd75f9a5bd8d9944f4d710836c9b2017d2d58436c5e60",
+    "alpha_name": "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+    "alpha_sha256": "3d8de7e5da9969215a0bc202d658674851ddc7a61759b32a49fc28834f99c530"
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399"
+  },
+  "operation": {
+    "token_id": 42,
+    "input_width": 5120,
+    "qkv_width": 10240,
+    "z_width": 6144,
+    "ba_width": 96,
+    "input_dtype": 12,
+    "output_dtype": 12,
+    "weight_dtype": 3,
+    "scale_dtype": 1,
+    "group_size": 16,
+    "bits": 4,
+    "mode": "nvfp4",
+    "transpose_weight": true,
+    "epsilon": "0.000001",
+    "shift_norm_weight_by_one": true,
+    "qkv_global_scale": "0.000162760422",
+    "z_global_scale": "0.000162760422",
+    "fingerprint": "fnv1a64-little-endian-f32"
+  },
+  "generalist": {
+    "normalized_input": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "-97.883594393730",
+      "squared_sum": "5040.863182364837",
+      "first": "-1.851562500",
+      "middle": "-1.507812500",
+      "last": "0.542968750",
+      "fingerprint": "532fd92e242a53b7"
+    },
+    "raw_qkvz": {
+      "dtype": 12,
+      "elements": 16384,
+      "sum": "-44939736.578125000000",
+      "squared_sum": "9446612228506.912109375000",
+      "first": "1688.000000000",
+      "middle": "8576.000000000",
+      "last": "14976.000000000",
+      "fingerprint": "bbf43ae7fcdfaf86"
+    },
+    "mixed_qkvz": {
+      "dtype": 12,
+      "elements": 16384,
+      "sum": "-7313.001100540161",
+      "squared_sum": "250255.279606075375",
+      "first": "0.275390625",
+      "middle": "1.398437500",
+      "last": "2.437500000",
+      "fingerprint": "6e85bd2229186beb"
+    },
+    "mixed_ba": {
+      "dtype": 12,
+      "elements": 96,
+      "sum": "69.155761718750",
+      "squared_sum": "767.991014719009",
+      "first": "-2.390625000",
+      "middle": "-1.765625000",
+      "last": "0.800781250",
+      "fingerprint": "1d07f87fb2b3e7f5"
+    }
+  },
+  "ollama": {
+    "normalized_input": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "-97.883594393730",
+      "squared_sum": "5040.863182364837",
+      "first": "-1.851562500",
+      "middle": "-1.507812500",
+      "last": "0.542968750",
+      "fingerprint": "532fd92e242a53b7"
+    },
+    "raw_qkvz": {
+      "dtype": 12,
+      "elements": 16384,
+      "sum": "-44939736.578125000000",
+      "squared_sum": "9446612228506.912109375000",
+      "first": "1688.000000000",
+      "middle": "8576.000000000",
+      "last": "14976.000000000",
+      "fingerprint": "bbf43ae7fcdfaf86"
+    },
+    "mixed_qkvz": {
+      "dtype": 12,
+      "elements": 16384,
+      "sum": "-7313.001100540161",
+      "squared_sum": "250255.279606075375",
+      "first": "0.275390625",
+      "middle": "1.398437500",
+      "last": "2.437500000",
+      "fingerprint": "6e85bd2229186beb"
+    },
+    "mixed_ba": {
+      "dtype": 12,
+      "elements": 96,
+      "sum": "69.155761718750",
+      "squared_sum": "767.991014719009",
+      "first": "-2.390625000",
+      "middle": "-1.765625000",
+      "last": "0.800781250",
+      "fingerprint": "1d07f87fb2b3e7f5"
+    }
+  },
+  "comparison": {
+    "exact": true,
+    "stages": ["normalized_input", "raw_qkvz", "mixed_qkvz", "mixed_ba"]
+  },
+  "optimization_target": {
+    "baseline": "Ollama split-projection packing with one QKVZ NVFP4 matmul and one beta/alpha BF16 matmul",
+    "candidate": "prepack persistent arrays once at model load and fuse global scaling only after the exact decode baseline exists"
+  }
+}

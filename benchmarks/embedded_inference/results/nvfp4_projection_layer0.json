@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-token42-layer0-in-proj-qkv-nvfp4",
+  "recorded_at": "2026-08-31T06:35:26Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "embedding_name": "model.language_model.embed_tokens.weight",
+    "embedding_sha256": "10986d0f406a9fc981e29dc2bf90157ff505ddc74bdb19aef52a40d283247db6",
+    "norm_name": "model.language_model.layers.0.input_layernorm.weight",
+    "norm_sha256": "ee8700267f26047c63e54902301adeca2d8c0a26784c0242190f689f7ed06114",
+    "weight_name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+    "scale_name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight.scale",
+    "global_scale_name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight.global_scale",
+    "projection_sha256": "46256a4834040a6bc66a237a060f502e6e4e5a1f3bd7c1efaea11a31d9aa2452"
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399"
+  },
+  "operation": {
+    "token_id": 42,
+    "input_width": 5120,
+    "output_width": 10240,
+    "input_dtype": 12,
+    "output_dtype": 12,
+    "weight_dtype": 3,
+    "scale_dtype": 1,
+    "global_scale_dtype": 10,
+    "group_size": 16,
+    "bits": 4,
+    "mode": "nvfp4",
+    "transpose_weight": true,
+    "epsilon": "0.000001",
+    "shift_norm_weight_by_one": true,
+    "global_scale": "0.000162760422",
+    "fingerprint": "fnv1a64-little-endian-f32"
+  },
+  "generalist": {
+    "normalized_input": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "-97.883594393730",
+      "squared_sum": "5040.863182364837",
+      "first": "-1.851562500",
+      "middle": "-1.507812500",
+      "last": "0.542968750",
+      "fingerprint": "532fd92e242a53b7"
+    },
+    "raw_projection": {
+      "dtype": 12,
+      "elements": 10240,
+      "sum": "-2443264.531250000000",
+      "squared_sum": "7554840165757.656250000000",
+      "first": "1688.000000000",
+      "middle": "26368.000000000",
+      "last": "-1544.000000000",
+      "fingerprint": "cd0d43bd6989de79"
+    },
+    "output": {
+      "dtype": 12,
+      "elements": 10240,
+      "sum": "-396.359180450439",
+      "squared_sum": "200134.013254729914",
+      "first": "0.275390625",
+      "middle": "4.281250000",
+      "last": "-0.251953125",
+      "fingerprint": "8a833d11b88535ee"
+    }
+  },
+  "ollama": {
+    "normalized_input": {
+      "dtype": 12,
+      "elements": 5120,
+      "sum": "-97.883594393730",
+      "squared_sum": "5040.863182364837",
+      "first": "-1.851562500",
+      "middle": "-1.507812500",
+      "last": "0.542968750",
+      "fingerprint": "532fd92e242a53b7"
+    },
+    "raw_projection": {
+      "dtype": 12,
+      "elements": 10240,
+      "sum": "-2443264.531250000000",
+      "squared_sum": "7554840165757.656250000000",
+      "first": "1688.000000000",
+      "middle": "26368.000000000",
+      "last": "-1544.000000000",
+      "fingerprint": "cd0d43bd6989de79"
+    },
+    "output": {
+      "dtype": 12,
+      "elements": 10240,
+      "sum": "-396.359180450439",
+      "squared_sum": "200134.013254729914",
+      "first": "0.275390625",
+      "middle": "4.281250000",
+      "last": "-0.251953125",
+      "fingerprint": "8a833d11b88535ee"
+    }
+  },
+  "comparison": {
+    "exact": true,
+    "stages": ["normalized_input", "raw_projection", "output"]
+  },
+  "optimization_target": {
+    "baseline": "MLX quantized_matmul followed by F32 global-scale multiply and BF16 cast",
+    "candidate": "fuse the checkpoint global scale into the Metal NVFP4 matrix-vector kernel"
+  }
+}

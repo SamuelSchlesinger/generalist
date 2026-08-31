@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "checkpoint": "qwen3.8-27b-mlx-layer0-input-rmsnorm",
+  "recorded_at": "2026-08-31T06:20:00Z",
+  "model": {
+    "ollama_tag": "qwen3.8:27b-mlx",
+    "manifest_sha256": "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e",
+    "tensor_name": "model.language_model.layers.0.input_layernorm.weight",
+    "tensor_sha256": "ee8700267f26047c63e54902301adeca2d8c0a26784c0242190f689f7ed06114"
+  },
+  "runtime": {
+    "ollama_tag": "v0.32.13",
+    "ollama_commit": "0f25c31bd53b64dc3fcc8fce0bde954159a67a58",
+    "mlx_commit": "3abd0fd6b3eb9d9d3a34cb65e8a2189c57260399",
+    "mlx_c_commit": "fba4470b89073180056c9ea46c443051375f7399"
+  },
+  "operation": {
+    "width": 5120,
+    "input_dtype": 12,
+    "weight_dtype": 12,
+    "output_dtype": 12,
+    "epsilon": "0.000001",
+    "shift_weight_by_one": true,
+    "input_formula": "((i % 257) - 128) / 64 + ((i % 7) - 3) / 1024",
+    "fingerprint": "fnv1a64-little-endian-f32"
+  },
+  "generalist": {
+    "output_sum": "-29.126705169678",
+    "output_squared_sum": "4797.539512497911",
+    "output_first": "-1.812500000",
+    "output_middle": "1.632812500",
+    "output_last": "1.304687500",
+    "output_fingerprint": "11865e3aca836a05",
+    "max_abs_float64_reference_error": "0.007577597279"
+  },
+  "ollama": {
+    "output_sum": "-29.126705169678",
+    "output_squared_sum": "4797.539512497911",
+    "output_first": "-1.812500000",
+    "output_middle": "1.632812500",
+    "output_last": "1.304687500",
+    "output_fingerprint": "11865e3aca836a05"
+  },
+  "comparison": {
+    "exact_fields": [
+      "output_sum",
+      "output_squared_sum",
+      "output_first",
+      "output_middle",
+      "output_last",
+      "output_fingerprint"
+    ],
+    "exact": true
+  }
+}

@@ -11,10 +11,16 @@
 //!   distinct persistence identity
 
 pub mod anthropic;
+#[cfg(feature = "embedded-mlx")]
+pub mod embedded;
 pub mod openai;
 pub mod openrouter;
 
 pub use anthropic::AnthropicProvider;
+#[cfg(feature = "embedded-mlx")]
+pub use embedded::{
+    EmbeddedProvider, GenerationOutput, LocalCompletionRequest, LocalInferenceBackend,
+};
 pub use openai::OpenAiProvider;
 pub use openrouter::OpenRouterProvider;
 
@@ -24,8 +30,10 @@ use async_trait::async_trait;
 
 /// A backend capable of producing one model completion per call.
 ///
-/// Implementations should be stateless with respect to the conversation:
-/// the full history arrives in every [`CompletionRequest`].
+/// Completion semantics must depend only on the request: the full history
+/// arrives in every [`CompletionRequest`]. Implementations may retain model
+/// weights, compiled graphs, and validated prefix caches between calls, but a
+/// cache hit must be indistinguishable from recomputing the same request.
 ///
 /// Futures are `?Send`: the agent is a single-task loop (UI callbacks hold
 /// non-`Sync` state), so provider calls never cross threads. Run the agent
