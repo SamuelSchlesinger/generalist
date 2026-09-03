@@ -41,6 +41,8 @@ const DEFAULT_LOCAL_MODEL: &str = "qwen3.8:27b-mlx";
 const DEFAULT_EMBEDDED_MODEL: &str = "qwen3.8:27b-mlx";
 const LOCAL_QWEN_COMPACTION_THRESHOLD_TOKENS: u64 = 24_000;
 const LOCAL_QWEN_COMPACTION_KEEP_RECENT_TOKENS: u64 = 8_000;
+const CEREBRAS_COMPACTION_THRESHOLD_TOKENS: u64 = 48_000;
+const CEREBRAS_COMPACTION_KEEP_RECENT_TOKENS: u64 = 16_000;
 const THIRD_PARTY_LICENSES: &str = include_str!("../THIRD_PARTY_LICENSES.txt");
 #[cfg(feature = "embedded-mlx-native")]
 const EMBEDDED_MLX_LICENSES: &str = include_str!("../native/mlx/THIRD_PARTY_NOTICES.md");
@@ -155,7 +157,12 @@ fn uses_local_qwen_model(keys: &ApiKeys, provider: &str, model: &str) -> bool {
 }
 
 fn apply_model_runtime_profile(agent: &mut Agent, keys: &ApiKeys) {
-    if uses_local_qwen_model(keys, agent.provider().id(), agent.provider().model()) {
+    if agent.provider().id() == "cerebras" {
+        // The smallest current shared Cerebras context is 65,536 tokens. Keep
+        // enough headroom for an ordinary completion and its tool payload.
+        agent.compaction_threshold_tokens = CEREBRAS_COMPACTION_THRESHOLD_TOKENS;
+        agent.compaction_keep_recent_tokens = CEREBRAS_COMPACTION_KEEP_RECENT_TOKENS;
+    } else if uses_local_qwen_model(keys, agent.provider().id(), agent.provider().model()) {
         agent.compaction_threshold_tokens = LOCAL_QWEN_COMPACTION_THRESHOLD_TOKENS;
         agent.compaction_keep_recent_tokens = LOCAL_QWEN_COMPACTION_KEEP_RECENT_TOKENS;
     } else {
@@ -1112,7 +1119,10 @@ fn print_usage() {
         DEFAULT_EMBEDDED_MODEL
     );
     println!("  --max-tokens N    Request at most N output tokens per ordinary completion");
-    println!("                    (default: Anthropic model maximum; provider default elsewhere)");
+    println!(
+        "                    (default: Cerebras {}; Anthropic model maximum; provider default elsewhere)",
+        cerebras::DEFAULT_MAX_COMPLETION_TOKENS
+    );
     println!("  --licenses        Show third-party licenses and exit");
     println!("  -h, --help        Show this help");
 }
@@ -2813,6 +2823,32 @@ mod tests {
         assert_eq!(
             agent.compaction_keep_recent_tokens,
             DEFAULT_COMPACTION_KEEP_RECENT_TOKENS
+        );
+    }
+
+    #[test]
+    fn cerebras_runtime_profile_reserves_headroom_for_its_smallest_context() {
+        let keys = ApiKeys {
+            anthropic: None,
+            cerebras: Some("unused".to_string()),
+            openai: None,
+            openrouter: None,
+            openai_base_url: generalist::provider::openai::DEFAULT_BASE_URL.to_string(),
+        };
+        let provider =
+            CerebrasProvider::new("unused".to_string(), cerebras::DEFAULT_MODEL.to_string())
+                .unwrap();
+        let mut agent = Agent::new(Box::new(provider), ToolRegistry::new(), "test");
+
+        apply_model_runtime_profile(&mut agent, &keys);
+
+        assert_eq!(
+            agent.compaction_threshold_tokens,
+            CEREBRAS_COMPACTION_THRESHOLD_TOKENS
+        );
+        assert_eq!(
+            agent.compaction_keep_recent_tokens,
+            CEREBRAS_COMPACTION_KEEP_RECENT_TOKENS
         );
     }
 

@@ -29,8 +29,6 @@ async fn main() -> generalist::Result<()> {
         registry,
         "Use the calculator tool for every arithmetic operation.",
     );
-    agent.code_mode = false;
-    agent.max_tokens = Some(1024);
 
     let mut on_event = |event: AgentEvent| match event {
         AgentEvent::AssistantTextDelta(text) => print!("{text}"),

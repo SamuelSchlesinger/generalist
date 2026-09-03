@@ -1369,6 +1369,121 @@ impl Provider for RecordingScript {
     }
 }
 
+#[tokio::test]
+async fn output_limited_reasoning_is_continued_without_polluting_durable_history() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let truncated = CompletionResponse {
+        content: vec![ContentBlock::Thinking {
+            thinking: "a very long private plan".into(),
+            signature: String::new(),
+        }],
+        stop_reason: StopReason::MaxTokens,
+        usage: None,
+    };
+    let provider = RecordingScript {
+        // RecordingScript pops from the end.
+        steps: Mutex::new(vec![
+            Ok(text_response("done")),
+            Ok(tool_response()),
+            Ok(truncated),
+        ]),
+        requests: Arc::clone(&requests),
+    };
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(Echo)).unwrap();
+    let mut agent = Agent::new(Box::new(provider), registry, "test");
+    agent.code_mode = false;
+    let mut events = Vec::new();
+
+    let outcome = agent
+        .run_turn("build it", &mut |event| events.push(event))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, TurnOutcome::Completed);
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 3);
+    assert!(matches!(
+        captured[1][1].content.as_slice(),
+        [ContentBlock::Thinking { thinking, .. }] if thinking == "a very long private plan"
+    ));
+    assert!(captured[1][2]
+        .text()
+        .contains("stop planning and issue the next complete tool call"));
+    drop(captured);
+
+    assert!(events.iter().any(|event| {
+        matches!(event, AgentEvent::Notice(message) if message.contains("continuing automatically (1/2)"))
+    }));
+    assert!(agent.history.iter().all(|message| {
+        message.content.iter().all(|block| {
+            !matches!(block, ContentBlock::Thinking { thinking, .. } if thinking == "a very long private plan")
+        })
+    }));
+    assert!(history_tool_protocol_is_valid(&agent.history));
+    assert_eq!(agent.history.last().unwrap().text(), "done");
+}
+
+#[tokio::test]
+async fn output_limited_visible_text_is_joined_with_its_continuation() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let truncated = CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: "first half".into(),
+        }],
+        stop_reason: StopReason::MaxTokens,
+        usage: None,
+    };
+    let provider = RecordingScript {
+        steps: Mutex::new(vec![Ok(text_response("second half")), Ok(truncated)]),
+        requests: Arc::clone(&requests),
+    };
+    let mut agent = Agent::new(Box::new(provider), ToolRegistry::new(), "test");
+
+    let outcome = agent.run_turn("answer", &mut |_| {}).await.unwrap();
+
+    assert_eq!(outcome, TurnOutcome::Completed);
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        agent.history.last().unwrap().text(),
+        "first half\nsecond half"
+    );
+}
+
+#[tokio::test]
+async fn repeated_output_limit_exhaustion_is_an_error_not_a_completed_turn() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let truncated = || CompletionResponse {
+        content: vec![ContentBlock::Thinking {
+            thinking: "still planning".into(),
+            signature: String::new(),
+        }],
+        stop_reason: StopReason::MaxTokens,
+        usage: None,
+    };
+    let provider = RecordingScript {
+        steps: Mutex::new(vec![Ok(truncated()), Ok(truncated()), Ok(truncated())]),
+        requests: Arc::clone(&requests),
+    };
+    let mut agent = Agent::new(Box::new(provider), ToolRegistry::new(), "test");
+    let mut notices = Vec::new();
+
+    let error = agent
+        .run_turn("answer", &mut |event| {
+            if let AgentEvent::Notice(message) = event {
+                notices.push(message);
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Limit(_)));
+    assert!(error.to_string().contains("3 times"));
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    assert_eq!(notices.len(), 2);
+    assert_eq!(agent.history.len(), 1, "partial reasoning must not commit");
+}
+
 fn tool_pair(id: &str, result: &str) -> [Message; 2] {
     [
         Message::assistant(vec![ContentBlock::ToolUse {

@@ -2,10 +2,18 @@
 
 use super::events::{emit_stream_aborted, StreamedKinds};
 use super::{Agent, AgentEvent};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::runtime::TurnControl;
-use crate::types::{CompletionDelta, CompletionRequest};
+use crate::types::{CompletionDelta, CompletionRequest, ContentBlock, Message, StopReason};
 use std::time::Duration;
+
+const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 2;
+const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str =
+    "The previous model response reached its output-token limit and is incomplete. Continue \
+     without repeating its reasoning. If tools are available and the task needs them, stop \
+     planning and issue the next complete tool call now. Keep each tool call small enough to \
+     finish, splitting large work across calls. Otherwise continue the user-visible answer \
+     exactly where it stopped.";
 
 impl Agent {
     pub(super) async fn complete_with_retry(
@@ -16,11 +24,18 @@ impl Agent {
         let tools = self.model_tool_defs();
         let system_prompt = self.effective_system_prompt();
         let mut attempt: u32 = 0;
+        let mut continuation_history = None::<Vec<Message>>;
+        let mut prior_visible_content = Vec::<ContentBlock>::new();
+        let mut continued_streamed = StreamedKinds::default();
+        let mut output_limit_continuations = 0usize;
         loop {
             on_event(AgentEvent::ApiCallStarted);
+            let messages = continuation_history
+                .as_deref()
+                .unwrap_or(self.history.as_slice());
             let request = CompletionRequest {
                 system: Some(system_prompt.as_ref()),
-                messages: &self.history,
+                messages,
                 tools: &tools,
                 max_tokens: self.max_tokens,
                 limits: self.completion_limits,
@@ -76,6 +91,8 @@ impl Agent {
                 maybe_result
             };
             let Some(result) = maybe_result else {
+                streamed.text |= continued_streamed.text;
+                streamed.reasoning |= continued_streamed.reasoning;
                 emit_stream_aborted(
                     on_event,
                     streamed,
@@ -85,8 +102,10 @@ impl Agent {
                 return Ok(None);
             };
             match result {
-                Ok(response) => {
+                Ok(mut response) => {
                     if let Err(error) = self.completion_limits.validate_response(&response) {
+                        streamed.text |= continued_streamed.text;
+                        streamed.reasoning |= continued_streamed.reasoning;
                         emit_stream_aborted(
                             on_event,
                             streamed,
@@ -98,6 +117,77 @@ impl Agent {
                     on_event(AgentEvent::ApiCallFinished {
                         usage: response.usage.clone(),
                     });
+
+                    streamed.text |= continued_streamed.text;
+                    streamed.reasoning |= continued_streamed.reasoning;
+                    let has_tool_uses = response
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+                    if response.stop_reason == StopReason::MaxTokens && !has_tool_uses {
+                        if output_limit_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS {
+                            emit_stream_aborted(
+                                on_event,
+                                streamed,
+                                format!(
+                                    "the model reached its output-token limit in {} consecutive \
+                                     continuation attempts",
+                                    MAX_OUTPUT_LIMIT_CONTINUATIONS + 1
+                                ),
+                            );
+                            return Err(Error::Limit(format!(
+                                "model reached its output-token limit {} times without producing \
+                                 a complete answer or tool call",
+                                MAX_OUTPUT_LIMIT_CONTINUATIONS + 1
+                            )));
+                        }
+
+                        prior_visible_content.extend(response.content.iter().filter_map(|block| {
+                            match block {
+                                ContentBlock::Text { .. } => Some(block.clone()),
+                                ContentBlock::ToolUse { .. }
+                                | ContentBlock::ToolResult { .. }
+                                | ContentBlock::Thinking { .. }
+                                | ContentBlock::RedactedThinking { .. } => None,
+                            }
+                        }));
+                        let mut next_history = continuation_history
+                            .take()
+                            .unwrap_or_else(|| self.history.clone());
+                        next_history.push(Message::assistant(response.content));
+                        next_history.push(Message::user_text(OUTPUT_LIMIT_CONTINUATION_PROMPT));
+                        continuation_history = Some(next_history);
+                        continued_streamed = streamed;
+                        output_limit_continuations += 1;
+                        attempt = 0;
+                        on_event(AgentEvent::Notice(format!(
+                            "Response hit the output-token limit before completing; continuing \
+                             automatically ({output_limit_continuations}/\
+                             {MAX_OUTPUT_LIMIT_CONTINUATIONS})."
+                        )));
+                        continue;
+                    }
+
+                    if output_limit_continuations > 0 {
+                        prior_visible_content.extend(response.content);
+                        response.content = prior_visible_content;
+                        // The final provider request counted temporary continuation messages
+                        // that are intentionally not committed. Its usage remains available
+                        // through ApiCallFinished, but is not a sound estimate of the durable
+                        // conversation context.
+                        response.usage = None;
+                        if let Err(error) = self.completion_limits.validate_response(&response) {
+                            emit_stream_aborted(
+                                on_event,
+                                streamed,
+                                format!(
+                                    "continued response was rejected before it was committed: \
+                                     {error}"
+                                ),
+                            );
+                            return Err(error);
+                        }
+                    }
                     return Ok(Some((response, streamed)));
                 }
                 Err(e) if e.is_retryable() && attempt < self.max_retries => {
@@ -121,6 +211,8 @@ impl Agent {
                     attempt += 1;
                 }
                 Err(e) => {
+                    streamed.text |= continued_streamed.text;
+                    streamed.reasoning |= continued_streamed.reasoning;
                     emit_stream_aborted(
                         on_event,
                         streamed,

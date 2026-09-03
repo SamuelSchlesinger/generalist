@@ -10,6 +10,9 @@ pub const PUBLIC_MODELS_URL: &str = "https://api.cerebras.ai/public/v1/models";
 pub const DEFAULT_MODEL: &str = "qwen-3.8-27b";
 pub const GPT_OSS_120B_MODEL: &str = "gpt-oss-120b";
 pub const GEMMA_4_31B_MODEL: &str = "gemma-4-31b";
+/// Keep one agent round focused enough to reach a tool call. Callers can
+/// override this with `Agent::max_tokens` / `--max-tokens`.
+pub const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 8_192;
 
 /// Shared Cerebras models offered in the CLI picker. The first entry is the
 /// default. Arbitrary model IDs remain available for dedicated endpoints.
@@ -28,6 +31,17 @@ impl CerebrasProvider {
             inner: OpenAiProvider::for_cerebras(api_key, DEFAULT_BASE_URL.to_string(), model)?,
         })
     }
+
+    fn with_request_defaults<'a>(&self, request: CompletionRequest<'a>) -> CompletionRequest<'a> {
+        CompletionRequest {
+            max_tokens: request.max_tokens.or_else(|| {
+                SUGGESTED_MODELS
+                    .contains(&self.model())
+                    .then_some(DEFAULT_MAX_COMPLETION_TOKENS)
+            }),
+            ..request
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -45,7 +59,9 @@ impl Provider for CerebrasProvider {
     }
 
     async fn complete(&self, request: CompletionRequest<'_>) -> Result<CompletionResponse> {
-        self.inner.complete(request).await
+        self.inner
+            .complete(self.with_request_defaults(request))
+            .await
     }
 
     async fn complete_streaming(
@@ -53,13 +69,16 @@ impl Provider for CerebrasProvider {
         request: CompletionRequest<'_>,
         on_delta: &mut dyn FnMut(CompletionDelta) -> Result<()>,
     ) -> Result<CompletionResponse> {
-        self.inner.complete_streaming(request, on_delta).await
+        self.inner
+            .complete_streaming(self.with_request_defaults(request), on_delta)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{CompletionLimits, Message};
 
     #[test]
     fn has_distinct_persistence_identity_and_qwen_default() {
@@ -76,6 +95,45 @@ mod tests {
             SUGGESTED_MODELS,
             [DEFAULT_MODEL, GPT_OSS_120B_MODEL, GEMMA_4_31B_MODEL]
         );
+    }
+
+    #[test]
+    fn applies_focused_default_token_budget_but_preserves_an_override() {
+        let provider = CerebrasProvider::new("key".into(), DEFAULT_MODEL.into()).unwrap();
+        let messages = vec![Message::user_text("hi")];
+        let request = CompletionRequest {
+            system: None,
+            messages: &messages,
+            tools: &[],
+            max_tokens: None,
+            limits: CompletionLimits::default(),
+        };
+        assert_eq!(
+            provider.with_request_defaults(request).max_tokens,
+            Some(DEFAULT_MAX_COMPLETION_TOKENS)
+        );
+
+        let request = CompletionRequest {
+            system: None,
+            messages: &messages,
+            tools: &[],
+            max_tokens: Some(12_345),
+            limits: CompletionLimits::default(),
+        };
+        assert_eq!(
+            provider.with_request_defaults(request).max_tokens,
+            Some(12_345)
+        );
+
+        let dedicated = CerebrasProvider::new("key".into(), "team/custom-model".into()).unwrap();
+        let request = CompletionRequest {
+            system: None,
+            messages: &messages,
+            tools: &[],
+            max_tokens: None,
+            limits: CompletionLimits::default(),
+        };
+        assert_eq!(dedicated.with_request_defaults(request).max_tokens, None);
     }
 
     #[tokio::test]

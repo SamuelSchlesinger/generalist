@@ -254,16 +254,23 @@ that directory. The profile root is resolved once at startup, before
 `.generalist.env` is loaded, so changing `GENERALIST_HOME` inside that file
 does not relocate only part of the running profile.
 
-Ordinary completions have no fixed 16,000-token default. Anthropic requires a
-numeric `max_tokens`, so Generalist retrieves and caches the selected model's
-advertised maximum from the Models API. OpenAI-compatible endpoints receive no
-token-limit field by default because there is no portable model-limit discovery
-contract across OpenAI, OpenRouter, Ollama, and other compatible servers. Pass
-`--max-tokens N` to request an explicit ceiling on either path. The separate
-host response limits described below remain authoritative if a provider ignores
-the request or returns malformed structure. Explicit official OpenAI requests
-use `max_completion_tokens`; compatible endpoints retain the widely supported
-`max_tokens` field.
+Ordinary completions have no universal fixed token default. Requests to the
+curated shared Cerebras models default to 8,192 completion tokens so an agent
+round reaches action before a reasoning model consumes its whole model limit;
+`--max-tokens N` overrides it. Unknown dedicated model IDs retain their own
+provider default.
+The CLI compacts Cerebras conversations at roughly 48k tokens and keeps the
+most recent 16k, preserving headroom under the smallest current shared-model
+context window.
+Anthropic requires a numeric `max_tokens`, so Generalist retrieves and caches
+the selected model's advertised maximum from the Models API. Other
+OpenAI-compatible endpoints receive no token-limit field by default because
+there is no portable model-limit discovery contract across OpenAI, OpenRouter,
+Ollama, and other compatible servers. The separate host response limits
+described below remain authoritative if a provider ignores the request or
+returns malformed structure. Cerebras and explicit official OpenAI requests use
+`max_completion_tokens`; generic compatible endpoints retain the widely
+supported `max_tokens` field.
 
 ## Terminal UI
 
@@ -483,6 +490,10 @@ Follows what pi, opencode, and Claude Code converged on:
   1 MiB.
 - Tool calls in a response that hit the output-token limit are failed, not executed —
   their arguments may be silently incomplete. The model is asked to re-issue them.
+- A response that hits the output-token limit before producing a tool call or complete answer
+  is continued automatically up to two times with an explicit instruction to stop repeating
+  its plan and act. Only user-visible text is joined into the committed response; runaway
+  reasoning stays out of durable history, and repeated exhaustion fails the turn visibly.
 - A denied tool call ends the turn so you can redirect. Denial is a structured
   outcome, never inferred from result text.
 - On Anthropic, the system prompt and conversation prefix carry prompt-cache
