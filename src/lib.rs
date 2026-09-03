@@ -6,8 +6,8 @@ A provider-agnostic agent library and CLI.
 The core is small and deliberate:
 
 - [`types`] — neutral conversation types ([`Message`], [`ContentBlock`], ...)
-- [`provider`] — the [`Provider`] trait plus Anthropic and OpenAI-compatible
-  implementations
+- [`provider`] — the [`Provider`] trait plus Anthropic, Cerebras, and generic
+  OpenAI-compatible implementations
 - [`tool`] — the [`Tool`] trait and [`ToolRegistry`], with permission gating
 - [`agent`] — [`Agent`], the request → tool → result loop, reporting progress
   through [`AgentEvent`] callbacks

@@ -1,7 +1,7 @@
 //! LLM provider abstraction.
 //!
 //! The agent core speaks only [`Provider`]; concrete implementations translate
-//! the neutral types in [`crate::types`] to a vendor wire format. Two are
+//! the neutral types in [`crate::types`] to a vendor wire format. Four are
 //! included:
 //!
 //! - [`AnthropicProvider`] — the Anthropic Messages API
@@ -9,14 +9,18 @@
 //!   (OpenAI itself, Ollama, Groq, Mistral, vLLM, ...)
 //! - [`OpenRouterProvider`] — OpenRouter's OpenAI-compatible endpoint, with a
 //!   distinct persistence identity
+//! - [`CerebrasProvider`] — Cerebras's OpenAI-compatible endpoint, with its
+//!   own credential, model catalog, and persistence identity
 
 pub mod anthropic;
+pub mod cerebras;
 #[cfg(feature = "embedded-mlx")]
 pub mod embedded;
 pub mod openai;
 pub mod openrouter;
 
 pub use anthropic::AnthropicProvider;
+pub use cerebras::CerebrasProvider;
 #[cfg(feature = "embedded-mlx")]
 pub use embedded::{
     EmbeddedProvider, GenerationOutput, LocalCompletionRequest, LocalInferenceBackend,

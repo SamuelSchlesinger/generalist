@@ -15,30 +15,78 @@ use serde_json::{json, Value};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+#[derive(Clone, Copy)]
+enum MaxTokensField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+#[derive(Clone, Copy)]
+struct WireProfile {
+    max_tokens_field: MaxTokensField,
+    reasoning_replay_field: Option<&'static str>,
+}
+
+const GENERIC_WIRE_PROFILE: WireProfile = WireProfile {
+    max_tokens_field: MaxTokensField::MaxTokens,
+    reasoning_replay_field: None,
+};
+
+const OPENAI_WIRE_PROFILE: WireProfile = WireProfile {
+    max_tokens_field: MaxTokensField::MaxCompletionTokens,
+    reasoning_replay_field: None,
+};
+
+const CEREBRAS_WIRE_PROFILE: WireProfile = WireProfile {
+    max_tokens_field: MaxTokensField::MaxCompletionTokens,
+    reasoning_replay_field: Some("reasoning"),
+};
+
 pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     model: String,
     client: reqwest::Client,
+    wire_profile: WireProfile,
 }
 
 impl OpenAiProvider {
     pub fn new(api_key: String, base_url: String, model: String) -> Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
+        let wire_profile = if base_url == DEFAULT_BASE_URL {
+            OPENAI_WIRE_PROFILE
+        } else {
+            GENERIC_WIRE_PROFILE
+        };
+        Self::with_wire_profile(api_key, base_url, model, wire_profile)
+    }
+
+    pub(crate) fn for_cerebras(api_key: String, base_url: String, model: String) -> Result<Self> {
+        Self::with_wire_profile(api_key, base_url, model, CEREBRAS_WIRE_PROFILE)
+    }
+
+    fn with_wire_profile(
+        api_key: String,
+        base_url: String,
+        model: String,
+        wire_profile: WireProfile,
+    ) -> Result<Self> {
         Ok(Self {
             api_key,
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_string(),
             model,
             client: super::http_client()?,
+            wire_profile,
         })
     }
 
     /// Convert neutral messages to the chat-completions message list.
     ///
     /// Tool results become `role: "tool"` messages; assistant tool-use blocks
-    /// become `tool_calls`; thinking blocks are dropped (they are meaningless
-    /// to other providers).
-    fn to_wire_messages(system: Option<&str>, messages: &[Message]) -> Vec<Value> {
+    /// become `tool_calls`. Generic compatible APIs drop neutral thinking
+    /// blocks; provider profiles may replay unsigned reasoning in their native
+    /// field when the API documents that round-trip.
+    fn to_wire_messages(&self, system: Option<&str>, messages: &[Message]) -> Vec<Value> {
         let mut out = Vec::new();
         if let Some(system) = system {
             out.push(json!({"role": "system", "content": system}));
@@ -70,6 +118,22 @@ impl OpenAiProvider {
                     };
                     if !tool_calls.is_empty() {
                         msg["tool_calls"] = Value::Array(tool_calls);
+                    }
+                    if let Some(field) = self.wire_profile.reasoning_replay_field {
+                        let reasoning = message
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Thinking {
+                                    thinking,
+                                    signature,
+                                } if signature.is_empty() => Some(thinking.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        if !reasoning.is_empty() {
+                            msg[field] = Value::String(reasoning);
+                        }
                     }
                     out.push(msg);
                 }
@@ -119,17 +183,16 @@ impl OpenAiProvider {
     fn build_body(&self, request: &CompletionRequest<'_>, streaming: bool) -> Value {
         let mut body = json!({
             "model": self.model,
-            "messages": Self::to_wire_messages(request.system, request.messages),
+            "messages": self.to_wire_messages(request.system, request.messages),
         });
         if streaming {
             body["stream"] = json!(true);
             body["stream_options"] = json!({"include_usage": true});
         }
         if let Some(max_tokens) = request.max_tokens {
-            let field = if self.base_url == DEFAULT_BASE_URL {
-                "max_completion_tokens"
-            } else {
-                "max_tokens"
+            let field = match self.wire_profile.max_tokens_field {
+                MaxTokensField::MaxTokens => "max_tokens",
+                MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
             };
             body[field] = json!(max_tokens);
         }
@@ -637,6 +700,12 @@ mod tests {
 
     #[test]
     fn wire_messages_map_tool_results_to_tool_role() {
+        let provider = OpenAiProvider::new(
+            "key".into(),
+            "http://localhost:11434/v1".into(),
+            "model".into(),
+        )
+        .unwrap();
         let messages = vec![
             Message::user_text("run ls"),
             Message::assistant(vec![
@@ -655,7 +724,7 @@ mod tests {
                 is_error: None,
             }]),
         ];
-        let wire = OpenAiProvider::to_wire_messages(Some("sys"), &messages);
+        let wire = provider.to_wire_messages(Some("sys"), &messages);
         assert_eq!(wire[0]["role"], "system");
         assert_eq!(wire[1]["role"], "user");
         assert_eq!(wire[2]["role"], "assistant");
@@ -666,6 +735,12 @@ mod tests {
 
     #[test]
     fn thinking_blocks_are_dropped() {
+        let provider = OpenAiProvider::new(
+            "key".into(),
+            "http://localhost:11434/v1".into(),
+            "model".into(),
+        )
+        .unwrap();
         let messages = vec![Message::assistant(vec![
             ContentBlock::Thinking {
                 thinking: "hmm".into(),
@@ -675,10 +750,52 @@ mod tests {
                 text: "answer".into(),
             },
         ])];
-        let wire = OpenAiProvider::to_wire_messages(None, &messages);
+        let wire = provider.to_wire_messages(None, &messages);
         assert_eq!(wire.len(), 1);
         assert_eq!(wire[0]["content"], "answer");
         assert!(wire[0].get("tool_calls").is_none());
+        assert!(wire[0].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn cerebras_profile_replays_unsigned_reasoning_and_uses_completion_token_field() {
+        let provider = OpenAiProvider::for_cerebras(
+            "key".into(),
+            "http://localhost:8000/v1".into(),
+            "qwen-3.8-27b".into(),
+        )
+        .unwrap();
+        let messages = vec![Message::assistant(vec![
+            ContentBlock::Thinking {
+                thinking: "provider reasoning".into(),
+                signature: String::new(),
+            },
+            ContentBlock::Thinking {
+                thinking: "signed reasoning from another protocol".into(),
+                signature: "opaque-signature".into(),
+            },
+            ContentBlock::ToolUse {
+                name: "calculator".into(),
+                input: json!({"expression": "2+2"}),
+                id: "call_1".into(),
+            },
+        ])];
+        let request = CompletionRequest {
+            system: None,
+            messages: &messages,
+            tools: &[],
+            max_tokens: Some(4096),
+            limits: CompletionLimits::default(),
+        };
+
+        let body = provider.build_body(&request, true);
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["messages"][0]["reasoning"], "provider reasoning");
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            "calculator"
+        );
     }
 
     #[test]

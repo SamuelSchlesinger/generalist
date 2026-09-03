@@ -3,7 +3,8 @@ use generalist::mcp::{McpConfig, McpRegistrationOutcome, McpRegistrationReport};
 #[cfg(feature = "embedded-mlx-native")]
 use generalist::provider::embedded::EmbeddedProvider;
 use generalist::provider::{
-    anthropic, openrouter, AnthropicProvider, OpenAiProvider, OpenRouterProvider, Provider,
+    anthropic, cerebras, openrouter, AnthropicProvider, CerebrasProvider, OpenAiProvider,
+    OpenRouterProvider, Provider,
 };
 use generalist::tools::*;
 use generalist::tui::{TerminalUi, UiAction};
@@ -70,6 +71,7 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
 
 struct ApiKeys {
     anthropic: Option<String>,
+    cerebras: Option<String>,
     openai: Option<String>,
     openrouter: Option<String>,
     openai_base_url: String,
@@ -82,6 +84,7 @@ impl ApiKeys {
             anthropic: env::var("ANTHROPIC_API_KEY")
                 .or_else(|_| env::var("CLAUDE_API_KEY"))
                 .ok(),
+            cerebras: env::var("CEREBRAS_API_KEY").ok(),
             // Local OpenAI-compatible servers generally do not inspect the
             // key, so a configured base URL is sufficient to enable them.
             openai: env::var("OPENAI_API_KEY")
@@ -103,6 +106,9 @@ impl ApiKeys {
         if self.openai.is_some() {
             providers.push("openai");
         }
+        if self.cerebras.is_some() {
+            providers.insert(0, "cerebras");
+        }
         if self.openrouter.is_some() {
             providers.insert(0, "openrouter");
         }
@@ -112,6 +118,7 @@ impl ApiKeys {
     fn provider_label(&self, provider: &str) -> String {
         match provider {
             "anthropic" => "Anthropic".to_string(),
+            "cerebras" => "Cerebras".to_string(),
             "openrouter" => "OpenRouter".to_string(),
             "openai" if self.openai_base_url == generalist::provider::openai::DEFAULT_BASE_URL => {
                 "OpenAI".to_string()
@@ -166,6 +173,13 @@ fn build_provider(keys: &ApiKeys, provider: &str, model: String) -> Result<Box<d
                 .ok_or_else(|| Error::Other("ANTHROPIC_API_KEY is not set".to_string()))?;
             Ok(Box::new(AnthropicProvider::new(key, model)?))
         }
+        "cerebras" => {
+            let key = keys
+                .cerebras
+                .clone()
+                .ok_or_else(|| Error::Other("CEREBRAS_API_KEY is not set".to_string()))?;
+            Ok(Box::new(CerebrasProvider::new(key, model)?))
+        }
         "openai" => {
             let key = keys
                 .openai
@@ -204,12 +218,16 @@ fn build_provider(keys: &ApiKeys, provider: &str, model: String) -> Result<Box<d
 }
 
 fn default_remote_provider_and_model(keys: &ApiKeys) -> Option<(String, String)> {
-    keys.openrouter.as_ref().map(|_| {
-        (
+    if keys.openrouter.is_some() {
+        Some((
             "openrouter".to_string(),
             openrouter::DEFAULT_MODEL.to_string(),
-        )
-    })
+        ))
+    } else {
+        keys.cerebras
+            .as_ref()
+            .map(|_| ("cerebras".to_string(), cerebras::DEFAULT_MODEL.to_string()))
+    }
 }
 
 fn build_registry(
@@ -1075,7 +1093,7 @@ fn print_usage() {
     println!("  --gemini          Use Gemini 3.7 Flash through OpenRouter");
     println!("                    (requires OPENROUTER_API_KEY; --local takes precedence)");
     println!(
-        "  --provider NAME   Use anthropic, openai, openrouter, or embedded without prompting"
+        "  --provider NAME   Use anthropic, cerebras, openai, openrouter, or embedded without prompting"
     );
     println!("  --model ID        Model for --provider (provider default when omitted)");
     println!("  --local [model]   Run against a local OpenAI-compatible server");
@@ -1229,6 +1247,8 @@ fn parse_args() -> CliArgs {
 fn normalized_provider_id(provider: &str) -> Option<&'static str> {
     if provider.eq_ignore_ascii_case("anthropic") {
         Some("anthropic")
+    } else if provider.eq_ignore_ascii_case("cerebras") {
+        Some("cerebras")
     } else if provider.eq_ignore_ascii_case("openai") {
         Some("openai")
     } else if provider.eq_ignore_ascii_case("openrouter") {
@@ -1254,6 +1274,7 @@ fn validated_model_id(model: &str) -> std::result::Result<&str, String> {
 fn provider_default_model(provider: &str) -> std::result::Result<String, String> {
     match provider {
         "anthropic" => Ok(anthropic::SUGGESTED_MODELS[0].to_string()),
+        "cerebras" => Ok(cerebras::DEFAULT_MODEL.to_string()),
         "openrouter" => Ok(openrouter::DEFAULT_MODEL.to_string()),
         "openai" => Ok(env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string())),
         "embedded" => Ok(DEFAULT_EMBEDDED_MODEL.to_string()),
@@ -1327,6 +1348,8 @@ async fn choose_model(ui: &mut TerminalUi, provider: &str) -> Result<Option<Stri
     } else if provider == "anthropic" {
         choose_suggested_or_custom_model(ui, "Anthropic model ID", anthropic::SUGGESTED_MODELS)
             .await
+    } else if provider == "cerebras" {
+        choose_suggested_or_custom_model(ui, "Cerebras model ID", cerebras::SUGGESTED_MODELS).await
     } else if provider == "openrouter" {
         choose_suggested_or_custom_model(ui, "OpenRouter model ID", openrouter::SUGGESTED_MODELS)
             .await
@@ -2272,6 +2295,7 @@ async fn main() -> Result<()> {
         if !available.contains(&provider.as_str()) {
             let required = match provider.as_str() {
                 "anthropic" => "ANTHROPIC_API_KEY",
+                "cerebras" => "CEREBRAS_API_KEY",
                 "openrouter" => "OPENROUTER_API_KEY",
                 "openai" => "OPENAI_API_KEY or OPENAI_BASE_URL",
                 _ => "the provider's API key",
@@ -2291,6 +2315,7 @@ async fn main() -> Result<()> {
             profile_paths.environment_file().display()
         );
         eprintln!("  ANTHROPIC_API_KEY=...   for Anthropic models");
+        eprintln!("  CEREBRAS_API_KEY=...    for Cerebras (Qwen 3.8 27B by default)");
         eprintln!("  OPENAI_API_KEY=...      for OpenAI or a compatible server");
         eprintln!(
             "  OPENROUTER_API_KEY=...  for OpenRouter (Kimi K3 by default; --gemini selects Gemini 3.7 Flash)"
@@ -2691,6 +2716,7 @@ mod tests {
     fn local_qwen_detection_is_scoped_to_loopback_qwen38_endpoints() {
         let local = ApiKeys {
             anthropic: None,
+            cerebras: None,
             openai: Some("unused".to_string()),
             openrouter: None,
             openai_base_url: OLLAMA_BASE_URL.to_string(),
@@ -2711,6 +2737,7 @@ mod tests {
 
         let loopback_ip = ApiKeys {
             anthropic: None,
+            cerebras: None,
             openai: Some("unused".to_string()),
             openrouter: None,
             openai_base_url: "http://127.0.0.1:11434/v1".to_string(),
@@ -2723,6 +2750,7 @@ mod tests {
 
         let remote_compatible = ApiKeys {
             anthropic: None,
+            cerebras: None,
             openai: Some("unused".to_string()),
             openrouter: None,
             openai_base_url: "https://inference.example/v1".to_string(),
@@ -2748,6 +2776,7 @@ mod tests {
     fn qwen_runtime_profile_leaves_headroom_and_resets_after_model_switch() {
         let keys = ApiKeys {
             anthropic: None,
+            cerebras: None,
             openai: Some("unused".to_string()),
             openrouter: None,
             openai_base_url: OLLAMA_BASE_URL.to_string(),
@@ -2800,6 +2829,28 @@ mod tests {
             Ok(Some((
                 "openrouter".to_string(),
                 "z-ai/glm-5.3-flash".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn explicit_cerebras_selection_defaults_to_qwen_and_accepts_dedicated_models() {
+        let default = parse_args_from(["--provider=Cerebras"].into_iter().map(str::to_string));
+        assert_eq!(
+            forced_provider_and_model(&default),
+            Ok(Some(("cerebras".to_string(), "qwen-3.8-27b".to_string())))
+        );
+
+        let dedicated = parse_args_from(
+            ["--provider", "cerebras", "--model=team/custom-model"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(
+            forced_provider_and_model(&dedicated),
+            Ok(Some((
+                "cerebras".to_string(),
+                "team/custom-model".to_string()
             )))
         );
     }
@@ -2864,6 +2915,13 @@ mod tests {
                 model: "z-ai/glm-5.3-flash"
             })
         );
+        assert_eq!(
+            parse_model_target("anthropic", Some("cerebras qwen-3.8-27b")),
+            Ok(ModelTarget::Direct {
+                provider: "cerebras",
+                model: "qwen-3.8-27b"
+            })
+        );
         assert!(parse_model_target("openrouter", Some("openrouter one two")).is_err());
         assert_eq!(
             ensure_provider_available("openrouter", &["openrouter", "anthropic"]),
@@ -2898,6 +2956,30 @@ mod tests {
 
         assert_eq!(state.provider, "openrouter");
         assert_eq!(state.model, "z-ai/glm-5.3-flash");
+    }
+
+    #[test]
+    fn switched_cerebras_model_is_preserved_with_distinct_provider_identity() {
+        let initial = OpenAiProvider::new(
+            "unused".to_string(),
+            generalist::provider::openai::DEFAULT_BASE_URL.to_string(),
+            "gpt-4o".to_string(),
+        )
+        .unwrap();
+        let mut agent = Agent::new(Box::new(initial), ToolRegistry::new(), "test");
+        let switched =
+            CerebrasProvider::new("unused".to_string(), "gemma-4-31b".to_string()).unwrap();
+        agent.set_provider(Box::new(switched));
+
+        let state = make_saved_state(
+            &agent,
+            &MemoryPermissionHandler::new(),
+            &PromptQueue::default(),
+            &WorkspaceScope::Global,
+        );
+
+        assert_eq!(state.provider, "cerebras");
+        assert_eq!(state.model, "gemma-4-31b");
     }
 
     #[test]
@@ -3481,24 +3563,45 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_kimi_is_the_default_remote_when_configured() {
+    fn openrouter_kimi_remains_the_default_remote_when_configured() {
         let keys = ApiKeys {
             anthropic: Some("anthropic-key".into()),
+            cerebras: Some("cerebras-key".into()),
             openai: Some("openai-key".into()),
             openrouter: Some("openrouter-key".into()),
             openai_base_url: generalist::provider::openai::DEFAULT_BASE_URL.into(),
         };
 
         let expected = if cfg!(generalist_mlx_native_linked) {
-            vec!["openrouter", "embedded", "anthropic", "openai"]
+            vec!["openrouter", "cerebras", "embedded", "anthropic", "openai"]
         } else {
-            vec!["openrouter", "anthropic", "openai"]
+            vec!["openrouter", "cerebras", "anthropic", "openai"]
         };
         assert_eq!(keys.available_providers(), expected);
         assert_eq!(
             default_remote_provider_and_model(&keys),
             Some(("openrouter".to_string(), "moonshotai/kimi-k3".to_string()))
         );
+    }
+
+    #[test]
+    fn cerebras_qwen_is_the_default_remote_without_openrouter() {
+        let keys = ApiKeys {
+            anthropic: Some("anthropic-key".into()),
+            cerebras: Some("cerebras-key".into()),
+            openai: None,
+            openrouter: None,
+            openai_base_url: generalist::provider::openai::DEFAULT_BASE_URL.into(),
+        };
+
+        assert_eq!(
+            default_remote_provider_and_model(&keys),
+            Some(("cerebras".to_string(), "qwen-3.8-27b".to_string()))
+        );
+        let provider = build_provider(&keys, "cerebras", "qwen-3.8-27b".to_string()).unwrap();
+        assert_eq!(provider.id(), "cerebras");
+        assert_eq!(provider.display_name(), "Cerebras");
+        assert_eq!(provider.model(), "qwen-3.8-27b");
     }
 
     #[test]

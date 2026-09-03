@@ -1,10 +1,10 @@
 # generalist
 
 A provider-agnostic terminal agent in Rust with a full-screen Ratatui interface. Works
-with the Anthropic Messages API, OpenRouter, or any OpenAI-compatible endpoint
-(OpenAI, Ollama, Groq, Mistral, vLLM, LM Studio). The library is small: neutral
-conversation types, a `Provider` trait, a tool registry with permission gating, and
-an agent loop that reports progress through event callbacks.
+with the Anthropic Messages API, Cerebras, OpenRouter, or any OpenAI-compatible
+endpoint (OpenAI, Ollama, Groq, Mistral, vLLM, LM Studio). The library is small:
+neutral conversation types, a `Provider` trait, a tool registry with permission
+gating, and an agent loop that reports progress through event callbacks.
 
 ## Install and run
 
@@ -13,6 +13,7 @@ cargo build --release --locked
 
 # Keys go in the environment or ~/.generalist.env:
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.generalist.env
+echo 'CEREBRAS_API_KEY=csk-...'      >> ~/.generalist.env   # and/or
 echo 'OPENAI_API_KEY=sk-...'        >> ~/.generalist.env   # and/or
 echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.generalist.env   # and/or
 echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
@@ -25,6 +26,10 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 # Any configured provider/model, without an interactive prompt:
 ./target/release/generalist --provider openrouter --model z-ai/glm-5.3-flash
 
+# Cerebras defaults to Qwen 3.8 27B; another shared or dedicated model is explicit:
+./target/release/generalist --provider cerebras
+./target/release/generalist --provider cerebras --model gpt-oss-120b
+
 # Local models need no key:
 ollama pull qwen3.8:27b-mlx
 ./target/release/generalist --local                    # qwen3.8:27b-mlx
@@ -32,10 +37,14 @@ ollama pull qwen3.8:27b-mlx
 ```
 
 When `OPENROUTER_API_KEY` is configured, normal remote startup defaults to
-OpenRouter's `moonshotai/kimi-k3`. Use `/model` to switch interactively,
+OpenRouter's `moonshotai/kimi-k3`. Without OpenRouter, a configured
+`CEREBRAS_API_KEY` defaults to Cerebras's `qwen-3.8-27b`. Use `/model` to
+switch interactively,
 `/model <model>` to switch the current API directly, or
-`/model <provider> <model>` to switch both. The Anthropic and OpenRouter pickers
-offer curated models plus an arbitrary model-ID prompt. `--provider` and
+`/model <provider> <model>` to switch both. The Anthropic, Cerebras, and OpenRouter
+pickers offer curated models plus an arbitrary model-ID prompt. Cerebras currently
+offers `qwen-3.8-27b`, `gpt-oss-120b`, and `gemma-4-31b` on its shared API; arbitrary
+IDs support models made available through dedicated endpoints. `--provider` and
 `--model` provide the same explicit selection at startup. `--gemini` remains a
 convenience alias that uses OpenRouter's
 `google/gemini-3.7-flash`. `--local` always takes precedence and keeps the
@@ -169,7 +178,8 @@ pins, promoted optimizations, and benchmark commands are in
 Optional binaries: `z3` (constraint solver), `patch` (file editing; present on any Unix).
 
 Smoke tests, all live end-to-end: `cargo run --example smoke` (Anthropic),
-`smoke_openrouter` (Kimi K3), `smoke_ollama` (local tool loop),
+`smoke_cerebras` (Qwen 3.8 27B by default), `smoke_openrouter` (Kimi K3),
+`smoke_ollama` (local tool loop),
 `smoke_codemode` (local code-mode bridge), and `smoke_embedded` (the in-process
 MLX agent path).
 

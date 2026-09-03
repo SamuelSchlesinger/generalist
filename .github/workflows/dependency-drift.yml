@@ -38,3 +38,18 @@ jobs:
           cargo test --locked --lib
           provider::openrouter::tests::suggested_models_exist_and_support_tools_in_live_catalog
           -- --ignored --exact
+
+  cerebras-catalog:
+    name: Curated Cerebras models
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify picker matches the shared tool catalog
+        run: >-
+          cargo test --locked --lib
+          provider::cerebras::tests::suggested_models_match_live_shared_tool_catalog
+          -- --ignored --exact
