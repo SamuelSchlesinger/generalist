@@ -7,7 +7,10 @@
 
 use generalist::provider::OpenAiProvider;
 use generalist::tools::CalculatorTool;
-use generalist::{Agent, AgentEvent, ToolRegistry, TurnOutcome};
+use generalist::{
+    Agent, AgentEvent, CompletionLimits, CompletionRequest, Message, Provider, ToolRegistry,
+    TurnOutcome,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -136,4 +139,36 @@ async fn agent_completes_a_streamed_tool_round_trip_over_http() {
     // History is a valid tool-use protocol trace of the full round trip.
     assert!(generalist::history_tool_protocol_is_valid(agent.history()));
     assert_eq!(agent.history().len(), 4);
+}
+
+#[tokio::test]
+async fn malformed_sse_is_not_hidden_by_a_later_done_event() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+
+    let server = async {
+        serve_one(&listener, &[r#"{"choices":["#]).await;
+    };
+    let client = async {
+        let provider = OpenAiProvider::new("test-key".into(), base_url, "test-model".into())
+            .expect("provider");
+        let messages = [Message::user_text("hello")];
+        provider
+            .complete_streaming(
+                CompletionRequest {
+                    system: None,
+                    messages: &messages,
+                    tools: &[],
+                    max_tokens: Some(16),
+                    limits: CompletionLimits::default(),
+                },
+                &mut |_| Ok(()),
+            )
+            .await
+            .unwrap_err()
+    };
+
+    let (_, error) = tokio::join!(server, client);
+    assert!(error.is_retryable());
+    assert!(error.to_string().contains("malformed SSE JSON"));
 }

@@ -566,24 +566,22 @@ impl Provider for AnthropicProvider {
         while let Some(chunk) = response.chunk().await? {
             crate::provider::account_wire_bytes(limits, &mut received, chunk.len())?;
             for payload in assembler.push(&chunk) {
-                if let Ok(event) = serde_json::from_str::<Value>(&payload) {
-                    if event.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
-                        saw_message_stop = true;
-                    }
-                    for delta in state.apply(&event, limits)? {
-                        on_delta(delta)?;
-                    }
-                }
-            }
-        }
-        if let Some(payload) = assembler.finish() {
-            if let Ok(event) = serde_json::from_str::<Value>(&payload) {
+                let event = crate::provider::parse_sse_json(&payload)?;
                 if event.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
                     saw_message_stop = true;
                 }
                 for delta in state.apply(&event, limits)? {
                     on_delta(delta)?;
                 }
+            }
+        }
+        if let Some(payload) = assembler.finish() {
+            let event = crate::provider::parse_sse_json(&payload)?;
+            if event.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
+                saw_message_stop = true;
+            }
+            for delta in state.apply(&event, limits)? {
+                on_delta(delta)?;
             }
         }
         // A connection cut mid-stream yields a syntactically fine but

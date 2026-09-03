@@ -517,24 +517,24 @@ impl Provider for OpenAiProvider {
                     done = true;
                     continue;
                 }
-                if let Ok(value) = serde_json::from_str::<Value>(&payload) {
-                    // Ollama and several compatible gateways report
-                    // mid-stream failures (e.g. context overflow) as an
-                    // in-band error payload; surface it instead of letting
-                    // the stream read as merely cut short.
-                    if let Some(error) = Self::in_band_stream_error(&value) {
-                        return Err(error);
-                    }
-                    for delta in state.apply(&value, limits)? {
-                        on_delta(delta)?;
-                    }
+                let value = crate::provider::parse_sse_json(&payload)?;
+                // Ollama and several compatible gateways report mid-stream
+                // failures (e.g. context overflow) as an in-band error
+                // payload; surface it instead of letting the stream read as
+                // merely cut short.
+                if let Some(error) = Self::in_band_stream_error(&value) {
+                    return Err(error);
+                }
+                for delta in state.apply(&value, limits)? {
+                    on_delta(delta)?;
                 }
             }
         }
         if let Some(payload) = assembler.finish() {
             if payload.trim() == "[DONE]" {
                 done = true;
-            } else if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+            } else {
+                let value = crate::provider::parse_sse_json(&payload)?;
                 if let Some(error) = Self::in_band_stream_error(&value) {
                     return Err(error);
                 }

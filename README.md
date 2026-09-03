@@ -96,6 +96,11 @@ Cancellation and completed turns release their temporary decode state while
 retaining only the two bounded reusable branches; the model weights themselves
 stay resident to avoid a costly reload.
 
+ChatML role delimiters are host-authored token boundaries. If system text,
+messages, tool metadata, or tool results contain the same visible strings, the
+embedded tokenizer encodes those occurrences as literal content rather than
+control-token IDs, so dynamic text cannot manufacture a new message role.
+
 On the checked M4 Pro comparison, the exact production-rendered xhigh-reasoning
 prompt measured 32.559 versus 30.014 warm decode tok/s for embedded and Ollama,
 and 32.229 versus 28.961 end-to-end tok/s. Embedded time to first content was
@@ -449,8 +454,11 @@ Caveats:
   in-process fences; use a container or dedicated user for real isolation.
 - Fetched web content is untrusted input; the approval step exists mainly to catch
   prompt injection acting on it.
-- `http_fetch` rejects localhost, private, and link-local addresses, including
-  redirect hops and DNS results. Best effort, not a guarantee.
+- `http_fetch` rejects localhost, private, and link-local addresses. Its
+  direct resolver filters the complete DNS answer used for every connection,
+  including redirect hops, and the client ignores ambient proxy settings so
+  proxy-side resolution cannot bypass that check. This application policy is
+  still not a network sandbox.
 
 ## Agent loop
 
@@ -460,6 +468,9 @@ Follows what pi, opencode, and Claude Code converged on:
 - Transient API errors retry 3 times with exponential backoff.
 - Tool results are truncated before entering history. Bash and python keep the tail
   (where errors are) and spill full output to a temp file the model can read back.
+- `read_file` accepts only regular UTF-8 files and reads 32 KiB by default,
+  returning a byte offset for lossless pagination; one call may request at most
+  1 MiB.
 - Tool calls in a response that hit the output-token limit are failed, not executed —
   their arguments may be silently incomplete. The model is asked to re-issue them.
 - A denied tool call ends the turn so you can redirect. Denial is a structured
@@ -505,7 +516,9 @@ so the model can use them in its first script without a discovery round-trip. Ca
 served over a Unix socket and pass through the same permission gate as direct mode.
 Results return to the script, not the model, so one script can perform a long sequence,
 process megabytes of output, validate the result, and print only the conclusion. Script
-errors come back as tool results, so the model can fix and re-run. This is the pattern
+errors come back as tool results, so the model can fix and re-run. Generated script and
+bridge sources live in an owner-only temporary directory and are removed after the
+process exits; durable artifacts belong in the inherited project directory. This is the pattern
 from CodeAct, Cloudflare's Code Mode, Anthropic's code-execution-with-MCP, and the
 "Code as Agent Harness" survey (arXiv 2605.18747).
 

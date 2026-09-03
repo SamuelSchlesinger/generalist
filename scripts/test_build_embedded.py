@@ -14,6 +14,7 @@ BUILDER = REPOSITORY / "scripts" / "build-embedded.sh"
 NATIVE_BUILDER = REPOSITORY / "native" / "mlx" / "build_static_probe.sh"
 NATIVE_NOTICES = REPOSITORY / "native" / "mlx" / "THIRD_PARTY_NOTICES.md"
 NATIVE_PINS = REPOSITORY / "native" / "mlx" / "PINS.env"
+NATIVE_SHIM = REPOSITORY / "native" / "mlx" / "shim.cpp"
 
 REQUIRED_NATIVE_COPYRIGHTS = (
     "Copyright © 2023 Apple Inc.",
@@ -126,6 +127,14 @@ class EmbeddedBuildInterfaceTests(unittest.TestCase):
         self.assertIn("native fetched dependency set changed", native_builder)
         for fetched_dependency in ("fmt", "json", "metal_cpp"):
             self.assertIn(fetched_dependency, native_builder)
+
+    def test_native_errors_return_instead_of_terminating_the_process(self) -> None:
+        shim = NATIVE_SHIM.read_text()
+        self.assertIn("mlx_set_error_handler(ignore_mlx_c_error", shim)
+        self.assertIn("install_nonterminating_mlx_error_handler();", shim)
+        self.assertIn(
+            "Qwen model loader caught an unknown native exception", shim
+        )
 
 
 if __name__ == "__main__":

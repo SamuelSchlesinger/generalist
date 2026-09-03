@@ -174,6 +174,17 @@ pub(crate) async fn read_response_body_bounded(
     Ok(body)
 }
 
+/// Parse one completed SSE `data:` payload. Once framing says a payload is
+/// complete, malformed JSON is a broken provider response rather than a
+/// keepalive: silently skipping it could turn a partial answer or tool input
+/// into an apparently successful completion.
+pub(crate) fn parse_sse_json(payload: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(payload).map_err(|error| Error::Stream {
+        message: format!("provider sent malformed SSE JSON: {error}"),
+        retryable: true,
+    })
+}
+
 /// Build the shared HTTP client used by providers.
 ///
 /// No whole-request deadline: a hard agent call on a slow local model can
@@ -341,5 +352,12 @@ mod tests {
             .to_string();
         assert!(error.contains("wire limit of 65536 bytes"));
         assert_eq!(received, 64 * 1024);
+    }
+
+    #[test]
+    fn malformed_sse_json_is_a_retryable_stream_error() {
+        let error = parse_sse_json("{not json").unwrap_err();
+        assert!(error.is_retryable());
+        assert!(error.to_string().contains("malformed SSE JSON"));
     }
 }

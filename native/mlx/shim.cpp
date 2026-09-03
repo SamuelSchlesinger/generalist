@@ -9,6 +9,7 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,7 @@
 
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/metal/metal.h"
+#include "mlx/c/error.h"
 #include "mlx/c/mlx.h"
 #include "mlx/c/private/mlx.h"
 #include "mlx/compile.h"
@@ -28,6 +30,18 @@
 namespace {
 
 constexpr size_t maximum_probe_bytes = 16U * 1024U * 1024U;
+
+// MLX-C's process-global default handler calls exit(-1). The Rust boundary
+// requires native failures to return through the status/error-buffer ABI, so
+// install a non-terminating handler before any MLX-C operation. MLX-C wrappers
+// already translate their C++ exceptions into failure return values.
+void ignore_mlx_c_error(const char *, void *) {}
+
+void install_nonterminating_mlx_error_handler() {
+  static std::once_flag installed;
+  std::call_once(installed,
+                 [] { mlx_set_error_handler(ignore_mlx_c_error, nullptr, nullptr); });
+}
 
 void set_error(char *destination, size_t capacity, const char *message) {
   if (destination == nullptr || capacity == 0) {
@@ -629,6 +643,7 @@ extern "C" int generalist_mlx_initialize(const char *metallib_path,
     return fail(error, error_capacity, "metallib path cannot be empty");
   }
   try {
+    install_nonterminating_mlx_error_handler();
     mlx::core::metal::set_metallib_path(std::string(metallib_path));
     bool available = false;
     if (mlx_metal_is_available(&available) != 0 || !available) {
@@ -3871,11 +3886,13 @@ extern "C" int generalist_mlx_qwen_model_new(
   *model = nullptr;
   *result = {};
   set_error(error, error_capacity, "");
-  mlx_stream cpu_stream = mlx_default_cpu_stream_new();
-  mlx_stream gpu_stream = mlx_default_gpu_stream_new();
-  std::unique_ptr<generalist_mlx_qwen_model> candidate =
-      std::make_unique<generalist_mlx_qwen_model>();
+  mlx_stream cpu_stream{nullptr};
+  mlx_stream gpu_stream{nullptr};
   try {
+    install_nonterminating_mlx_error_handler();
+    cpu_stream = mlx_default_cpu_stream_new();
+    gpu_stream = mlx_default_gpu_stream_new();
+    auto candidate = std::make_unique<generalist_mlx_qwen_model>();
     for (size_t index = 0; index < source_count; ++index) {
       if (sources[index].path == nullptr || sources[index].path[0] == '\0') {
         throw std::runtime_error("Qwen model blob path cannot be empty");
@@ -3909,6 +3926,12 @@ extern "C" int generalist_mlx_qwen_model_new(
     return 0;
   } catch (const std::exception &exception) {
     set_error(error, error_capacity, exception.what());
+    mlx_stream_free(gpu_stream);
+    mlx_stream_free(cpu_stream);
+    return 1;
+  } catch (...) {
+    set_error(error, error_capacity,
+              "Qwen model loader caught an unknown native exception");
     mlx_stream_free(gpu_stream);
     mlx_stream_free(cpu_stream);
     return 1;

@@ -10,7 +10,7 @@
 //! - tool results are processed *inside* the script and never enter the
 //!   model's context unless printed — state offloading for free
 //!
-//! Mechanics: the agent writes `tools.py` + `main.py` to a scratch dir, runs
+//! Mechanics: the agent writes `tools.py` + `main.py` to an ephemeral scratch dir, runs
 //! `main.py` through a small wrapper that preloads `tools`, and serves tool
 //! calls over a Unix socket. Every
 //! bridged call goes through the same `ToolRegistry` permission gate as a
@@ -20,7 +20,7 @@ use crate::agent::AgentEvent;
 use crate::tool::{ToolCallOutcome, ToolRegistry};
 use crate::types::{ContentBlock, ToolDef};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -221,8 +221,9 @@ pub(crate) fn python_tool_def(available_tools: &[ToolDef], code_only_tools: &[To
              inspection. Complete the largest coherent work phase in one script \
              instead of returning after one bridged call: loop, branch, retry, validate, and \
              combine results in code. Tool results stay inside the script unless printed. Print \
-             only conclusions, compact evidence, and paths; write large intermediate results to \
-             files. Output is truncated to the last 50,000 characters (full output is saved to a \
+             only conclusions, compact evidence, and paths; write durable intermediate results \
+             under the current project because the runner's private scratch directory is removed \
+             after execution. Output is truncated to the last 50,000 characters (full output is saved to a \
              temp file whose path is included). Default timeout 120s (override with \
              timeout_seconds, max 600).\n\nAvailable bridge tools:\n{}{}",
             tool_docs, code_only_note
@@ -312,6 +313,27 @@ struct RemoveOnDrop {
     directory: PathBuf,
 }
 
+fn create_private_script_directory() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+
+    tempfile::Builder::new()
+        .prefix("generalist-script-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
+fn write_private_script_file(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_ref())
+}
+
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket);
@@ -345,24 +367,24 @@ async fn run_script_inner(
     registry: &mut ToolRegistry,
     on_event: &mut dyn FnMut(AgentEvent),
 ) -> Result<ScriptResult, String> {
-    // A persistent scratch dir: scripts may print paths to files they wrote
-    // here, which the model may read back later, so don't auto-delete.
-    let script_dir: PathBuf = std::env::temp_dir().join(format!(
-        "generalist-script-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&script_dir)
+    // Scaffold source can contain conversation data and tool schemas. Keep it
+    // in an atomically created owner-only directory and remove the whole tree
+    // when execution ends. Scripts that need durable artifacts write them in
+    // the inherited project cwd.
+    let script_directory = create_private_script_directory()
         .map_err(|e| format!("Failed to create script dir: {}", e))?;
+    let script_dir = script_directory.path();
 
-    std::fs::write(
-        script_dir.join("tools.py"),
+    write_private_script_file(
+        &script_dir.join("tools.py"),
         generate_tools_module(&registry.get_bridge_tool_defs()),
     )
     .map_err(|e| format!("Failed to write tools.py: {}", e))?;
     let main_py = script_dir.join("main.py");
-    std::fs::write(&main_py, code).map_err(|e| format!("Failed to write main.py: {}", e))?;
+    write_private_script_file(&main_py, code)
+        .map_err(|e| format!("Failed to write main.py: {}", e))?;
     let runner_py = script_dir.join("runner.py");
-    std::fs::write(&runner_py, RUNNER_MODULE)
+    write_private_script_file(&runner_py, RUNNER_MODULE)
         .map_err(|e| format!("Failed to write runner.py: {}", e))?;
 
     // Unix socket paths are limited to ~104 bytes (SUN_LEN); macOS per-user
@@ -406,6 +428,7 @@ async fn run_script_inner(
         .arg(&runner_py)
         .arg(&main_py)
         .env("GENERALIST_TOOL_SOCKET", &socket_path)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -589,10 +612,9 @@ mod tests {
         assert!(module.contains("Call: tools.tricky(*, x: str | None = None, **extra) -> str"));
 
         // Ask Python itself whether the module compiles.
-        let dir = std::env::temp_dir().join(format!("gm-test-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tools.py");
-        std::fs::write(&path, &module).unwrap();
+        let dir = create_private_script_directory().unwrap();
+        let path = dir.path().join("tools.py");
+        write_private_script_file(&path, &module).unwrap();
         let status = std::process::Command::new("python3")
             .arg("-m")
             .arg("py_compile")
@@ -600,6 +622,33 @@ mod tests {
             .status()
             .expect("python3 available");
         assert!(status.success(), "generated tools.py does not compile");
+    }
+
+    #[test]
+    fn script_scaffold_is_private_and_ephemeral() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory_path;
+        {
+            let directory = create_private_script_directory().unwrap();
+            directory_path = directory.path().to_path_buf();
+            assert_eq!(
+                std::fs::metadata(&directory_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+
+            let script = directory_path.join("main.py");
+            write_private_script_file(&script, b"print('private')\n").unwrap();
+            assert_eq!(
+                std::fs::metadata(script).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!directory_path.exists());
     }
 
     #[test]

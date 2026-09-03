@@ -1,13 +1,40 @@
 use crate::{Error, Result, Tool};
 use async_trait::async_trait;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Maximum bytes of response body to read.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Resolve every HTTP connection locally and reject the complete answer when
+/// any address is not public. Installing this on the reqwest client makes the
+/// check apply to redirect targets as well as the initial URL, and the
+/// returned addresses are the ones reqwest actually connects to.
+#[derive(Debug)]
+struct PublicDnsResolver;
+
+impl Resolve for PublicDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let resolved = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| {
+                    Box::new(std::io::Error::other(format!(
+                        "DNS resolution for {host} failed: {error}"
+                    ))) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+            let addresses = checked_resolved_addresses(&host, resolved).map_err(|message| {
+                Box::new(std::io::Error::other(message)) as Box<dyn std::error::Error + Send + Sync>
+            })?;
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
 
 pub struct HttpFetchTool;
 
@@ -31,10 +58,9 @@ struct HttpFetchResponse {
 
 /// Reject URLs that point at local or private infrastructure.
 ///
-/// This is a best-effort guard, not a security boundary: a determined
-/// attacker with DNS control can still race resolution (TOCTOU). Redirects
-/// are re-checked hop by hop, and hostnames are resolved and checked before
-/// connecting.
+/// This remains an application policy rather than a network sandbox.
+/// Redirect URLs are checked hop by hop, while [`PublicDnsResolver`] filters
+/// and returns the exact address set from which reqwest selects a connection.
 fn host_is_disallowed(host: &str) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
@@ -65,6 +91,25 @@ fn ip_is_disallowed(ip: IpAddr) -> bool {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
         }
     }
+}
+
+fn checked_resolved_addresses(
+    host: &str,
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addresses = addresses.into_iter().collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(format!("DNS resolution for {host} returned no addresses"));
+    }
+    if addresses
+        .iter()
+        .any(|address| ip_is_disallowed(address.ip()))
+    {
+        return Err(format!(
+            "{host} resolves to a local or private address; refusing to fetch"
+        ));
+    }
+    Ok(addresses)
 }
 
 fn check_url(url: &reqwest::Url) -> std::result::Result<(), String> {
@@ -133,25 +178,6 @@ impl Tool for HttpFetchTool {
             .map_err(|e| Error::Tool(format!("Invalid URL: {}", e)))?;
         check_url(&url).map_err(Error::Tool)?;
 
-        // Hostnames can resolve to private addresses; check what DNS says
-        // before connecting.
-        if let Some(host) = url.host_str() {
-            if host.parse::<IpAddr>().is_err() {
-                let port = url.port_or_known_default().unwrap_or(443);
-                let addrs = tokio::net::lookup_host((host, port))
-                    .await
-                    .map_err(|e| Error::Tool(format!("DNS resolution failed: {}", e)))?;
-                for addr in addrs {
-                    if ip_is_disallowed(addr.ip()) {
-                        return Err(Error::Tool(
-                            "URL resolves to a local or private address; refusing to fetch"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-
         let timeout = Duration::from_secs(params.timeout_seconds.unwrap_or(30).min(300));
 
         // Validate every redirect hop against the same policy.
@@ -168,6 +194,11 @@ impl Tool for HttpFetchTool {
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(redirect_policy)
+            // A proxy would resolve and connect to the target outside the
+            // checked resolver, so public-only fetching deliberately bypasses
+            // ambient proxy configuration.
+            .no_proxy()
+            .dns_resolver(PublicDnsResolver)
             .user_agent("generalist-agent/0.2")
             .build()
             .map_err(|e| Error::Tool(format!("Failed to create HTTP client: {}", e)))?;
@@ -284,5 +315,24 @@ mod tests {
         }
         let ftp = reqwest::Url::parse("ftp://example.com/").unwrap();
         assert!(check_url(&ftp).is_err());
+    }
+
+    #[test]
+    fn dns_answers_fail_closed_if_any_address_is_private() {
+        let mixed = [
+            SocketAddr::from(([93, 184, 216, 34], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        ];
+        assert!(checked_resolved_addresses("mixed.example", mixed).is_err());
+
+        let public = [
+            SocketAddr::from(([93, 184, 216, 34], 0)),
+            SocketAddr::from(([8, 8, 8, 8], 0)),
+        ];
+        assert_eq!(
+            checked_resolved_addresses("public.example", public).unwrap(),
+            public
+        );
+        assert!(checked_resolved_addresses("empty.example", []).is_err());
     }
 }
