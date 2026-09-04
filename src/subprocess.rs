@@ -3,8 +3,10 @@
 //! handling, and result formats cannot drift apart.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::time::Duration;
 
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub(crate) const MAX_TIMEOUT_SECS: u64 = 600;
@@ -16,6 +18,7 @@ const TAIL_CAP_BYTES: usize = 512 * 1024;
 /// in-memory tail keeps tracking the stream's end) so a runaway command
 /// cannot exhaust the disk either.
 const SPILL_CAP_BYTES: u64 = 64 * 1024 * 1024;
+const OUTPUT_DRAIN_GRACE_SECS: u64 = 2;
 
 /// One fully drained child stream: a bounded tail plus an optional spill of
 /// the full stream on disk.
@@ -69,6 +72,7 @@ impl CollectedStream {
 pub(crate) async fn collect_bounded(
     mut reader: impl AsyncRead + Unpin,
     spill_prefix: &str,
+    spill_directory: Option<PathBuf>,
 ) -> CollectedStream {
     let mut tail: VecDeque<u8> = VecDeque::with_capacity(TAIL_CAP_BYTES);
     let mut total: u64 = 0;
@@ -86,11 +90,14 @@ pub(crate) async fn collect_bounded(
             // First overflow: start the spill with everything seen so far.
             // A failed spill setup degrades to tail-only, never unbounded.
             let prefix = spill_prefix.to_string();
+            let directory = spill_directory.clone();
             let created = tokio::task::spawn_blocking(move || {
-                let temporary = tempfile::Builder::new()
-                    .prefix(&prefix)
-                    .suffix(".txt")
-                    .tempfile()?;
+                let mut builder = tempfile::Builder::new();
+                builder.prefix(&prefix).suffix(".txt");
+                let temporary = match directory {
+                    Some(directory) => builder.tempfile_in(directory)?,
+                    None => builder.tempfile()?,
+                };
                 Ok::<_, std::io::Error>(temporary.into_parts())
             })
             .await;
@@ -140,14 +147,52 @@ pub(crate) async fn collect_bounded(
     }
 }
 
-/// Kill the child's entire process group, then reap the leader normally.
+/// Give a killed process tree a short opportunity to close its output pipe,
+/// then stop waiting. An escaped descendant must not be able to hold the host
+/// tool call open indefinitely just by retaining stdout or stderr.
+pub(crate) async fn finish_output_collector(
+    mut task: tokio::task::JoinHandle<CollectedStream>,
+) -> String {
+    match tokio::time::timeout(Duration::from_secs(OUTPUT_DRAIN_GRACE_SECS), &mut task).await {
+        Ok(Ok(stream)) => stream.into_text(),
+        Ok(Err(_)) => String::new(),
+        Err(_) => {
+            task.abort();
+            String::new()
+        }
+    }
+}
+
+/// RAII ownership of one model-authored execution group.
 ///
-/// Callers must have spawned the child with `process_group(0)`; without a
-/// group kill, grandchildren of `bash -c 'x | y &'` survive a timeout.
-pub(crate) fn kill_process_group(child: &tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        // A negative pid addresses the whole process group.
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+/// Explicit completion paths call [`Self::kill`]. If an agent turn or tool
+/// future is cancelled, `Drop` still kills the complete group instead of
+/// relying on Tokio's `kill_on_drop`, which covers only the leader.
+pub(crate) struct ProcessGroupGuard {
+    process_group_id: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    /// Capture the pid immediately after spawning with `process_group(0)`:
+    /// `Child::id()` becomes `None` after the leader exits, exactly when an
+    /// orphaned background descendant may still need cleanup.
+    pub(crate) fn new(process_group_id: Option<u32>) -> Self {
+        Self { process_group_id }
+    }
+
+    pub(crate) fn kill(&mut self) {
+        if let Some(pid) = self.process_group_id.take() {
+            // A negative pid addresses the whole process group. Taking the id
+            // before signalling prevents a later Drop from targeting a group
+            // whose numeric id may have been recycled.
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -177,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn small_streams_pass_through_unchanged() {
         let data = b"hello world".as_slice();
-        let collected = collect_bounded(data, "generalist-test-").await;
+        let collected = collect_bounded(data, "generalist-test-", None).await;
         assert_eq!(collected.into_text(), "hello world");
     }
 
@@ -186,7 +231,7 @@ mod tests {
         let mut data = vec![b'a'; TAIL_CAP_BYTES * 2];
         data.extend_from_slice(b"THE_END");
         let total = data.len();
-        let collected = collect_bounded(data.as_slice(), "generalist-test-").await;
+        let collected = collect_bounded(data.as_slice(), "generalist-test-", None).await;
 
         assert_eq!(collected.total_bytes, total as u64);
         assert!(collected.tail.len() <= TAIL_CAP_BYTES);
@@ -204,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn undisclosed_spills_are_removed_when_collection_is_dropped() {
         let data = vec![b'x'; TAIL_CAP_BYTES + 1];
-        let collected = collect_bounded(data.as_slice(), "generalist-test-").await;
+        let collected = collect_bounded(data.as_slice(), "generalist-test-", None).await;
         let path = collected
             .spill
             .as_ref()

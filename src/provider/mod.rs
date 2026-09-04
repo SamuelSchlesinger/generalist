@@ -89,7 +89,15 @@ pub trait Provider: Send + Sync {
 /// used by Anthropic and OpenAI) and the bare-string form (`{"error": "..."}`,
 /// used by Ollama).
 pub(crate) fn parse_error_value(value: &serde_json::Value) -> Option<(String, Option<String>)> {
-    let error = value.get("error")?;
+    let Some(error) = value.get("error") else {
+        let message = value.get("message")?.as_str()?.to_string();
+        let error_type = value
+            .get("type")
+            .or_else(|| value.get("code"))
+            .and_then(|kind| kind.as_str())
+            .map(str::to_string);
+        return Some((message, error_type));
+    };
     if let serde_json::Value::String(text) = error {
         return Some((text.clone(), None));
     }
@@ -363,5 +371,14 @@ mod tests {
         let error = parse_sse_json("{not json").unwrap_err();
         assert!(error.is_retryable());
         assert!(error.to_string().contains("malformed SSE JSON"));
+    }
+
+    #[test]
+    fn bare_cerebras_error_objects_keep_message_and_type() {
+        let (message, error_type) = parse_error_body(
+            br#"{"message":"Tokens per minute limit exceeded","type":"too_many_tokens_error","param":"quota","code":"token_quota_exceeded"}"#,
+        );
+        assert_eq!(message, "Tokens per minute limit exceeded");
+        assert_eq!(error_type.as_deref(), Some("too_many_tokens_error"));
     }
 }

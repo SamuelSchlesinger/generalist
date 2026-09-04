@@ -77,7 +77,13 @@ impl Error {
 /// condition. `default` applies when the type is absent or unrecognized.
 pub(crate) fn provider_error_type_is_transient(error_type: Option<&str>, default: bool) -> bool {
     match error_type {
-        Some("overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error") => true,
+        Some(
+            "overloaded_error"
+            | "api_error"
+            | "rate_limit_error"
+            | "too_many_tokens_error"
+            | "timeout_error",
+        ) => true,
         Some(
             "invalid_request_error"
             | "authentication_error"

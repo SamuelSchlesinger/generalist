@@ -6,6 +6,7 @@ use crate::model_trace::{ArchiveModelAction, AsyncModelAction, MemoryModelAction
 use crate::permissions::{
     AlwaysAllowPermissions, PermissionDecision, ToolExecutionRequest, ToolPermissionHandler,
 };
+use crate::sandbox::ExecutionSandbox;
 use crate::scope::ScopeFilter;
 use crate::types::{ContentBlock, ToolDef};
 use crate::Error;
@@ -235,6 +236,7 @@ pub struct ToolRegistry {
     order: Vec<String>,
     executions: Vec<ToolExecution>,
     permission_handler: Box<dyn ToolPermissionHandler>,
+    execution_sandbox: ExecutionSandbox,
     model_trace: Option<ModelTrace>,
 }
 
@@ -255,12 +257,24 @@ impl ToolRegistry {
             order: Vec::new(),
             executions: Vec::new(),
             permission_handler: handler,
+            execution_sandbox: ExecutionSandbox::unrestricted(),
             model_trace: None,
         }
     }
 
     pub fn set_permission_handler(&mut self, handler: Box<dyn ToolPermissionHandler>) {
         self.permission_handler = handler;
+    }
+
+    /// Select the containment boundary used by model-authored subprocesses.
+    /// Library registries default to unrestricted execution for compatibility;
+    /// the CLI installs a workspace sandbox unless `--yolo` was selected.
+    pub fn set_execution_sandbox(&mut self, sandbox: ExecutionSandbox) {
+        self.execution_sandbox = sandbox;
+    }
+
+    pub fn execution_sandbox(&self) -> &ExecutionSandbox {
+        &self.execution_sandbox
     }
 
     #[doc(hidden)]

@@ -371,11 +371,25 @@ by the controller after execution. Display-only actions are covered by
   capability plus the reserved `update_goal` control while a goal is active; any
   other undeclared response is paired with an error for `ToolHistoryIsValid`
   but is never exposed as executable tool activity.
-- `NoAutomaticRetrieval` is not a same-UID filesystem sandbox. The dedicated
-  archive APIs are permission-gated and the host performs no prompt injection,
-  but the advertised `python`, `bash`, and file tools can access the same local
-  files if separately authorized. Hard confidentiality between project
-  archives requires an OS sandbox or a dedicated user, not this model.
+- `NoAutomaticRetrieval` is not by itself a same-UID filesystem sandbox. Normal
+  CLI `python`, `bash`, `patch_file`, and Z3 subprocesses now run in the
+  project-scoped OS sandbox, but approved
+  host file/archive tools, configured MCP servers, `--yolo`, and unconfigured
+  library registries remain outside that subprocess boundary. Hard
+  confidentiality from those trusted-host components still requires a VM,
+  container, or dedicated user, not this model.
+- The macOS Seatbelt policy remains inherited if a child uses `posix_spawn` to
+  enter another process group, but the host's process-group cleanup can no
+  longer identify that child after reparenting. Denying `posix_spawn` also
+  denies common runtime launchers, so guaranteed adversarial resource cleanup
+  remains outside this defense-in-depth boundary.
+- Subprocess ownership is RAII-based: timeout, cancellation, bridge failure,
+  normal leader exit, and dropped tool futures kill the complete process group.
+  Python bridge frames and serialization are bounded, and a two-second host
+  write deadline prevents a script from wedging the bridge by refusing a
+  response. Every restricted child disables core dumps and has a hard
+  1,024-descriptor ceiling. These are per-call controls, not aggregate
+  memory/CPU/process/disk quotas.
 - The memory request channel and live episode store have no quota in this
   experiment. One request is enqueued per settled turn and ordinary SQLite lock
   contention is bounded by the busy timeout, but a hung filesystem or sustained

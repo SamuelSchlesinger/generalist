@@ -11,12 +11,13 @@ use generalist::tui::{TerminalUi, UiAction};
 use generalist::{
     conversation_transcript, history_tool_protocol_is_valid, is_local_command,
     latest_assistant_reasoning, latest_assistant_text, parse_local_command, truncate_middle, Agent,
-    AgentEvent, CopyCommand, DeliveryMode, EpisodeOutcome, EpisodicMemory, Error, GoalCommand,
-    HistoryCommand, HistoryStore, LocalCommand, McpCommand, MemoryCommand, MemoryEvent,
-    MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt, PermissionChoice,
-    PermissionRequest, PermissionUiEvent, ProfilePaths, PromptQueue, PromptSource, Result,
-    SavedState, ToolRegistry, TurnControl, TurnOutcome, UsageCommand, WorkspaceScope,
-    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS, DEFAULT_COMPACTION_THRESHOLD_TOKENS,
+    AgentEvent, AlwaysAllowPermissions, CopyCommand, DeliveryMode, EpisodeOutcome, EpisodicMemory,
+    Error, ExecutionSandbox, GoalCommand, HistoryCommand, HistoryStore, LocalCommand, McpCommand,
+    MemoryCommand, MemoryEvent, MemoryPermissionHandler, MessageOrigin, PermissionBrokerPrompt,
+    PermissionChoice, PermissionRequest, PermissionUiEvent, ProfilePaths, PromptQueue,
+    PromptSource, Result, SavedState, ToolPermissionHandler, ToolRegistry, TurnControl,
+    TurnOutcome, UsageCommand, WorkspaceScope, DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+    DEFAULT_COMPACTION_THRESHOLD_TOKENS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -185,7 +186,24 @@ fn build_provider(keys: &ApiKeys, provider: &str, model: String) -> Result<Box<d
                 .cerebras
                 .clone()
                 .ok_or_else(|| Error::Other("CEREBRAS_API_KEY is not set".to_string()))?;
-            Ok(Box::new(CerebrasProvider::new(key, model)?))
+            let provider = CerebrasProvider::new(key, model)?;
+            let provider = match env::var("CEREBRAS_TOKENS_PER_MINUTE") {
+                Ok(raw) => {
+                    let limit = raw.trim().parse::<u64>().map_err(|_| {
+                        Error::Other(
+                            "CEREBRAS_TOKENS_PER_MINUTE must be a positive integer".to_string(),
+                        )
+                    })?;
+                    provider.with_tokens_per_minute(limit)?
+                }
+                Err(env::VarError::NotPresent) => provider,
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(Error::Other(
+                        "CEREBRAS_TOKENS_PER_MINUTE must be valid UTF-8".to_string(),
+                    ));
+                }
+            };
+            Ok(Box::new(provider))
         }
         "openai" => {
             let key = keys
@@ -239,19 +257,23 @@ fn default_remote_provider_and_model(keys: &ApiKeys) -> Option<(String, String)>
 
 fn build_registry(
     todo_file_path: &Path,
-    permission_handler: &MemoryPermissionHandler,
+    permission_handler: Box<dyn ToolPermissionHandler>,
+    execution_sandbox: ExecutionSandbox,
     history_store: &HistoryStore,
     memory: Option<&EpisodicMemory>,
 ) -> Result<ToolRegistry> {
-    let mut registry = ToolRegistry::with_permission_handler(Box::new(permission_handler.clone()));
+    let mut registry = ToolRegistry::with_permission_handler(permission_handler);
+    registry.set_execution_sandbox(execution_sandbox.clone());
     registry.register(Arc::new(ReadFileTool))?;
-    registry.register(Arc::new(PatchFileTool))?;
+    registry.register(Arc::new(SandboxedPatchFileTool::new(
+        execution_sandbox.clone(),
+    )))?;
     registry.register(Arc::new(ListDirectoryTool))?;
-    registry.register(Arc::new(BashTool))?;
+    registry.register(Arc::new(SandboxedBashTool::new(execution_sandbox.clone())))?;
     registry.register(Arc::new(WeatherTool))?;
     registry.register(Arc::new(HttpFetchTool))?;
     registry.register(Arc::new(WikipediaTool))?;
-    registry.register(Arc::new(Z3SolverTool))?;
+    registry.register(Arc::new(SandboxedZ3SolverTool::new(execution_sandbox)))?;
     registry.register(Arc::new(TodoTool::new(todo_file_path)))?;
     registry.register(Arc::new(FirecrawlCrawlTool))?;
     registry.register(Arc::new(FirecrawlSearchTool))?;
@@ -1086,17 +1108,21 @@ struct CliArgs {
     provider: Option<String>,
     model: Option<String>,
     global_scope: bool,
+    yolo: bool,
     max_tokens: Option<u32>,
     show_licenses: bool,
 }
 
 fn print_usage() {
     println!(
-        "Usage: generalist [--global] [--provider <name> [--model <id>]] [--gemini] [--local [model]] [--embedded [model]] [--max-tokens <count>] [--licenses]"
+        "Usage: generalist [--global] [--yolo] [--provider <name> [--model <id>]] [--gemini] [--local [model]] [--embedded [model]] [--max-tokens <count>] [--licenses]"
     );
     println!();
     println!("  --global          Use the explicit cross-project history/memory scope");
     println!("                    (default: project scope discovered from the working directory)");
+    println!(
+        "  --yolo            Disable the sandbox and allow all tools without permission prompts"
+    );
     println!("  --gemini          Use Gemini 3.7 Flash through OpenRouter");
     println!("                    (requires OPENROUTER_API_KEY; --local takes precedence)");
     println!(
@@ -1125,6 +1151,9 @@ fn print_usage() {
     );
     println!("  --licenses        Show third-party licenses and exit");
     println!("  -h, --help        Show this help");
+    println!();
+    println!("Execution is sandboxed to the current project by default.");
+    println!("Linux safe mode requires Landlock or a working Bubblewrap installation.");
 }
 
 fn parse_max_tokens(value: &str) -> std::result::Result<u32, String> {
@@ -1144,12 +1173,14 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
     let mut provider = None;
     let mut model = None;
     let mut global_scope = false;
+    let mut yolo = false;
     let mut max_tokens = None;
     let mut show_licenses = false;
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--global" => global_scope = true,
+            "--yolo" => yolo = true,
             "--gemini" => gemini = true,
             "--licenses" => show_licenses = true,
             "--provider" => {
@@ -1245,6 +1276,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
         provider,
         model,
         global_scope,
+        yolo,
         max_tokens,
         show_licenses,
     }
@@ -1252,6 +1284,29 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> CliArgs {
 
 fn parse_args() -> CliArgs {
     parse_args_from(env::args().skip(1))
+}
+
+fn registry_permission_handler(
+    cli: &CliArgs,
+    interactive: &MemoryPermissionHandler,
+) -> Box<dyn ToolPermissionHandler> {
+    if cli.yolo {
+        Box::new(AlwaysAllowPermissions)
+    } else {
+        Box::new(interactive.clone())
+    }
+}
+
+fn execution_sandbox_for_run(
+    cli: &CliArgs,
+    scope: &WorkspaceScope,
+    working_directory: &Path,
+) -> Result<ExecutionSandbox> {
+    if cli.yolo {
+        Ok(ExecutionSandbox::unrestricted())
+    } else {
+        ExecutionSandbox::restricted(scope.project_root().unwrap_or(working_directory))
+    }
 }
 
 fn normalized_provider_id(provider: &str) -> Option<&'static str> {
@@ -2263,7 +2318,14 @@ fn compose_system_prompt(scope: &WorkspaceScope, profile_paths: &ProfilePaths) -
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("{} {error}", style("Error:").for_stderr().red());
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = parse_args();
     if cli.show_licenses {
         print!("{THIRD_PARTY_LICENSES}");
@@ -2336,7 +2398,6 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let mut ui = terminal(TerminalUi::start("Starting", "selecting model"))?;
     let working_directory = env::current_dir()
         .map_err(|error| Error::Other(format!("Failed to read working directory: {error}")))?;
     let scope = if cli.global_scope {
@@ -2344,8 +2405,22 @@ async fn main() -> Result<()> {
     } else {
         WorkspaceScope::discover(&working_directory)?
     };
+    // Validate containment before entering the alternate screen or asking the
+    // user to select a model. A missing/disabled backend should be a plain,
+    // actionable startup error rather than a late TUI failure.
+    let execution_sandbox = execution_sandbox_for_run(&cli, &scope, &working_directory)?;
+
+    let mut ui = terminal(TerminalUi::start("Starting", "selecting model"))?;
     let history_store = HistoryStore::open_profile(&profile_paths, scope.clone())?;
     ui.info(&format!("Storage scope: {}", scope.display_name()));
+    if let Some(root) = execution_sandbox.workspace_root() {
+        ui.info(&format!(
+            "Execution: sandboxed to {} (network blocked for shell and Python)",
+            root.display()
+        ));
+    } else {
+        ui.info("Execution: unrestricted; permission prompts are disabled for this run.");
+    }
 
     let (memory_event_tx, mut memory_event_rx) = mpsc::unbounded_channel();
     let memory = match EpisodicMemory::open_scoped_with_events(
@@ -2377,7 +2452,8 @@ async fn main() -> Result<()> {
     let permission_handler = MemoryPermissionHandler::with_prompt(permission_prompt);
     let mut registry = build_registry(
         profile_paths.todo_file(),
-        &permission_handler,
+        registry_permission_handler(&cli, &permission_handler),
+        execution_sandbox,
         &history_store,
         memory.as_ref(),
     )?;
@@ -2588,6 +2664,20 @@ mod tests {
     use super::*;
     use generalist::{PermissionCommand, ToolsCommand};
 
+    #[derive(Default)]
+    struct CountingPermissionPrompt {
+        prompts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl generalist::PermissionPrompt for CountingPermissionPrompt {
+        async fn choose(&self, _request: &generalist::ToolExecutionRequest) -> PermissionChoice {
+            self.prompts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            PermissionChoice::DenyOnce
+        }
+    }
+
     #[test]
     fn memory_export_uses_supplied_profile_directory() {
         let home = tempfile::tempdir().unwrap();
@@ -2617,6 +2707,63 @@ mod tests {
                 "google/gemini-3.7-flash".to_string()
             )))
         );
+    }
+
+    #[tokio::test]
+    async fn yolo_is_host_only_and_never_prompts() {
+        let cli = parse_args_from(["--yolo"].into_iter().map(str::to_string));
+        assert!(cli.yolo);
+
+        let prompt = Arc::new(CountingPermissionPrompt::default());
+        let interactive = MemoryPermissionHandler::with_prompt(Arc::clone(&prompt) as _);
+        interactive.set_always_deny(["bash".to_string()].into());
+        let gate = registry_permission_handler(&cli, &interactive);
+
+        for tool_name in ["python", "bash"] {
+            assert_eq!(
+                gate.check_permission(&generalist::ToolExecutionRequest {
+                    tool_use_id: format!("{tool_name}-id"),
+                    tool_name: tool_name.to_string(),
+                    input: serde_json::json!({"code": "pass"}),
+                    tool_description: "test tool".to_string(),
+                })
+                .await,
+                generalist::PermissionDecision::Allow
+            );
+        }
+        assert_eq!(prompt.prompts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(interactive.remembered_policy().always_deny.contains("bash"));
+        let sandbox_root = tempfile::tempdir().unwrap();
+        assert!(
+            !execution_sandbox_for_run(&cli, &WorkspaceScope::Global, sandbox_root.path())
+                .unwrap()
+                .is_restricted()
+        );
+
+        let normal_cli = parse_args_from(std::iter::empty());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(execution_sandbox_for_run(
+            &normal_cli,
+            &WorkspaceScope::project(sandbox_root.path()).unwrap(),
+            sandbox_root.path()
+        )
+        .unwrap()
+        .is_restricted());
+        assert!(matches!(
+            registry_permission_handler(&normal_cli, &interactive)
+                .check_permission(&generalist::ToolExecutionRequest {
+                    tool_use_id: "normal-bash-id".to_string(),
+                    tool_name: "bash".to_string(),
+                    input: serde_json::json!({"command": "true"}),
+                    tool_description: "test tool".to_string(),
+                })
+                .await,
+            generalist::PermissionDecision::DenyWithReason(_)
+        ));
+
+        let profile = ProfilePaths::new(tempfile::tempdir().unwrap().path());
+        let system_prompt = compose_system_prompt(&WorkspaceScope::Global, &profile);
+        assert!(!system_prompt.contains("--yolo"));
     }
 
     #[test]
@@ -3652,7 +3799,8 @@ mod tests {
         .unwrap();
         let registry = build_registry(
             profile.todo_file(),
-            &MemoryPermissionHandler::new(),
+            Box::new(MemoryPermissionHandler::new()),
+            ExecutionSandbox::unrestricted(),
             &history,
             Some(&memory),
         )

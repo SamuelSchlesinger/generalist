@@ -17,14 +17,16 @@
 //! direct call, so interactive approval still applies.
 
 use crate::agent::AgentEvent;
+use crate::sandbox::SandboxAccess;
 use crate::tool::{ToolCallOutcome, ToolRegistry};
 use crate::types::{ContentBlock, ToolDef};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream as StdUnixStream;
+use std::path::Path;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::process::Command;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::time::Duration;
 
 /// The name the code-mode tool is advertised under.
@@ -32,9 +34,19 @@ pub(crate) const PY_TOOL_NAME: &str = "python";
 
 pub(crate) use crate::subprocess::{DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
 
+const MAX_BRIDGE_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_BRIDGE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BRIDGED_TOOL_CALLS: u64 = 64;
+const BRIDGE_WRITE_TIMEOUT_SECS: u64 = 2;
+
 const RUNNER_MODULE: &str = r#""""Generalist code-mode bootstrap."""
+import os as _os
 import runpy as _runpy
 import sys as _sys
+
+# -I -S deliberately omits the script/project directory and site hooks.
+# Add only this owner-private scaffold directory before importing the bridge.
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import tools as _tools
 
 _runpy.run_path(_sys.argv[1], init_globals={"tools": _tools}, run_name="__main__")
@@ -258,22 +270,22 @@ Generalist preloads this module as `tools`; `import tools` also works.
 Call tools.<name>(**kwargs) -> str. Raises RuntimeError on failure."""
 import json as _json
 import os as _os
-import socket as _socket
 
-_sock = None
-_rfile = None
+_bridge = _os.fdopen(0, "r+b", buffering=0)
+_MAX_REQUEST_BYTES = 1048576
+_MAX_RESPONSE_BYTES = 8388608
 
 
 def _call(_tool, **kwargs):
-    global _sock, _rfile
-    if _sock is None:
-        _sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        _sock.connect(_os.environ["GENERALIST_TOOL_SOCKET"])
-        _rfile = _sock.makefile("r")
-    _sock.sendall((_json.dumps({"tool": _tool, "input": kwargs}) + "\n").encode())
-    line = _rfile.readline()
+    request = (_json.dumps({"tool": _tool, "input": kwargs}) + "\n").encode()
+    if len(request) > _MAX_REQUEST_BYTES:
+        raise RuntimeError(f"{_tool}: tool request exceeds the 1 MiB bridge limit")
+    _bridge.write(request)
+    line = _bridge.readline(_MAX_RESPONSE_BYTES + 1)
     if not line:
         raise RuntimeError("tool bridge closed unexpectedly")
+    if len(line) > _MAX_RESPONSE_BYTES or not line.endswith(b"\n"):
+        raise RuntimeError("tool bridge response exceeds the 8 MiB bridge limit")
     resp = _json.loads(line)
     if resp.get("is_error"):
         raise RuntimeError(f"{_tool}: {resp.get('content', 'tool failed')}")
@@ -307,12 +319,6 @@ pub(crate) struct ScriptResult {
     pub denied: bool,
 }
 
-/// Remove the bridge socket and its private directory when dropped.
-struct RemoveOnDrop {
-    socket: PathBuf,
-    directory: PathBuf,
-}
-
 fn create_private_script_directory() -> std::io::Result<tempfile::TempDir> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -334,11 +340,84 @@ fn write_private_script_file(path: &Path, contents: impl AsRef<[u8]>) -> std::io
     file.write_all(contents.as_ref())
 }
 
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket);
-        let _ = std::fs::remove_dir(&self.directory);
+async fn read_bridge_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    loop {
+        let (consumed, complete) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                if frame.is_empty() {
+                    return Ok(None);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "tool bridge closed in the middle of a request",
+                ));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let content_bytes = newline.unwrap_or(available.len());
+            if frame.len().saturating_add(content_bytes) > MAX_BRIDGE_REQUEST_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "tool bridge request exceeds the 1 MiB limit",
+                ));
+            }
+            frame.extend_from_slice(&available[..content_bytes]);
+            (
+                content_bytes + usize::from(newline.is_some()),
+                newline.is_some(),
+            )
+        };
+        reader.consume(consumed);
+        if complete {
+            return Ok(Some(frame));
+        }
     }
+}
+
+struct BoundedBridgeResponse {
+    bytes: Vec<u8>,
+}
+
+impl std::io::Write for BoundedBridgeResponse {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        // Reserve one byte for the newline framing delimiter consumed by the
+        // generated Python bridge.
+        let limit = MAX_BRIDGE_RESPONSE_BYTES - 1;
+        let next = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("tool bridge response length overflow"))?;
+        if next > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "tool bridge response exceeds the 8 MiB limit",
+            ));
+        }
+        self.bytes.try_reserve(bytes.len()).map_err(|_| {
+            std::io::Error::other("failed to reserve bounded tool bridge response memory")
+        })?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_bridge_response(response: &Value) -> Vec<u8> {
+    const TOO_LARGE: &[u8] =
+        b"{\"is_error\":true,\"content\":\"tool bridge response exceeds the 8 MiB limit\"}\n";
+    let mut writer = BoundedBridgeResponse { bytes: Vec::new() };
+    if serde_json::to_writer(&mut writer, response).is_err() {
+        return TOO_LARGE.to_vec();
+    }
+    writer.bytes.push(b'\n');
+    writer.bytes
 }
 
 /// Run `code` with the tool bridge attached.
@@ -387,49 +466,41 @@ async fn run_script_inner(
     write_private_script_file(&runner_py, RUNNER_MODULE)
         .map_err(|e| format!("Failed to write runner.py: {}", e))?;
 
-    // Unix socket paths are limited to ~104 bytes (SUN_LEN); macOS per-user
-    // temp dirs under /var/folders are long enough to overflow it, so the
-    // socket lives under /tmp with a short name — inside a freshly created
-    // mode-0700 directory, because /tmp is world-listable and a bare socket
-    // would otherwise be connectable by any local user.
-    let bridge_dir = PathBuf::from(format!(
-        "/tmp/gnl-{:.12}",
-        uuid::Uuid::new_v4().simple().to_string()
-    ));
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        // `create` (not `create_all`): an existing path here is unexpected
-        // and must fail rather than adopt a directory someone else planted.
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&bridge_dir)
-            .map_err(|e| format!("Failed to create bridge socket dir: {}", e))?;
-    }
-    let socket_path = bridge_dir.join("t.sock");
-    // Install the guard immediately after creation: metadata inspection or
-    // socket binding can fail too, and must not strand a private /tmp dir.
-    let _socket_guard = RemoveOnDrop {
-        socket: socket_path.clone(),
-        directory: bridge_dir.clone(),
-    };
-    let host_uid = {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(&bridge_dir)
-            .map_err(|e| format!("Failed to inspect bridge socket dir: {}", e))?
-            .uid()
-    };
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|e| format!("Failed to bind bridge socket: {}", e))?;
+    // A pre-connected socketpair is both shorter and safer than a pathname
+    // socket: there is nothing for another local process to discover or dial,
+    // and Linux can block creation of every new socket in the child.
+    let (host_stream, child_stream) =
+        StdUnixStream::pair().map_err(|e| format!("Failed to create tool bridge: {e}"))?;
+    host_stream
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to configure tool bridge: {e}"))?;
+    let stream = UnixStream::from_std(host_stream)
+        .map_err(|e| format!("Failed to start tool bridge: {e}"))?;
+    let child_bridge: OwnedFd = child_stream.into();
 
     // Inherit the agent's cwd so the model script reads/writes project files
     // naturally. runner.py's directory is first on sys.path, and run_path
     // gives main.py its normal file identity while preloading the bridge.
-    let mut child = Command::new("python3")
+    let sandbox = registry.execution_sandbox().clone();
+    let mut access = SandboxAccess::default();
+    access.allow_read_only(script_dir);
+    let mut prepared = sandbox
+        .prepare_command("python3", &access)
+        .map_err(|e| format!("Failed to prepare Python sandbox: {e}"))?;
+    let mut child = prepared
+        .command_mut()
+        // Isolated/no-site startup prevents project-controlled sitecustomize,
+        // user packages, PYTHON* variables, and the cwd from executing before
+        // the trusted runner establishes the bridge.
+        .arg("-I")
+        .arg("-S")
         .arg(&runner_py)
         .arg(&main_py)
-        .env("GENERALIST_TOOL_SOCKET", &socket_path)
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .stdin(Stdio::null())
+        // Map only the pre-connected bridge into the child. Using stdin lets
+        // the standard spawn plumbing perform the descriptor transfer without
+        // a process-wide close-on-exec race.
+        .stdin(Stdio::from(child_bridge))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Own process group so a timeout can kill descendants too.
@@ -437,6 +508,7 @@ async fn run_script_inner(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("Failed to start python3: {}. Is it installed?", e))?;
+    let mut process_group = crate::subprocess::ProcessGroupGuard::new(child.id());
 
     // Drain output concurrently — with bounded memory — so a chatty script
     // can neither dead-lock against a pending tool call nor OOM the agent.
@@ -445,14 +517,20 @@ async fn run_script_inner(
     let stdout_task = tokio::spawn(crate::subprocess::collect_bounded(
         stdout_pipe,
         "generalist-script-stdout-",
+        sandbox.scratch_directory().map(Path::to_path_buf),
     ));
     let stderr_task = tokio::spawn(crate::subprocess::collect_bounded(
         stderr_pipe,
         "generalist-script-stderr-",
+        sandbox.scratch_directory().map(Path::to_path_buf),
     ));
 
     let mut denied = false;
     let mut bridged_calls: u64 = 0;
+    let mut bridge_failure = None;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut frames = BufReader::new(read_half);
+    let mut bridge_open = true;
     // The timeout budget covers script compute only. Time spent inside
     // bridged tool calls — including however long the user takes to answer a
     // permission prompt — extends the deadline, so a slow approval can never
@@ -464,32 +542,64 @@ async fn run_script_inner(
         let deadline = started + Duration::from_secs(timeout_secs) + serving;
         tokio::select! {
             status = child.wait() => break status,
-            accepted = listener.accept() => {
-                if let Ok((stream, _)) = accepted {
-                    // Belt over the 0700 directory: only this user's
-                    // processes may drive the bridge.
-                    let authorized = stream
-                        .peer_cred()
-                        .map(|cred| cred.uid() == host_uid)
-                        .unwrap_or(false);
-                    if !authorized {
-                        continue;
-                    }
+            frame = read_bridge_frame(&mut frames), if bridge_open => {
+                match frame {
+                    Ok(Some(frame)) if bridged_calls < MAX_BRIDGED_TOOL_CALLS => {
                     let serve_started = tokio::time::Instant::now();
-                    serve_connection(
-                        stream,
+                    let response = handle_request(
+                        &frame,
                         registry,
                         on_event,
                         &mut denied,
                         &mut bridged_calls,
                     )
                     .await;
+                    let payload = serialize_bridge_response(&response);
+                    let write_result = tokio::time::timeout(
+                        Duration::from_secs(BRIDGE_WRITE_TIMEOUT_SECS),
+                        write_half.write_all(&payload),
+                    )
+                    .await;
+                    if !matches!(write_result, Ok(Ok(()))) {
+                        bridge_failure = Some(match write_result {
+                            Ok(Err(error)) => format!(
+                                "Python tool bridge could not return a result: {error}"
+                            ),
+                            Err(_) => format!(
+                                "Python tool bridge did not accept a result within \
+                                 {BRIDGE_WRITE_TIMEOUT_SECS} seconds"
+                            ),
+                            Ok(Ok(())) => unreachable!(),
+                        });
+                        process_group.kill();
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
                     serving += serve_started.elapsed();
+                    }
+                    Ok(Some(_)) => {
+                        bridge_failure = Some(format!(
+                            "Python tool bridge stopped after the maximum of \
+                             {MAX_BRIDGED_TOOL_CALLS} calls. Split the work into another script."
+                        ));
+                        process_group.kill();
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
+                    Ok(None) => bridge_open = false,
+                    Err(error) => {
+                        bridge_failure = Some(format!("Python tool bridge rejected a request: {error}"));
+                        process_group.kill();
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
-                crate::subprocess::kill_process_group(&child);
+                process_group.kill();
                 let _ = child.start_kill();
+                stdout_task.abort();
+                stderr_task.abort();
                 return Ok(ScriptResult {
                     content: format!(
                         "Script timed out after {} seconds and was killed.",
@@ -501,21 +611,26 @@ async fn run_script_inner(
             }
         }
     };
+    process_group.kill();
+    drop(frames);
+    drop(write_half);
+
+    let (stdout, stderr) = tokio::join!(
+        crate::subprocess::finish_output_collector(stdout_task),
+        crate::subprocess::finish_output_collector(stderr_task)
+    );
     let status = status.map_err(|e| format!("Failed to run python: {}", e))?;
 
-    let stdout = match stdout_task.await {
-        Ok(stream) => stream.into_text(),
-        Err(_) => String::new(),
-    };
-    let stderr = match stderr_task.await {
-        Ok(stream) => stream.into_text(),
-        Err(_) => String::new(),
+    let failed = !status.success() || bridge_failure.is_some();
+    let process_content = crate::subprocess::combine_output(status, &stdout, &stderr);
+    let content = match bridge_failure {
+        Some(message) if process_content.trim().is_empty() => message,
+        Some(message) => format!("{message}\n{process_content}"),
+        None => process_content,
     };
 
-    let failed = !status.success();
-    let content = crate::subprocess::combine_output(status, &stdout, &stderr);
-
-    let mut content = crate::tools::bash::tail_truncate_with_spill(&content);
+    let mut content =
+        crate::tools::bash::tail_truncate_with_spill(&content, sandbox.scratch_directory());
     if !failed && bridged_calls > 0 && content.trim().is_empty() {
         content = format!(
             "Script completed successfully with no output. {bridged_calls} tool call{} executed \
@@ -532,37 +647,15 @@ async fn run_script_inner(
     })
 }
 
-/// Serve bridged tool calls on one connection until the script closes it.
-async fn serve_connection(
-    stream: UnixStream,
-    registry: &mut ToolRegistry,
-    on_event: &mut dyn FnMut(AgentEvent),
-    denied: &mut bool,
-    bridged_calls: &mut u64,
-) {
-    let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let response = handle_request(&line, registry, on_event, denied, bridged_calls).await;
-        let mut payload = serde_json::to_string(&response).unwrap_or_else(|_| {
-            "{\"is_error\": true, \"content\": \"serialization failed\"}".to_string()
-        });
-        payload.push('\n');
-        if write_half.write_all(payload.as_bytes()).await.is_err() {
-            break;
-        }
-    }
-}
-
 async fn handle_request(
-    line: &str,
+    frame: &[u8],
     registry: &mut ToolRegistry,
     on_event: &mut dyn FnMut(AgentEvent),
     denied: &mut bool,
     bridged_calls: &mut u64,
 ) -> Value {
     *bridged_calls += 1;
-    let request: Value = match serde_json::from_str(line) {
+    let request: Value = match serde_json::from_slice(frame) {
         Ok(v) => v,
         Err(e) => return json!({"is_error": true, "content": format!("invalid request: {}", e)}),
     };
@@ -600,6 +693,55 @@ async fn handle_request(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn bridge_frames_are_bounded_and_preserve_message_boundaries() {
+        let input = b"one\ntwo\n";
+        let mut reader = BufReader::new(&input[..]);
+        assert_eq!(
+            read_bridge_frame(&mut reader).await.unwrap().unwrap(),
+            b"one"
+        );
+        assert_eq!(
+            read_bridge_frame(&mut reader).await.unwrap().unwrap(),
+            b"two"
+        );
+        assert!(read_bridge_frame(&mut reader).await.unwrap().is_none());
+
+        let mut exact = vec![b'x'; MAX_BRIDGE_REQUEST_BYTES];
+        exact.push(b'\n');
+        let mut reader = BufReader::new(exact.as_slice());
+        assert_eq!(
+            read_bridge_frame(&mut reader).await.unwrap().unwrap().len(),
+            MAX_BRIDGE_REQUEST_BYTES
+        );
+
+        let mut oversized = vec![b'x'; MAX_BRIDGE_REQUEST_BYTES + 1];
+        oversized.push(b'\n');
+        let mut reader = BufReader::new(oversized.as_slice());
+        assert_eq!(
+            read_bridge_frame(&mut reader).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn bridge_response_serialization_is_bounded_even_when_json_escaping_expands() {
+        let response = json!({
+            "is_error": false,
+            "content": "\0".repeat(MAX_BRIDGE_RESPONSE_BYTES / 2),
+        });
+        let payload = serialize_bridge_response(&response);
+
+        assert!(payload.len() <= MAX_BRIDGE_RESPONSE_BYTES);
+        assert_eq!(payload.last(), Some(&b'\n'));
+        let decoded: Value = serde_json::from_slice(&payload[..payload.len() - 1]).unwrap();
+        assert_eq!(decoded["is_error"], true);
+        assert!(decoded["content"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds the 8 MiB limit"));
+    }
+
     #[test]
     fn generated_module_is_valid_python_with_awkward_descriptions() {
         let defs = vec![ToolDef {
@@ -610,6 +752,9 @@ mod tests {
         let module = generate_tools_module(&defs);
         assert!(module.contains("def tricky(**kwargs):"));
         assert!(module.contains("Call: tools.tricky(*, x: str | None = None, **extra) -> str"));
+        assert!(module.contains("_os.fdopen(0"));
+        assert!(!module.contains("GENERALIST_TOOL_FD"));
+        assert!(!module.contains("GENERALIST_TOOL_SOCKET"));
 
         // Ask Python itself whether the module compiles.
         let dir = create_private_script_directory().unwrap();
@@ -677,5 +822,221 @@ mod tests {
             .contains("tools.search(*, query: str"));
         assert!(!definition.description.contains("Input schema:"));
         assert!(definition.description.contains("__doc__"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn restricted_runner_can_write_workspace_but_not_read_a_sibling() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let secret = parent.path().join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let output = workspace.join("output.txt");
+
+        let mut registry = ToolRegistry::new();
+        registry.set_execution_sandbox(
+            crate::sandbox::ExecutionSandbox::restricted(&workspace).unwrap(),
+        );
+        let code = format!(
+            concat!(
+                "from pathlib import Path\n",
+                "secret = Path({})\n",
+                "output = Path({})\n",
+                "try:\n secret.read_text()\n raise SystemExit('escaped')\n",
+                "except PermissionError:\n pass\n",
+                "output.write_text('inside')\n",
+                "print('contained')\n",
+            ),
+            serde_json::to_string(&secret.to_string_lossy()).unwrap(),
+            serde_json::to_string(&output.to_string_lossy()).unwrap(),
+        );
+        let result = run_script(&code, 10, &mut registry, &mut |_| {}).await;
+
+        assert!(!result.failed, "{}", result.content);
+        assert!(result.content.contains("contained"));
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "inside");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn restricted_runner_ignores_project_python_startup_hooks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let marker = workspace.path().join("startup-hook-ran.txt");
+        let startup = format!(
+            "from pathlib import Path\nPath({}).write_text('escaped')\n",
+            serde_json::to_string(&marker.to_string_lossy()).unwrap()
+        );
+        std::fs::write(workspace.path().join("sitecustomize.py"), startup).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.set_execution_sandbox(
+            crate::sandbox::ExecutionSandbox::restricted(workspace.path()).unwrap(),
+        );
+        let result = run_script("print('isolated')\n", 10, &mut registry, &mut |_| {}).await;
+
+        assert!(!result.failed, "{}", result.content);
+        assert!(result.content.contains("isolated"));
+        assert!(
+            !marker.exists(),
+            "project sitecustomize.py ran before the script"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_still_runs_after_a_bridged_tool_call() {
+        use crate::tools::CalculatorTool;
+        use std::sync::Arc;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CalculatorTool)).unwrap();
+        let result = run_script(
+            "import time\ntools.calculator(expression='1+1')\ntime.sleep(10)\n",
+            1,
+            &mut registry,
+            &mut |_| {},
+        )
+        .await;
+
+        assert!(result.failed);
+        assert!(result.content.contains("timed out"), "{}", result.content);
+    }
+
+    struct LargeBridgeResultTool;
+
+    #[async_trait::async_trait]
+    impl crate::Tool for LargeBridgeResultTool {
+        fn name(&self) -> &str {
+            "large_bridge_result"
+        }
+
+        fn description(&self) -> &str {
+            "Return a large result for bridge backpressure testing"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object", "additionalProperties": false})
+        }
+
+        async fn execute(&self, _input: Value) -> crate::Result<String> {
+            Ok("x".repeat(7 * 1024 * 1024))
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_backpressure_cannot_hold_the_host_past_its_write_deadline() {
+        use std::sync::Arc;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(LargeBridgeResultTool)).unwrap();
+        let started = tokio::time::Instant::now();
+        let result = run_script(
+            concat!(
+                "import os,time\n",
+                "os.write(0,b'{\"tool\":\"large_bridge_result\",\"input\":{}}\\n')\n",
+                "time.sleep(30)\n",
+            ),
+            10,
+            &mut registry,
+            &mut |_| {},
+        )
+        .await;
+
+        assert!(result.failed);
+        assert!(
+            result.content.contains("did not accept a result"),
+            "{}",
+            result.content
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bridge write deadline was not enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_stops_scripts_after_the_call_budget() {
+        use crate::tools::CalculatorTool;
+        use std::sync::Arc;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CalculatorTool)).unwrap();
+        let result = run_script(
+            "for _ in range(65): tools.calculator(expression='1+1')\n",
+            10,
+            &mut registry,
+            &mut |_| {},
+        )
+        .await;
+
+        assert!(result.failed);
+        assert!(
+            result.content.contains("maximum of 64 calls"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_script_cannot_leave_a_background_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("escaped.txt");
+        let code = format!(
+            concat!(
+                "import os,time\n",
+                "pid=os.fork()\n",
+                "if pid: os._exit(0)\n",
+                "os.close(0); os.close(1); os.close(2)\n",
+                "time.sleep(1)\n",
+                "open({}, 'w').write('escaped')\n",
+            ),
+            serde_json::to_string(&marker.to_string_lossy()).unwrap(),
+        );
+        let mut registry = ToolRegistry::new();
+        let result = run_script(&code, 5, &mut registry, &mut |_| {}).await;
+        assert!(!result.failed, "{}", result.content);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            !marker.exists(),
+            "background descendant survived tool return"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_script_future_kills_the_complete_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let started = directory.path().join("child-started.txt");
+        let escaped = directory.path().join("escaped.txt");
+        let code = format!(
+            concat!(
+                "import os,time\n",
+                "pid=os.fork()\n",
+                "if pid == 0:\n",
+                " open({}, 'w').write('started')\n",
+                " time.sleep(1)\n",
+                " open({}, 'w').write('escaped')\n",
+                " os._exit(0)\n",
+                "time.sleep(30)\n",
+            ),
+            serde_json::to_string(&started.to_string_lossy()).unwrap(),
+            serde_json::to_string(&escaped.to_string_lossy()).unwrap(),
+        );
+        let mut registry = ToolRegistry::new();
+        let mut events = |_| {};
+        let mut script = Box::pin(run_script(&code, 10, &mut registry, &mut events));
+        for _ in 0..200 {
+            tokio::select! {
+                result = &mut script => panic!("script exited before cancellation: {}", result.content),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            if started.exists() {
+                break;
+            }
+        }
+        assert!(started.exists(), "background child never started");
+
+        drop(script);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(!escaped.exists(), "cancelled script left a live descendant");
     }
 }

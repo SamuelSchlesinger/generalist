@@ -8,12 +8,31 @@ gating, and an agent loop that reports progress through event callbacks.
 
 ## Install and run
 
+Generalist requires Rust 1.88 or newer and Python 3. On macOS, install Apple's
+command-line tools with `xcode-select --install` if they are not already
+present. On Debian or Ubuntu, the build prerequisites are:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libssl-dev python3
+
+# Optional fallback for Linux kernels without Landlock ABI 4 support:
+sudo apt-get install -y bubblewrap
+```
+
+Then build from the checkout:
+
 ```bash
 cargo build --release --locked
 
-# Keys go in the environment or ~/.generalist.env:
+# Or install the `generalist` command into Cargo's bin directory:
+cargo install --path . --locked
+
+# Keys go in the environment or an owner-only ~/.generalist.env:
+touch ~/.generalist.env && chmod 600 ~/.generalist.env
 echo 'ANTHROPIC_API_KEY=sk-ant-...' >> ~/.generalist.env
 echo 'CEREBRAS_API_KEY=csk-...'      >> ~/.generalist.env   # and/or
+# Optional: CEREBRAS_TOKENS_PER_MINUTE=<TPM shown for your Cerebras project>
 echo 'OPENAI_API_KEY=sk-...'        >> ~/.generalist.env   # and/or
 echo 'OPENROUTER_API_KEY=sk-or-...' >> ~/.generalist.env   # and/or
 echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
@@ -34,7 +53,19 @@ echo 'FIRECRAWL_API_KEY=fc-...'     >> ~/.generalist.env   # optional, web tools
 ollama pull qwen3.8:27b-mlx
 ./target/release/generalist --local                    # qwen3.8:27b-mlx
 ./target/release/generalist --local qwen2.5-coder:32b  # or name one
+
+# Explicitly disable containment and allow every tool call without prompts:
+./target/release/generalist --yolo
 ```
+
+Normal CLI runs fail closed into a process sandbox. macOS uses the built-in
+`sandbox-exec` Seatbelt interface. Linux uses native Landlock plus seccomp on
+Landlock ABI 4 or newer kernels and falls back to a root-owned `bwrap`
+(Bubblewrap) installation on older kernels. No extra sandbox package is needed
+on current macOS or Linux systems with Landlock support. Generalist runs an
+actual restricted-process probe before opening the TUI; if no backend can be
+activated, startup fails with an actionable diagnostic instead of silently
+running model-authored code without containment.
 
 When `OPENROUTER_API_KEY` is configured, normal remote startup defaults to
 OpenRouter's `moonshotai/kimi-k3`. Without OpenRouter, a configured
@@ -254,11 +285,20 @@ that directory. The profile root is resolved once at startup, before
 `.generalist.env` is loaded, so changing `GENERALIST_HOME` inside that file
 does not relocate only part of the running profile.
 
-Ordinary completions have no universal fixed token default. Requests to the
-curated shared Cerebras models default to 8,192 completion tokens so an agent
-round reaches action before a reasoning model consumes its whole model limit;
-`--max-tokens N` overrides it. Unknown dedicated model IDs retain their own
-provider default.
+Ordinary completions have no universal fixed token default. Every Cerebras
+model defaults to 8,192 completion tokens so an agent round reaches action and
+Cerebras does not reserve the model's entire remaining sequence length;
+`--max-tokens N` overrides it.
+
+For Cerebras, Generalist reserves a conservative estimate of input tokens plus
+the requested completion budget before each call. It continuously paces that
+budget as a token bucket using Cerebras's live
+`x-ratelimit-limit-tokens-minute` and
+`x-ratelimit-remaining-tokens-minute` response headers, and observes the reset
+hint after a 429. Because the effective quota is organization-, project-, and
+model-specific, no tier number is hard-coded. Set
+`CEREBRAS_TOKENS_PER_MINUTE` to the current project value if the first request
+must also be paced; live headers replace that seed as soon as they arrive.
 The CLI compacts Cerebras conversations at roughly 48k tokens and keeps the
 most recent 16k, preserving headroom under the smallest current shared-model
 context window.
@@ -396,10 +436,10 @@ pause capture before sensitive work. The worker rejects symlinked
 database/directory targets. There is no automatic expiry or storage quota in
 this experiment; inspect and delete retained rows explicitly.
 The `0700` directory and `0600` database protect against other Unix users, not
-same-UID tools; this prototype is not a sandbox or a multi-agent security
-boundary. In particular, code mode's unsandboxed Python process can access the
-database as an ordinary local file if directed to its path. Permission-gated
-archive reads are not a same-UID sandbox and do not weaken this caveat.
+arbitrary same-UID host processes or approved host tools. Normal code-mode
+Python cannot directly read a profile database outside its project sandbox;
+`--yolo` removes that protection. Permission-gated archive reads are not a
+multi-agent security boundary and do not weaken this caveat.
 Simultaneous Generalist processes share settings/rows through SQLite locking,
 but have no cross-process queue ordering or collaboration protocol.
 
@@ -443,6 +483,42 @@ while every execution remains visible in the tool-activity panel. The activity
 preview keeps the first source or command lines visible after completion alongside
 the result summary.
 
+Starting Generalist with `--yolo` bypasses the permission handler for every tool
+call and selects unrestricted subprocess execution for that process. It does
+not modify or persist the remembered allow/deny policy, and a saved denial takes
+effect again on the next normal run. The active flag is host-side runtime state:
+it is not added to the agent's system prompt, tool descriptions, or
+conversation.
+
+Without `--yolo`, model-authored bash commands, code-mode Python, the
+`patch_file` parser, and Z3 run inside a workspace process sandbox. They can
+read and write the discovered project tree (or the startup directory with
+`--global`) and a fresh private scratch directory, and read system runtimes,
+toolchains, and executable directories. `patch_file` additionally refuses a
+target outside that tree before launch. Python uses only its pre-connected
+code-mode bridge mapped onto stdin. Other inherited file descriptors are sealed
+before exec, including files a host library accidentally opened without
+close-on-exec.
+The private sandbox Cargo home may reuse canonical public crates.io cache
+directories, but never host Cargo credentials, Git dependency caches, or other
+registries. Vendor private dependencies into the project before asking an agent
+to build them without host assistance.
+Direct host network access and access to the rest of the home directory are
+denied, and excessively broad workspaces such as `/`, the home directory, or a
+system root are refused. The native Linux backend combines Landlock filesystem,
+TCP, signal, and Unix-socket scopes where the running kernel supports them with
+a seccomp policy that blocks new sockets, cross-process controls, global IPC,
+namespace/mount APIs, and high-risk kernel interfaces. The Bubblewrap fallback
+uses the same seccomp policy plus isolated network/PID/IPC namespaces, a private
+`/dev`, capability dropping, and disabled nested user namespaces. The child
+environment is rebuilt from a small display/locale allowlist, so provider keys,
+SSH agent sockets, dynamic-loader injection variables, and other ambient
+credentials are not inherited. Core dumps are disabled and each child has a
+1,024-descriptor hard ceiling. Completion, timeout, cancellation, malformed
+bridge traffic, and ordinary process exit all terminate the complete execution
+group; output memory and spill files are bounded. Network and cross-scope work
+remain available only through separately permissioned host tools.
+
 `/permissions` lists persisted decisions in stable tool-name order and reports
 session-only exact-input allow counts without printing those inputs.
 `/permissions reset <tool>` removes that tool's name-level and session-only
@@ -467,8 +543,25 @@ Caveats:
   Each allowed invocation still receives a new capability bound to that exact
   tool name, complete input, and scope; allow-always does not grant a reusable
   unscoped storage handle.
-- The prompts are not a sandbox. An agent that can write and run code can circumvent
-  in-process fences; use a container or dedicated user for real isolation.
+- The subprocess sandbox is defense in depth, not a hostile multi-tenant
+  container: it has a wall-clock timeout but no aggregate memory, CPU, process,
+  or workspace-disk quota, can inspect filesystem metadata, and can read
+  secrets, pre-existing hard links, or mounted content inside the project tree.
+- The boundary covers model-authored bash and Python. Approved built-in tools
+  execute in the host and enforce their own input policy; configured MCP server
+  processes are also trusted host processes. Use a VM, container, or dedicated
+  user when those components are not trusted.
+- Apple's `sandbox-exec` interface is deprecated even though it remains present
+  on current macOS. Generalist checks it at startup and fails closed. On Linux,
+  Generalist prefers Landlock ABI 4 or newer and layers its syscall filter on
+  top; Bubblewrap is a fallback only when its hardened user-namespace sandbox
+  can actually start.
+- On macOS, Seatbelt containment is inherited by subprocesses, including a
+  subprocess that uses `posix_spawn` to enter another process group. That API
+  cannot be blocked without also breaking common runtime launchers, so the
+  best-effort process-group cleanup cannot guarantee that such a subprocess is
+  reaped when its command leader exits. Use a VM or container when adversarial
+  resource cleanup is part of the trust boundary.
 - Fetched web content is untrusted input; the approval step exists mainly to catch
   prompt injection acting on it.
 - `http_fetch` rejects localhost, private, and link-local addresses. Its
@@ -532,16 +625,24 @@ pages = tools.firecrawl_search(query="rust async runtimes")
 print(extract_urls(pages))
 ```
 
-Ordinary tool descriptions and schemas are folded into the `python` tool description,
-so the model can use them in its first script without a discovery round-trip. Calls are
-served over a Unix socket and pass through the same permission gate as direct mode.
-Results return to the script, not the model, so one script can perform a long sequence,
-process megabytes of output, validate the result, and print only the conclusion. Script
-errors come back as tool results, so the model can fix and re-run. Generated script and
-bridge sources live in an owner-only temporary directory and are removed after the
-process exits; durable artifacts belong in the inherited project directory. This is the pattern
-from CodeAct, Cloudflare's Code Mode, Anthropic's code-execution-with-MCP, and the
-"Code as Agent Harness" survey (arXiv 2605.18747).
+Ordinary tool descriptions and schemas are folded into the `python` tool
+description, so the model can use them in its first script without a discovery
+round-trip. Calls use a pre-connected Unix socketpair mapped onto stdin and
+pass through the same permission gate as direct mode. A script is limited to
+64 bridged calls; each request is capped at 1 MiB and each response at 8 MiB.
+The host also stops a script whose bridge response remains backpressured for
+two seconds, so a child that stops reading cannot wedge the agent.
+Results return to the script, not the model, so one script can process
+substantial output, validate the result, and print only the conclusion. Script
+errors come back as tool results, so the model can fix and re-run. Python starts
+in isolated, no-site mode so project/user startup hooks cannot run before the
+trusted runner. Generated script and bridge sources live in an owner-only
+temporary directory and are removed after the process exits. In normal CLI
+runs the script is sandboxed to the project, its private scratch space, system
+runtimes, and the inherited bridge descriptor; durable artifacts belong in the
+inherited project directory. This is the pattern from CodeAct, Cloudflare's
+Code Mode, Anthropic's code-execution-with-MCP, and the "Code as Agent Harness"
+survey (arXiv 2605.18747).
 
 The host-owned `/tools` command inspects this effective surface without calling
 a provider or capability. `/tools` lists registered bridges in stable
@@ -565,7 +666,8 @@ cannot be registered as a custom capability.
 
 Relation to CaMeL: tool output that stays inside a script cannot prompt-inject the
 model, and per-call approval acts as the policy check. There is no data-flow/taint
-tracking, and scripts run unsandboxed with your privileges.
+tracking; the workspace process sandbox is a coarse capability boundary rather
+than a provenance-aware information-flow policy.
 
 ## MCP
 
@@ -632,6 +734,9 @@ included in the `python` tool's bridge-function documentation. Permission policy
 pluggable via `ToolPermissionHandler`:
 `AlwaysAllow`, `AlwaysDeny`, name-based `PolicyPermissions`, or the interactive
 `MemoryPermissionHandler` the CLI uses.
+Library registries retain unrestricted subprocess behavior for compatibility.
+Install an `ExecutionSandbox::restricted(project_root)` on the registry and use
+`SandboxedBashTool` when embedding the safe execution path.
 
 ## Skills and project notes
 
@@ -652,7 +757,14 @@ in the working directory is appended to the system prompt at startup.
   bounds.
 - Compaction uses a chars/4 token estimate between provider measurements; treat
   thresholds as approximate.
-- Code-mode scripts run unsandboxed (see Permissions).
+- Normal CLI code-mode scripts and bash commands run in the workspace sandbox;
+  `--yolo` and unconfigured library registries are unrestricted (see
+  Permissions).
+- The sandbox bounds individual calls, streams, spill files, descriptors, and
+  execution groups. It is defense in depth, not a hostile multi-tenant runtime:
+  there is no aggregate memory/CPU/process/workspace-disk quota. On macOS,
+  Seatbelt remains inherited by a `posix_spawn` child that changes process
+  group, but the host cannot guarantee cleanup after that child is reparented.
 
 ## Development
 

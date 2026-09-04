@@ -11,7 +11,10 @@ use crate::types::{
     Message, StopReason, ToolDef, Usage,
 };
 use async_trait::async_trait;
+use reqwest::header::HeaderMap;
+use reqwest::StatusCode;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -42,12 +45,16 @@ const CEREBRAS_WIRE_PROFILE: WireProfile = WireProfile {
     reasoning_replay_field: Some("reasoning"),
 };
 
+pub(crate) type ResponseHeadersObserver =
+    Arc<dyn Fn(StatusCode, &HeaderMap) + Send + Sync + 'static>;
+
 pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     model: String,
     client: reqwest::Client,
     wire_profile: WireProfile,
+    response_headers_observer: Option<ResponseHeadersObserver>,
 }
 
 impl OpenAiProvider {
@@ -58,11 +65,22 @@ impl OpenAiProvider {
         } else {
             GENERIC_WIRE_PROFILE
         };
-        Self::with_wire_profile(api_key, base_url, model, wire_profile)
+        Self::with_wire_profile(api_key, base_url, model, wire_profile, None)
     }
 
-    pub(crate) fn for_cerebras(api_key: String, base_url: String, model: String) -> Result<Self> {
-        Self::with_wire_profile(api_key, base_url, model, CEREBRAS_WIRE_PROFILE)
+    pub(crate) fn for_cerebras_with_observer(
+        api_key: String,
+        base_url: String,
+        model: String,
+        response_headers_observer: ResponseHeadersObserver,
+    ) -> Result<Self> {
+        Self::with_wire_profile(
+            api_key,
+            base_url,
+            model,
+            CEREBRAS_WIRE_PROFILE,
+            Some(response_headers_observer),
+        )
     }
 
     fn with_wire_profile(
@@ -70,6 +88,7 @@ impl OpenAiProvider {
         base_url: String,
         model: String,
         wire_profile: WireProfile,
+        response_headers_observer: Option<ResponseHeadersObserver>,
     ) -> Result<Self> {
         Ok(Self {
             api_key,
@@ -77,7 +96,14 @@ impl OpenAiProvider {
             model,
             client: super::http_client()?,
             wire_profile,
+            response_headers_observer,
         })
+    }
+
+    fn observe_response_headers(&self, status: StatusCode, headers: &HeaderMap) {
+        if let Some(observer) = &self.response_headers_observer {
+            observer(status, headers);
+        }
     }
 
     /// Convert neutral messages to the chat-completions message list.
@@ -111,7 +137,12 @@ impl OpenAiProvider {
                         })
                         .collect();
                     let mut msg = json!({"role": "assistant"});
-                    msg["content"] = if text.is_empty() {
+                    // OpenAI uses null content for a tool-call message, but
+                    // Ollama rejects null on an ordinary assistant message.
+                    // A reasoning-only response can become textless here
+                    // because generic compatible APIs do not replay private
+                    // reasoning on the next request.
+                    msg["content"] = if text.is_empty() && !tool_calls.is_empty() {
                         Value::Null
                     } else {
                         Value::String(text)
@@ -512,6 +543,7 @@ impl Provider for OpenAiProvider {
             .await?;
 
         let status = response.status();
+        self.observe_response_headers(status, response.headers());
         let retry_after = response
             .headers()
             .get("retry-after")
@@ -551,6 +583,7 @@ impl Provider for OpenAiProvider {
             .await?;
 
         let status = response.status();
+        self.observe_response_headers(status, response.headers());
         let retry_after = response
             .headers()
             .get("retry-after")
@@ -758,11 +791,32 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_only_message_uses_empty_content_instead_of_null() {
+        let provider = OpenAiProvider::new(
+            "key".into(),
+            "http://localhost:11434/v1".into(),
+            "model".into(),
+        )
+        .unwrap();
+        let messages = vec![Message::assistant(vec![ContentBlock::Thinking {
+            thinking: "unfinished private reasoning".into(),
+            signature: String::new(),
+        }])];
+
+        let wire = provider.to_wire_messages(None, &messages);
+
+        assert_eq!(wire[0]["role"], "assistant");
+        assert_eq!(wire[0]["content"], "");
+        assert!(wire[0].get("tool_calls").is_none());
+    }
+
+    #[test]
     fn cerebras_profile_replays_unsigned_reasoning_and_uses_completion_token_field() {
-        let provider = OpenAiProvider::for_cerebras(
+        let provider = OpenAiProvider::for_cerebras_with_observer(
             "key".into(),
             "http://localhost:8000/v1".into(),
             "qwen-3.8-27b".into(),
+            Arc::new(|_, _| {}),
         )
         .unwrap();
         let messages = vec![Message::assistant(vec![

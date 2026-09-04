@@ -19,7 +19,7 @@ pub mod z3_solver;
 pub use archive::{
     ReadConversationTool, ReadMemoryTool, SearchConversationsTool, SearchMemoriesTool,
 };
-pub use bash::BashTool;
+pub use bash::{BashTool, SandboxedBashTool};
 pub use calculator::CalculatorTool;
 pub use firecrawl_crawl::FirecrawlCrawlTool;
 pub use firecrawl_extract::FirecrawlExtractTool;
@@ -27,11 +27,11 @@ pub use firecrawl_map::FirecrawlMapTool;
 pub use firecrawl_search::FirecrawlSearchTool;
 pub use http_fetch::HttpFetchTool;
 pub use list_directory::ListDirectoryTool;
-pub use patch_file::PatchFileTool;
+pub use patch_file::{PatchFileTool, SandboxedPatchFileTool};
 pub use read_file::ReadFileTool;
 pub use system_info::SystemInfoTool;
 pub use think::ThinkTool;
 pub use todo::TodoTool;
 pub use weather::WeatherTool;
 pub use wikipedia::WikipediaTool;
-pub use z3_solver::Z3SolverTool;
+pub use z3_solver::{SandboxedZ3SolverTool, Z3SolverTool};

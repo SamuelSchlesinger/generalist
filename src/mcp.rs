@@ -176,7 +176,7 @@ enum Transport {
     },
     Stdio {
         // Held to keep the process alive; killed on drop.
-        _child: Child,
+        _child: Box<Child>,
         stdin: ChildStdin,
         reader: BufReader<ChildStdout>,
         /// Rolling tail of the server's stderr, for diagnostics when it dies.
@@ -323,7 +323,7 @@ impl McpServer {
                     }
                 });
                 Transport::Stdio {
-                    _child: child,
+                    _child: Box::new(child),
                     stdin,
                     reader,
                     stderr_tail,

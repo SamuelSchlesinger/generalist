@@ -1,11 +1,34 @@
+use crate::sandbox::{ExecutionSandbox, SandboxAccess};
+use crate::subprocess::{
+    collect_bounded, combine_output, finish_output_collector, ProcessGroupGuard,
+};
+use crate::tools::bash::tail_truncate_with_spill;
 use crate::{Error, Result, Tool};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::Path;
+use std::process::Stdio;
+use tokio::time::{timeout, Duration};
 
 /// Z3 SMT/SAT solver tool. Shells out to the `z3` CLI (must be installed).
 pub struct Z3SolverTool;
+
+/// Z3 constrained by the same execution boundary as shell and code mode.
+pub struct SandboxedZ3SolverTool {
+    sandbox: ExecutionSandbox,
+}
+
+impl SandboxedZ3SolverTool {
+    pub fn new(sandbox: ExecutionSandbox) -> Self {
+        Self { sandbox }
+    }
+}
+
+const MAX_SMT_PROGRAM_BYTES: usize = 1024 * 1024;
+const Z3_TIMEOUT_GRACE_MILLIS: u64 = 2_000;
 
 #[derive(Debug, Deserialize, Clone)]
 struct Z3Input {
@@ -28,20 +51,14 @@ struct Z3Response {
     z3_output: String,
 }
 
-#[async_trait]
-impl Tool for Z3SolverTool {
-    fn name(&self) -> &str {
-        "z3_solver"
-    }
-
-    fn description(&self) -> &str {
-        "Z3 SMT/SAT constraint solver. Use for logical constraints, satisfiability checks, \
+fn z3_description() -> &'static str {
+    "Z3 SMT/SAT constraint solver. Use for logical constraints, satisfiability checks, \
          optimization under constraints, and proving/disproving implications. Constraints are \
          written in SMT-LIB s-expression syntax, e.g. '(> x 0)' or '(= (+ x y) 10)'."
-    }
+}
 
-    fn input_schema(&self) -> Value {
-        json!({
+fn z3_input_schema() -> Value {
+    json!({
             "type": "object",
             "properties": {
                 "action": {
@@ -92,43 +109,185 @@ impl Tool for Z3SolverTool {
             },
             "required": [],
             "additionalProperties": false
-        })
+    })
+}
+
+#[async_trait]
+impl Tool for Z3SolverTool {
+    fn name(&self) -> &str {
+        "z3_solver"
+    }
+
+    fn description(&self) -> &str {
+        z3_description()
+    }
+
+    fn input_schema(&self) -> Value {
+        z3_input_schema()
     }
 
     async fn execute(&self, input: Value) -> Result<String> {
-        let params: Z3Input = serde_json::from_value(input)
-            .map_err(|e| Error::Tool(format!("Invalid input parameters: {}", e)))?;
-
-        let action = params.action.clone().unwrap_or_else(|| "solve".to_string());
-        let timeout_ms = params.timeout.unwrap_or(5000).min(60_000);
-
-        let result = tokio::task::spawn_blocking(move || -> Result<Z3Response> {
-            let program = match action.as_str() {
-                "solve" | "check_sat" => build_program(&params, false, false)?,
-                "optimize" => build_program(&params, true, false)?,
-                "prove" => build_program(&params, false, true)?,
-                other => return Err(Error::Tool(format!("Unknown action: {}", other))),
-            };
-            let output = run_z3(&program, timeout_ms)?;
-            Ok(interpret(&action, &output))
-        })
-        .await
-        .map_err(|e| Error::Tool(format!("Task join error: {}", e)))??;
-
-        serde_json::to_string_pretty(&result)
-            .map_err(|e| Error::Tool(format!("Failed to serialize response: {}", e)))
+        execute_z3(input, &ExecutionSandbox::unrestricted()).await
     }
 }
 
-fn validate_sexpr(kind: &str, expr: &str) -> Result<String> {
-    let trimmed = expr.trim();
-    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+#[async_trait]
+impl Tool for SandboxedZ3SolverTool {
+    fn name(&self) -> &str {
+        "z3_solver"
+    }
+
+    fn description(&self) -> &str {
+        z3_description()
+    }
+
+    fn input_schema(&self) -> Value {
+        z3_input_schema()
+    }
+
+    async fn execute(&self, input: Value) -> Result<String> {
+        execute_z3(input, &self.sandbox).await
+    }
+}
+
+async fn execute_z3(input: Value, sandbox: &ExecutionSandbox) -> Result<String> {
+    let params: Z3Input = serde_json::from_value(input)
+        .map_err(|e| Error::Tool(format!("Invalid input parameters: {e}")))?;
+    let action = params.action.clone().unwrap_or_else(|| "solve".to_string());
+    let timeout_ms = params.timeout.unwrap_or(5_000).clamp(1, 60_000);
+    let program = match action.as_str() {
+        "solve" | "check_sat" => build_program(&params, false, false)?,
+        "optimize" => build_program(&params, true, false)?,
+        "prove" => build_program(&params, false, true)?,
+        other => return Err(Error::Tool(format!("Unknown action: {other}"))),
+    };
+    if program.len() > MAX_SMT_PROGRAM_BYTES {
         return Err(Error::Tool(format!(
-            "{} must be an SMT-LIB s-expression (enclosed in parentheses): {}",
-            kind, expr
+            "SMT program exceeds the {MAX_SMT_PROGRAM_BYTES} byte input limit"
         )));
     }
-    Ok(trimmed.to_string())
+    let output = run_z3(&program, timeout_ms, sandbox).await?;
+    serde_json::to_string_pretty(&interpret(&action, &output))
+        .map_err(|e| Error::Tool(format!("Failed to serialize response: {e}")))
+}
+
+fn validate_simple_symbol<'a>(kind: &str, symbol: &'a str) -> Result<&'a str> {
+    let mut characters = symbol.chars();
+    let valid = characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        });
+    if !valid {
+        return Err(Error::Tool(format!(
+            "{kind} must be a simple SMT-LIB identifier: {symbol}"
+        )));
+    }
+    Ok(symbol)
+}
+
+/// Accept exactly one balanced SMT-LIB s-expression.
+///
+/// Merely checking the first/last byte lets a value close the host's `assert`
+/// and inject top-level commands such as `include` or `reset`. Track strings,
+/// quoted symbols, and comments so parentheses in data do not confuse the
+/// boundary check.
+fn validate_sexpr<'a>(kind: &str, expr: &'a str) -> Result<&'a str> {
+    let trimmed = expr.trim();
+    if trimmed.len() > MAX_SMT_PROGRAM_BYTES || !trimmed.starts_with('(') {
+        return Err(Error::Tool(format!(
+            "{kind} must be one bounded SMT-LIB s-expression: {expr}"
+        )));
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ParseState {
+        Normal,
+        String,
+        QuotedSymbol,
+        Comment,
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut state = ParseState::Normal;
+    let mut depth = 0usize;
+    let mut complete = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match state {
+            ParseState::Normal => {
+                if complete {
+                    if !byte.is_ascii_whitespace() {
+                        return Err(Error::Tool(format!(
+                            "{kind} must contain exactly one SMT-LIB s-expression"
+                        )));
+                    }
+                } else {
+                    match byte {
+                        b'(' => {
+                            depth = depth.checked_add(1).ok_or_else(|| {
+                                Error::Tool(format!("{kind} nesting depth overflowed"))
+                            })?;
+                        }
+                        b')' => {
+                            if depth == 0 {
+                                return Err(Error::Tool(format!(
+                                    "{kind} has an unmatched closing parenthesis"
+                                )));
+                            }
+                            depth -= 1;
+                            complete = depth == 0;
+                        }
+                        b'"' => state = ParseState::String,
+                        b'|' => state = ParseState::QuotedSymbol,
+                        b';' => state = ParseState::Comment,
+                        _ => {}
+                    }
+                }
+            }
+            ParseState::String => match byte {
+                // Z3 accepts backslash escapes in addition to SMT-LIB's
+                // doubled-quote spelling. Either remains within the string.
+                b'\\' if index + 1 < bytes.len() => index += 1,
+                b'"' if index + 1 < bytes.len() && bytes[index + 1] == b'"' => index += 1,
+                b'"' => state = ParseState::Normal,
+                _ => {}
+            },
+            ParseState::QuotedSymbol => match byte {
+                b'\\' if index + 1 < bytes.len() => index += 1,
+                b'|' => state = ParseState::Normal,
+                _ => {}
+            },
+            ParseState::Comment => {
+                if byte == b'\n' || byte == b'\r' {
+                    state = ParseState::Normal;
+                }
+            }
+        }
+        index += 1;
+    }
+    if !complete || depth != 0 || state != ParseState::Normal {
+        return Err(Error::Tool(format!(
+            "{kind} must be one balanced SMT-LIB s-expression"
+        )));
+    }
+    Ok(trimmed)
+}
+
+fn push_program(program: &mut String, fragment: &str) -> Result<()> {
+    let next = program
+        .len()
+        .checked_add(fragment.len())
+        .ok_or_else(|| Error::Tool("SMT program length overflowed".to_string()))?;
+    if next > MAX_SMT_PROGRAM_BYTES {
+        return Err(Error::Tool(format!(
+            "SMT program exceeds the {MAX_SMT_PROGRAM_BYTES} byte input limit"
+        )));
+    }
+    program.push_str(fragment);
+    Ok(())
 }
 
 /// Build a complete SMT-LIB program for solve/optimize/prove.
@@ -136,7 +295,10 @@ fn build_program(params: &Z3Input, optimize: bool, prove: bool) -> Result<String
     let mut program = String::new();
 
     if let Some(logic) = &params.logic {
-        program.push_str(&format!("(set-logic {})\n", logic));
+        push_program(
+            &mut program,
+            &format!("(set-logic {})\n", validate_simple_symbol("Logic", logic)?),
+        )?;
     }
 
     if let Some(variables) = &params.variables {
@@ -144,10 +306,12 @@ fn build_program(params: &Z3Input, optimize: bool, prove: bool) -> Result<String
         let mut vars: Vec<_> = variables.iter().collect();
         vars.sort();
         for (name, var_type) in vars {
+            let name = validate_simple_symbol("Variable name", name)?;
             match var_type.as_str() {
-                "Bool" | "Int" | "Real" => {
-                    program.push_str(&format!("(declare-const {} {})\n", name, var_type))
-                }
+                "Bool" | "Int" | "Real" => push_program(
+                    &mut program,
+                    &format!("(declare-const {name} {var_type})\n"),
+                )?,
                 other => return Err(Error::Tool(format!("Unsupported variable type: {}", other))),
             }
         }
@@ -156,14 +320,20 @@ fn build_program(params: &Z3Input, optimize: bool, prove: bool) -> Result<String
     if prove {
         if let Some(hypotheses) = &params.hypothesis {
             for h in hypotheses {
-                program.push_str(&format!("(assert {})\n", validate_sexpr("Hypothesis", h)?));
+                push_program(
+                    &mut program,
+                    &format!("(assert {})\n", validate_sexpr("Hypothesis", h)?),
+                )?;
             }
         }
     }
 
     if let Some(constraints) = &params.constraints {
         for c in constraints {
-            program.push_str(&format!("(assert {})\n", validate_sexpr("Constraint", c)?));
+            push_program(
+                &mut program,
+                &format!("(assert {})\n", validate_sexpr("Constraint", c)?),
+            )?;
         }
     }
 
@@ -173,10 +343,13 @@ fn build_program(params: &Z3Input, optimize: bool, prove: bool) -> Result<String
             .as_ref()
             .ok_or_else(|| Error::Tool("Conclusion is required for proof".to_string()))?;
         // Prove by refuting the negation.
-        program.push_str(&format!(
-            "(assert (not {}))\n",
-            validate_sexpr("Conclusion", conclusion)?
-        ));
+        push_program(
+            &mut program,
+            &format!(
+                "(assert (not {}))\n",
+                validate_sexpr("Conclusion", conclusion)?
+            ),
+        )?;
     }
 
     if optimize {
@@ -184,9 +357,10 @@ fn build_program(params: &Z3Input, optimize: bool, prove: bool) -> Result<String
             let mut objs: Vec<_> = objectives.iter().collect();
             objs.sort();
             for (var, direction) in objs {
+                let var = validate_simple_symbol("Optimization variable", var)?;
                 match direction.as_str() {
-                    "minimize" => program.push_str(&format!("(minimize {})\n", var)),
-                    "maximize" => program.push_str(&format!("(maximize {})\n", var)),
+                    "minimize" => push_program(&mut program, &format!("(minimize {var})\n"))?,
+                    "maximize" => push_program(&mut program, &format!("(maximize {var})\n"))?,
                     other => {
                         return Err(Error::Tool(format!(
                             "Invalid optimization direction: {}",
@@ -198,42 +372,76 @@ fn build_program(params: &Z3Input, optimize: bool, prove: bool) -> Result<String
         }
     }
 
-    program.push_str("(check-sat)\n(get-model)\n");
+    push_program(&mut program, "(check-sat)\n(get-model)\n")?;
     Ok(program)
 }
 
-fn run_z3(program: &str, timeout_ms: u64) -> Result<String> {
-    use std::io::Write;
-    use std::process::Command;
-
-    let mut temp = tempfile::Builder::new()
-        .prefix("generalist-z3-")
-        .suffix(".smt2")
-        .tempfile()
-        .map_err(|e| Error::Tool(format!("Failed to create temp file: {}", e)))?;
+async fn run_z3(program: &str, timeout_ms: u64, sandbox: &ExecutionSandbox) -> Result<String> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("generalist-z3-").suffix(".smt2");
+    let mut temp = match sandbox.scratch_directory() {
+        Some(directory) => builder.tempfile_in(directory),
+        None => builder.tempfile(),
+    }
+    .map_err(|e| Error::Tool(format!("Failed to create SMT input: {e}")))?;
     temp.write_all(program.as_bytes())
         .and_then(|_| temp.flush())
-        .map_err(|e| Error::Tool(format!("Failed to write SMT program: {}", e)))?;
+        .map_err(|e| Error::Tool(format!("Failed to write SMT program: {e}")))?;
 
     let timeout_secs = timeout_ms.div_ceil(1000).max(1);
-    let output = Command::new("z3")
+    let spill_directory = sandbox.scratch_directory().map(Path::to_path_buf);
+    let mut access = SandboxAccess::default();
+    access.allow_read_only(temp.path());
+    let mut prepared = sandbox.prepare_command("z3", &access)?;
+    let mut child = prepared
+        .command_mut()
         .arg(format!("-T:{}", timeout_secs))
         .arg(temp.path())
-        .output()
-        .map_err(|e| Error::Tool(format!("Failed to start Z3: {}. Is Z3 installed?", e)))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = if stderr.is_empty() {
-        stdout.to_string()
-    } else {
-        format!("{}\nSTDERR:\n{}", stdout, stderr)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| Error::Tool(format!("Failed to start Z3: {e}. Is Z3 installed?")))?;
+    let mut process_group = ProcessGroupGuard::new(child.id());
+    let stdout_task = tokio::spawn(collect_bounded(
+        child.stdout.take().expect("stdout piped"),
+        "generalist-z3-stdout-",
+        spill_directory.clone(),
+    ));
+    let stderr_task = tokio::spawn(collect_bounded(
+        child.stderr.take().expect("stderr piped"),
+        "generalist-z3-stderr-",
+        spill_directory.clone(),
+    ));
+    let outer_timeout = Duration::from_millis(timeout_ms.saturating_add(Z3_TIMEOUT_GRACE_MILLIS));
+    let status = match timeout(outer_timeout, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            process_group.kill();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(Error::Tool(format!(
+                "Z3 exceeded its {timeout_ms} ms timeout and was killed"
+            )));
+        }
     };
+    process_group.kill();
+    let (stdout, stderr) = tokio::join!(
+        finish_output_collector(stdout_task),
+        finish_output_collector(stderr_task)
+    );
+    let status = status.map_err(|e| Error::Tool(format!("Failed to wait for Z3: {e}")))?;
+    let combined = combine_output(status, &stdout, &stderr);
+    let combined = tail_truncate_with_spill(&combined, spill_directory.as_deref());
 
-    if combined.trim().is_empty() && !output.status.success() {
+    if combined.trim().is_empty() && !status.success() {
         return Err(Error::Tool(format!(
             "Z3 execution failed with no output. Exit code: {}",
-            output.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         )));
     }
     Ok(combined)
@@ -382,6 +590,37 @@ mod tests {
             hypothesis: None,
             conclusion: None,
         };
+        assert!(build_program(&params, false, false).is_err());
+    }
+
+    #[test]
+    fn rejects_top_level_command_and_identifier_injection() {
+        let mut params = Z3Input {
+            action: None,
+            variables: Some([("x".to_string(), "Int".to_string())].into()),
+            constraints: Some(vec!["(> x 0)\n(reset)".into()]),
+            timeout: None,
+            logic: None,
+            optimize: None,
+            hypothesis: None,
+            conclusion: None,
+        };
+        assert!(build_program(&params, false, false).is_err());
+
+        params.constraints = Some(vec!["(= x \"a ) ; still a string\")".into()]);
+        assert!(build_program(&params, false, false).is_ok());
+
+        params.variables = Some(
+            [(
+                "x) (include \"/etc/passwd\") (declare-const y".to_string(),
+                "Int".to_string(),
+            )]
+            .into(),
+        );
+        assert!(build_program(&params, false, false).is_err());
+
+        params.variables = None;
+        params.logic = Some("QF_LIA) (reset".into());
         assert!(build_program(&params, false, false).is_err());
     }
 }

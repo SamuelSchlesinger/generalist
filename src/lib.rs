@@ -12,6 +12,7 @@ The core is small and deliberate:
 - [`agent`] — [`Agent`], the request → tool → result loop, reporting progress
   through [`AgentEvent`] callbacks
 - [`permissions`] — pluggable [`ToolPermissionHandler`] implementations
+- [`sandbox`] — fail-closed isolation for model-authored subprocesses
 - [`profile`] — one immutable layout for profile-scoped configuration and storage
 - [`tools`] — a batteries-included tool set (bash, file ops, web, ...)
 
@@ -66,6 +67,7 @@ pub mod permissions;
 pub mod profile;
 pub mod provider;
 pub mod runtime;
+pub mod sandbox;
 pub mod scope;
 pub mod skills;
 pub mod state;
@@ -112,6 +114,7 @@ pub use runtime::{
     CancelHandle, DeliveryMode, PromptClaim, PromptId, PromptQueue, PromptSource, QueuedPrompt,
     TurnControl,
 };
+pub use sandbox::ExecutionSandbox;
 pub use scope::{discover_project_root, ScopeFilter, WorkspaceScope};
 pub use state::SavedState;
 pub use tool::{

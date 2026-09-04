@@ -43,6 +43,9 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 ring = { version = "0.17.14", optional = true }
 tokenizers = { version = "0.23.1", default-features = false, features = ["onig"], optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+
 [[bin]]
 name = "generalist"
 path = "src/main.rs"

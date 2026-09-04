@@ -106,15 +106,22 @@ or filesystem snapshots.
 ## What remains deliberately unimplemented
 
 - automatic memory retrieval or prompt injection;
-- model-authored durable memory writes (generic same-UID Python remains
-  unsandboxed and can access local files);
+- model-authored durable memory writes (normal CLI Python and bash are now
+  workspace-sandboxed, but approved host file/archive tools, `--yolo`, and
+  unconfigured library registries remain outside that process boundary);
 - trusted secret redaction or capture admission beyond structural payload
   omission;
 - FTS/embeddings, ranking, summaries, candidates, approval, lineage, or
   consolidation;
 - retention quotas or automatic expiry;
 - external tombstone ledger, backup non-resurrection, or encryption hierarchy;
-- a process-isolated supervisor or protection from same-UID tools;
+- a hostile multi-tenant supervisor boundary for approved host tools or MCP
+  servers (the workspace subprocess sandbox is deliberately defense in depth);
+- guaranteed macOS cleanup of a contained child that uses `posix_spawn` to
+  detach into another process group (Seatbelt restrictions remain inherited);
+- aggregate memory, CPU, process-count, and workspace-disk quotas beyond the
+  existing call timeouts, bounded output/spills, process-group cleanup, and
+  per-process descriptor ceiling;
 - simulations, predictions, procedures, dreaming, or weight updates;
 - durable multi-agent tasks/messages/delegation and
   `CollaborationRuntime.tla`.
