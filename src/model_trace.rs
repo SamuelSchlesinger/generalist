@@ -6,7 +6,7 @@
 //! Prompt text, archive contents, tool inputs, and provider payloads never
 //! enter this trace.
 
-use crate::runtime::DeliveryMode;
+use crate::runtime::{DeliveryMode, QueuedPrompt};
 use crate::scope::{ScopeFilter, WorkspaceScope};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -125,8 +125,19 @@ pub enum ArchiveModelAction {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelTraceSnapshot {
     pub async_runtime: Vec<AsyncModelAction>,
+    /// Actual queue contents after the indicated number of async actions.
+    #[serde(default)]
+    pub async_queue: Vec<QueueObservation>,
     pub memory_runtime: Vec<MemoryModelAction>,
     pub archive_scope_runtime: Vec<ArchiveModelAction>,
+}
+
+/// A partial state observation, projected directly from the authoritative queue.
+/// Only stable IDs and delivery modes are retained, in their actual order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueObservation {
+    pub after_action: usize,
+    pub prompts: Vec<(u64, DeliveryMode)>,
 }
 
 /// Cloneable event sink shared by the runtime, permission gate, and memory
@@ -180,6 +191,20 @@ impl ModelTrace {
                 .snapshot
                 .async_runtime
                 .push(action);
+        }
+    }
+
+    pub(crate) fn observe_queue(&self, items: &[QueuedPrompt]) {
+        if self.records(ModelKind::AsyncRuntime) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let after_action = state.snapshot.async_runtime.len();
+            state.snapshot.async_queue.push(QueueObservation {
+                after_action,
+                prompts: items.iter().map(|item| (item.id, item.delivery)).collect(),
+            });
         }
     }
 
@@ -293,12 +318,14 @@ mod tests {
     fn traces_are_model_selective_and_project_labels_are_opaque() {
         let trace = ModelTrace::for_models(&[ModelKind::ArchiveScopeRuntime]);
         trace.record_async(AsyncModelAction::ProviderAnswer);
+        trace.observe_queue(&[]);
         trace.record_archive(ArchiveModelAction::SelectProjectScope {
             scope: trace.scope_id("/sensitive/project/root"),
         });
 
         let snapshot = trace.snapshot();
         assert!(snapshot.async_runtime.is_empty());
+        assert!(snapshot.async_queue.is_empty());
         assert_eq!(
             snapshot.archive_scope_runtime,
             vec![ArchiveModelAction::SelectProjectScope {
@@ -308,6 +335,45 @@ mod tests {
         assert_eq!(trace.scope_id("/sensitive/project/root"), "scope-1");
         assert_eq!(trace.scope_id("/another/project"), "scope-2");
         assert_eq!(trace.scope_id("global"), "global");
+    }
+
+    #[test]
+    fn queue_observations_read_actual_state_without_prompt_payloads() {
+        let trace = ModelTrace::for_models(&[ModelKind::AsyncRuntime]);
+        let mut items: Vec<_> = [17, 42]
+            .into_iter()
+            .map(|id| QueuedPrompt {
+                id,
+                text: "private prompt payload".into(),
+                delivery: DeliveryMode::FollowUp,
+                source: crate::runtime::PromptSource::User,
+            })
+            .collect();
+        for item in &items {
+            trace.record_async(AsyncModelAction::Enqueue {
+                prompt_id: item.id,
+                delivery: item.delivery,
+            });
+        }
+        trace.observe_queue(&items);
+        // Simulate incorrect contents behind an unchanged, legal-looking
+        // action stream. Observation must read Rust, not replay those actions.
+        items.swap(0, 1);
+        items[0].delivery = DeliveryMode::Steer;
+        items.pop();
+        trace.observe_queue(&items);
+        let snapshot = trace.snapshot();
+        assert_eq!(snapshot.async_runtime.len(), 2);
+        assert_eq!(
+            snapshot.async_queue.last(),
+            Some(&QueueObservation {
+                after_action: 2,
+                prompts: vec![(42, DeliveryMode::Steer)],
+            })
+        );
+        assert!(!serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("private prompt payload"));
     }
 
     #[test]

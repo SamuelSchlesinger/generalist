@@ -13,26 +13,29 @@ warnings denied, ShellCheck, the documentation traceability lint, TLC, and the
 complete Rust test suite. The pre-commit hook first runs `make format-staged`
 (rustfmt on fully staged `.rs` files, re-staged so the commit and the working
 tree cannot diverge), then `make lint`; the pre-push hook runs `make check`.
+`make lint` covers the non-formal development checks. The full `make check`
+adds all three TLC models, implementation conformance, negative checks, and
+Rust tests. CI runs that same full gate. Commit-time lint does not require Java
+or execute TLC; use `make tla` explicitly when iterating on a protocol change.
 If a Rust file has both staged and unstaged changes, the hook stops before
 formatting it so unstaged work cannot be pulled into the commit accidentally.
 
 ## Runtime model review
 
-Changes to the TUI, conversation runtime, episodic-memory lifecycle, or archive
-scope routing are not complete until the Rust control flow has been traced
-against the affected `spec/AsyncRuntime.tla`, `spec/MemoryRuntime.tla`, and
-`spec/ArchiveScopeRuntime.tla` actions. The living state/action/invariant
-mappings are in
-`docs/runtime-traceability.md`. Treat that file as review evidence, not as
-architecture prose that can be updated from memory.
+Keep the models focused on consequential protocol rules: prompt ownership and
+queue order, permission correlation and disclosure scope, cancellation and
+settlement, and episode capture/deletion. Apply the review below when one of
+those rules changes, wherever its Rust implementation lives. Use the normal
+Rust, integration, and PTY checks for rendering, payload validation, provider
+adapters, and platform effects unless they also change a modeled rule.
 
-For every change touching `src/main.rs`, `src/command.rs`, `src/commands.rs`,
-`src/goal.rs`, `src/tui/`, `src/runtime.rs`, `src/agent/`,
-`src/display_channel.rs`, `src/execution.rs`, `src/subprocess.rs`,
-`src/permissions.rs`, `src/codemode.rs`, `src/tool.rs`, `src/mcp.rs`,
-`src/provider/`, `src/types.rs`, or queue/goal-bearing persistence in
-`src/state.rs`, plus every change to `src/storage.rs`, `src/memory.rs`,
-`src/history.rs`, `src/scope.rs`, or `src/tools/archive.rs`:
+The affected `spec/AsyncRuntime.tla`, `spec/MemoryRuntime.tla`, and
+`spec/ArchiveScopeRuntime.tla` actions and their live mappings in
+`docs/runtime-traceability.md` form the review contract. Update only the
+affected rows. Add model state only for a specific safety or progress property:
+identify a fault it must reject and the authoritative Rust state or execution
+that will connect the property to implementation. Prefer observing missing
+concrete state before expanding the abstract protocol.
 
 1. Read the changed Rust paths and the entire TLA+ action they refine. Do not
    infer equivalence from names.
@@ -58,14 +61,20 @@ For every change touching `src/main.rs`, `src/command.rs`, `src/commands.rs`,
    Model faults must fail through their named invariant, not an unrelated
    parse, launch, or temporal error. The renderer invokes the
    original TLA+ actions, so do not replace a missing action with a look-alike
-   predicate in the wrapper.
-7. Re-run every TLC model and the implementation traces with `make tla`. A
+   predicate in the wrapper. Preserve actual queue observations and their
+   shared ID mapping; wrong contents must fail even with unchanged action
+   labels. Observe after an atomic Rust operation completes, rather than
+   synthesizing the model's intermediate states in Rust.
+7. Use `make tla` for focused formal validation and `make check` for the full
+   publication gate. The latter already includes conformance and every TLC
+   model, so a separate formal run is unnecessary on unchanged source. A
    green finite model check plus green sampled traces establishes neither
    exhaustive Rust refinement nor concrete liveness. Record untraced paths in
    `docs/runtime-traceability.md` rather than implying coverage.
 8. For interaction changes, build the exact source under review with
    `cargo build --bin generalist --locked`, then run that binary in a PTY
-   against a deliberately stalled fake provider. While it is stalled, type in
+   against a deliberately stalled fake provider. Select the exercises below
+   that cover the changed interaction. While it is stalled, type in
    the composer, enqueue both delivery modes, edit/reorder/delete the queue,
    rapidly scroll a long transcript, answer or cancel a permission request, and
    interrupt the turn. Confirm that display-only scrolling does not change the
@@ -170,8 +179,8 @@ The checked-in pre-commit hook always presents this exact acknowledgement:
 
 > Yes, I have updated the TLA+ model to reflect the current architecture
 
-Answering yes means either the model changed or you painstakingly confirmed
-that the current model and traceability matrix still cover the change. The
+Answering yes means the affected protocol model/mapping was reviewed and
+updated as needed, or the change leaves those protocol rules unchanged. The
 prompt is an acknowledgement, not a substitute for the review. Deliberate
 non-interactive automation may set `GENERALIST_TLA_ACK=1`; ordinary local
 commits must answer in a terminal.

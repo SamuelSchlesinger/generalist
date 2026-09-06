@@ -771,8 +771,10 @@ in the working directory is appended to the system prompt at startup.
 ## Development
 
 Run `make setup` once to install the pinned TLA+ tools and checked-in Git hooks,
-then `make check` before contributing. The full methodology—including the
-required TUI-to-TLA+ trace review—is in [CONTRIBUTING.md](CONTRIBUTING.md).
+then `make check` before contributing. Commits run staged formatting and
+non-formal `make lint`; push and CI run the complete Rust/TLC/conformance gate.
+Use `make tla` while iterating on protocol changes. The review scope and
+methodology are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

@@ -1,12 +1,15 @@
 # Validation record
 
-Validated on 2026-09-06 03:33 UTC.
+Validated on 2026-09-06 04:10 UTC.
 
-Baseline commit: `4cb8df7bc5d0b27d75c1bc6170ab769dfa2b7306`. The changes are local and uncommitted.
-[source-hashes.sha256](source-hashes.sha256) records SHA-256 for all 293
+Baseline commit: `616ebd45adcd5f36f6db6ef3fd6e310500d536a8`. This follow-up adds
+actual queue-state observations and separates commit lint from the formal
+publication gate. The changes were local and uncommitted at validation time.
+[source-hashes.sha256](source-hashes.sha256) records SHA-256 for all 294
 tracked or visible untracked repository files outside `whitepaper/`, including
-the newly shared TLC helper. Ignored build/runtime files are excluded. This
-identifies the checked working contents, not just the baseline commit.
+the shared TLC helper and gate-composition regressions. Ignored build/runtime
+files are excluded. This identifies the checked working contents, not just the
+baseline commit.
 
 From the repository root, verify the source snapshot with:
 
@@ -20,16 +23,19 @@ shasum -a 256 -c whitepaper/evidence/source-hashes.sha256
 formatting, strict Clippy, Rust documentation generation, ShellCheck, profile
 and traceability lints, research/benchmark and hook checks, all three exhaustive
 TLC runs, observed traces, negative checks, and Rust tests including doc tests.
+`GENERALIST_TLA_ACK=1 ./.githooks/pre-commit` was also run directly and completed
+with exit status 0. Its command log includes neither formal checker. The hook
+retains staged-formatting safety and the architecture-review acknowledgement.
 
 | Check | Result |
 | --- | --- |
-| Library tests | 318 passed; 2 explicitly ignored live catalog checks |
+| Library tests | 319 passed; 2 explicitly ignored live catalog checks |
 | Binary tests | 36 passed |
 | OpenAI-compatible integration tests | 2 passed |
 | Example tests | 6 passed |
 | Documentation examples | 2 passed |
 | Observed trace wrappers | 16 accepted |
-| Invalid trace mutations | 25 rejected by a temporal counterexample |
+| Invalid trace/state mutations | 28 rejected by a temporal counterexample |
 | Model faults | 3 rejected by the required named invariant |
 
 | Model | Generated states | Distinct states | Depth |
@@ -47,7 +53,13 @@ The three checked configurations contain respectively:
 Observed wrappers derive their identity domains from each recorded scenario;
 all current async scenarios set the same two-round bound in Rust and TLC.
 The base state-invariant lists are inherited, while finite trace completion
-replaces base-specification temporal properties.
+replaces base-specification temporal properties. Actual ordered queue IDs and
+delivery modes constrain the initial state and the states observed after Rust
+mutations, claims/rollback, and final normalization. Three new negative checks
+keep every action intact and corrupt only queue membership, order, or delivery.
+A Rust regression verifies that observations read actual contents without prompt
+text. Two gate-composition regressions verify that `make lint` omits formal
+execution while `make check` retains each formal command and the Rust suites.
 
 ## Environment and limits
 
@@ -55,19 +67,24 @@ The run used macOS 26.5.2, Rust `1.99.0-nightly (d0babd8b6 2026-07-15)`, and
 TLC 2.19 (8 August 2024), via the locally installed AdoptOpenJDK 14 runtime.
 The TLC jar matches the repository's pinned v1.7.4 distribution checksum:
 `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`.
-TLC and Python bridge tests required permitted local sockets; the initial
-restricted-sandbox TLC launch failed at its RMI listener and was rerun with
-that access. No provider credentials were needed for this gate.
+TLC and Python bridge tests required permitted local sockets. An earlier
+restricted-sandbox TLC launch failed at its RMI listener; this run used the
+permitted environment. No provider credentials were needed for this gate.
 
 The two ignored tests query live Cerebras/OpenRouter catalogs. This local run
 does not execute those checks, a native MLX model, a Linux kernel sandbox, or a
 new terminal PTY smoke test. The all-feature build explicitly uses the
 unavailable native-runtime stub. Model results are finite checks; traces are
-sampled and predominantly action-based, with concrete queue claim IDs and Rust
-checkpoint assertions. No composed refinement proof, disk-crash proof,
-external-effect rollback, or task-quality result follows from these counts.
+sampled, with partial queue-state observations and Rust checkpoint assertions.
+Other components predominantly record actions; full prompt lifecycle, text, and
+provenance are not independently observed. No composed refinement proof,
+disk-crash proof, external-effect rollback, or task-quality result follows
+from these counts.
 
-## Regression evidence
+## Original audit regression evidence
+
+These findings preceded baseline commit `616ebd4`; their regressions remain
+part of the current gate.
 
 The expanded pre-fix conformance run accepted the old happy paths but rejected
 `AsyncRuntimeDeniedBatch`, `AsyncRuntimeDeniedPython`,
@@ -124,6 +141,9 @@ PASS rejected trace mutation: AsyncRuntimeIterationLimitReplayedPermission
 PASS rejected trace mutation: AsyncRuntimeSteeringLostSteeringCommit
 PASS rejected trace mutation: AsyncRuntimeCancelledBatchMissingCancellationRepair
 PASS rejected trace mutation: AsyncRuntimeQueueEditsLostQueueDeletion
+PASS rejected trace mutation: AsyncRuntimeQueueEditsObservedQueueLostPrompt
+PASS rejected trace mutation: AsyncRuntimeQueueEditsObservedQueueWrongOrder
+PASS rejected trace mutation: AsyncRuntimeQueueEditsObservedQueueWrongDelivery
 PASS rejected trace mutation: MemoryRuntimeStorageForgottenDisclosure
 PASS rejected trace mutation: ArchiveScopeRuntimeStorageWrongScope
 PASS model fault: AsyncRuntimePrematureIdle violates SingleTurnOwnership
@@ -139,4 +159,4 @@ All pages were rendered with Poppler and visually reviewed; the final pages
 have no clipped text or overlapping elements. Citation keys and reported
 numbers were checked against the bibliography and gate output.
 
-PDF SHA-256: `46f18908610e3d436d93156a4d7ad7549a807faeab5b32c18110a7e729163a44`.
+PDF SHA-256: `b5419c7374f438c979f0b129e34ba43e7407e694483ed15fc1beaf49a7d3e6cf`.

@@ -351,10 +351,14 @@ The renderer maps those IDs into a finite domain and imports the original
 model. For trace event $e_i$, the wrapper requires
 \[
   \text{Next}(s,s')\ \land\ \text{Action}_{e_i}(s,s')\
-  \land\ i'=i+1.
+  \land\ \text{Observed}_{i+1}(s')\ \land\ i'=i+1.
 \]
-For dispatch and steering claims, observed IDs further constrain the modeled
-post-state. \code{TraceCompletes} requires consumption of the entire sequence
+Dispatch and steering claims constrain the actual claimed IDs. Partial state
+observations also constrain queue membership, order, and delivery modes after
+atomic Rust mutations, claims/rollback, and normalization. The sink reads the
+authoritative queue; snapshots share the actions' ID mapping and include initial
+and final state. Bulk moves are observed after their complete modeled substeps.
+\code{TraceCompletes} requires consumption of the entire sequence
 under fairness of the constrained trace step. Every state invariant is copied
 from the base configuration rather than maintained in a parallel list.
 The wrapper replaces the model's long-running liveness properties with finite
@@ -365,8 +369,8 @@ This workflow follows the idea of validating implementation traces against
 specifications described by Merz and collaborators \cite{merz2024}. In this
 artifact, fixing each named action and its arguments yields a deterministic
 abstract path; missing enabled transitions cause a temporal counterexample.
-It is still predominantly action observation, not an observation of every Rust
-state variable. Misplaced or missing instrumentation can conceal a runtime
+Beyond queue contents, the trace still predominantly observes actions.
+Misplaced or missing instrumentation can conceal a runtime
 defect. Generated permission IDs represent policy invocations rather than an
 independent measurement of the UI broker's reply IDs. Memory start/settlement
 events occur together at capture submission, so the sample does not measure
@@ -410,6 +414,9 @@ fixtures to drift apart.
 Trace mutations remove result/repair events, move continuation before a
 result, lose a denial or steering commit, replay a permission reply, lose a
 queue deletion, disclose a forgotten episode, or change an archive filter.
+Three further mutations keep all actions intact while corrupting observed queue
+membership, order, or delivery mode. Action-only mutations omit state snapshots
+so incorrect observation offsets cannot substitute for a protocol violation.
 They must fail because the constrained trace cannot complete. A syntax error
 or failed Java launch is not accepted as a successful negative test.
 
@@ -439,6 +446,9 @@ Rust tests, all-feature stub-compatible compilation, formatting, strict Clippy,
 Rust documentation, ShellCheck, and repository corpus/hook checks. Native MLX
 execution is a separate machine-specific path; the all-feature stub gate does
 not certify native model loading or performance.
+Commits run staged formatting and non-formal \code{make lint}; pre-push and CI
+run the complete \code{make check} gate. Formal execution is also available
+explicitly during protocol development, without repeating it at every commit.
 
 The accompanying \path{whitepaper/evidence/validation.md} records the actual
 run results and source hashes. It is the numerical evidence ledger for this
@@ -466,7 +476,8 @@ a bug, and model a worker or durable queue only when a specific property needs
 that state. Increasing state counts or adding a model without a falsifiable
 property is not a verification milestone.
 
-The intended maintenance rule is concrete: read the changed control flow,
+Model review follows changes to ownership, ordering, authorization,
+cancellation, or capture/deletion rules. Read the changed control flow,
 identify its authoritative mutation and cancellation boundary, update the
 applicable action and live mapping, add a deterministic execution, and require
 both valid traces and meaningful faults to be classified correctly. This

@@ -2,9 +2,11 @@ SHELL := /bin/sh
 
 .PHONY: check lint test fmt format-staged clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks memory-evaluation hooks-check tla conformance whitepaper embedded install-embedded setup hooks tla-tools doctor
 
-check: lint test
+check: lint tla test
 
-lint: fmt clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks hooks-check tla
+# The commit hook runs lint. TLC and trace replay run once in the full gate
+# used by pre-push and CI, and remain available explicitly through make tla.
+lint: fmt clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks hooks-check
 
 test:
 	GENERALIST_MLX_ALLOW_STUB=1 cargo test --all-targets --all-features --locked
@@ -53,6 +55,7 @@ hooks-check:
 	test -x .githooks/pre-commit
 	test -x .githooks/pre-push
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_format_staged_rust.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_gates.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_build_embedded.py
 
 tla:

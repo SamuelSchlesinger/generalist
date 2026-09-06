@@ -205,21 +205,17 @@ reviewed, paired real-model longitudinal study.
 
 ## Validation
 
-Run:
+Run the complete publication gate:
 
 ```sh
-make memory-research
-make memory-evaluation
-make conformance
 make check
 git diff --check
 ```
 
-The established `AsyncRuntime.tla` baseline is 470,086 generated states,
-117,750 distinct states, and depth 27. The current-handle `MemoryRuntime.tla`
-configuration generates 7,627 states (1,690 distinct, depth 16), and
-`ArchiveScopeRuntime.tla` generates 519,516 states (59,725 distinct, depth 13).
-The exact Rust test count can change with dependency and target updates; rely on
-the current `make check` output rather than this handoff. All three base models,
-the three observed implementation traces, and the three deliberately invalid
-traces must be repeated after any relevant change.
+It includes all three base models, observed traces with actual queue-state
+checks, deliberate trace/state corruptions, model faults, and Rust tests.
+Commit-time `make lint` omits formal execution; pre-push and CI run the full
+gate. Use `make tla` or `make conformance` for focused iteration, and run
+`make memory-evaluation` when the episodic capture/search or worker lifecycle
+changes. Recorded counts and limits live in `whitepaper/evidence/validation.md`;
+use the current gate output when validating a newer source snapshot.

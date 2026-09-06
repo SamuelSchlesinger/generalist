@@ -221,7 +221,11 @@ async fn async_runtime_trace(case: AsyncCase) -> Result<Scenario> {
         let deleted = queue.enqueue("duplicate", DeliveryMode::FollowUp);
         let kept = queue.enqueue("duplicate", DeliveryMode::FollowUp);
         let restored = queue.enqueue("duplicate", DeliveryMode::FollowUp);
+        let moved = queue.enqueue("duplicate", DeliveryMode::FollowUp);
         assert!(queue.delete(deleted));
+        assert!(queue.move_by(moved, -2));
+        assert!(queue.move_by(moved, 2));
+        assert!(queue.delete(moved));
         assert!(queue.move_by(kept, 1));
         assert!(queue.move_by(kept, -1));
         assert_eq!(queue.restore_latest().unwrap().id, restored);
@@ -293,10 +297,14 @@ async fn async_runtime_trace(case: AsyncCase) -> Result<Scenario> {
     assert!(generalist::history_tool_protocol_is_valid(agent.history()));
     if matches!(case, CancelTruncatedBatch) {
         assert_eq!(queue.len(), 1);
-        queue.normalize_steers();
-        assert_eq!(queue.snapshot()[0].delivery, DeliveryMode::FollowUp);
     } else {
         assert!(queue.is_empty());
+    }
+    // The real controller normalizes the authoritative queue after every
+    // outcome. This also records its final state for TLC to compare.
+    queue.normalize_steers();
+    if matches!(case, CancelTruncatedBatch) {
+        assert_eq!(queue.snapshot()[0].delivery, DeliveryMode::FollowUp);
     }
     if matches!(case, DeniedBatch) {
         assert_eq!(agent.registry.execution_history().len(), 1);

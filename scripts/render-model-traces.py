@@ -58,8 +58,9 @@ def render_value(value: Any) -> str:
     raise TypeError(f"unsupported trace value: {value!r}")
 
 
-def normalize_async(events: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
-    prompts = FiniteIds("p")
+def normalize_async(events: list[dict[str, Any]],
+                    prompts: FiniteIds | None = None) -> list[tuple[Any, ...]]:
+    prompts = prompts if prompts is not None else FiniteIds("p")
     requests = FiniteIds("r")
     normalized: list[tuple[Any, ...]] = []
     known = {
@@ -111,6 +112,43 @@ def normalize_async(events: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
         claimed = [prompts.get(value) for value in event.get("prompt_ids", [])]
         normalized.append((action, prompt, request, mode, count, claimed))
     return normalized
+
+
+def normalize_queue_observations(observations: list[dict[str, Any]],
+                                 prompts: FiniteIds,
+                                 action_count: int) -> list[tuple[Any, ...]]:
+    if not observations:
+        raise ValueError("async conformance requires actual queue observations")
+    normalized = []
+    previous = 0
+    for observation in observations:
+        after = observation["after_action"]
+        if type(after) is not int or not previous <= after <= action_count:
+            raise ValueError(f"invalid queue observation position: {after!r}")
+        previous = after
+        ids, modes = [], []
+        for prompt_id, delivery in observation["prompts"]:
+            # Share the action trace's ID mapping; independently renumbering
+            # snapshots could conceal lost, reordered, or substituted prompts.
+            ids.append(prompts.mapping[str(prompt_id)])
+            modes.append({"steer": "steer", "follow_up": "followup"}[delivery])
+        normalized.append((after, ids, modes))
+    if normalized[0][0] != 0 or normalized[-1][0] != action_count:
+        raise ValueError("queue observations must include initial and final state")
+    return normalized
+
+
+def queue_observation_operator(observations: list[tuple[Any, ...]]) -> str:
+    return f"""
+QueueObservations == {render_trace(observations)}
+
+StateObservationsMatch ==
+    \\A i \\in 1..Len(QueueObservations) :
+        LET observation == QueueObservations[i] IN
+        traceIndex = observation[1] + 1 =>
+            /\\ queue = observation[2]
+            /\\ [j \\in 1..Len(queue) |-> delivery[queue[j]]] = observation[3]
+"""
 
 
 def normalize_memory(events: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
@@ -288,7 +326,10 @@ def module_text(
     base_module: str,
     trace: list[tuple[Any, ...]],
     action_operator: str,
+    observations: list[tuple[Any, ...]] | None = None,
 ) -> str:
+    state_operator = (queue_observation_operator(observations)
+                      if observations is not None else "StateObservationsMatch == TRUE")
     return f"""----------------------- MODULE {module_name} -----------------------
 EXTENDS {base_module}, Naturals, Sequences
 
@@ -300,15 +341,19 @@ traceVars == <<vars, traceIndex>>
 
 {action_operator}
 
+{state_operator}
+
 TraceInit ==
     /\\ Init
     /\\ traceIndex = 1
+    /\\ StateObservationsMatch
 
 TraceNext ==
     /\\ traceIndex <= Len(Trace)
     /\\ Next
     /\\ TraceAction(Trace[traceIndex])
     /\\ traceIndex' = traceIndex + 1
+    /\\ StateObservationsMatch'
 
 TraceSpec ==
     /\\ TraceInit
@@ -388,12 +433,28 @@ def archive_config(trace: list[tuple[Any, ...]]) -> str:
 
 
 def write_model(directory: Path, name: str, base: str,
-                trace: list[tuple[Any, ...]], action: str, config: str) -> None:
+                trace: list[tuple[Any, ...]], action: str, config: str,
+                observations: list[tuple[Any, ...]] | None = None) -> None:
     if not trace:
         raise ValueError(f"refusing vacuous trace: {name}")
     (directory / f"{name}.tla").write_text(
-        module_text(name, base, trace, action), encoding="utf-8")
+        module_text(name, base, trace, action, observations), encoding="utf-8")
     (directory / f"{name}.cfg").write_text(config, encoding="utf-8")
+
+
+def queue_state_mutations(observations: list[tuple[Any, ...]]):
+    """Keep every action intact and corrupt only a concrete state observation."""
+    index = next(i for i, (_, ids, _) in enumerate(observations) if len(ids) >= 2)
+    after, ids, modes = observations[index]
+    for label, wrong_ids, wrong_modes in [
+        ("ObservedQueueLostPrompt", ids[:-1], modes[:-1]),
+        ("ObservedQueueWrongOrder", list(reversed(ids)), list(reversed(modes))),
+        ("ObservedQueueWrongDelivery", ids,
+         ["steer" if modes[0] == "followup" else "followup"] + modes[1:]),
+    ]:
+        broken = observations.copy()
+        broken[index] = (after, wrong_ids, wrong_modes)
+        yield label, broken
 
 
 def mutations(base: str, trace: list[tuple[Any, ...]]):
@@ -510,17 +571,31 @@ def main() -> None:
             if not scenario[field]:
                 continue
             covered.add(base)
-            trace = normalize(scenario[field])
+            observations = None
+            if field == "async_runtime":
+                prompts = FiniteIds("p")
+                trace = normalize_async(scenario[field], prompts)
+                observations = normalize_queue_observations(
+                    scenario["async_queue"], prompts, len(trace))
+            else:
+                trace = normalize(scenario[field])
             config = (async_config(trace, scenario["max_rounds"])
                       if field == "async_runtime" else memory_config(trace)
                       if field == "memory_runtime" else archive_config(trace))
             module = base + name
-            write_model(output, module, base, trace, action, config)
+            write_model(output, module, base, trace, action, config, observations)
             observed.append(module)
             for label, broken in mutations(base, trace):
                 mutant = module + label
+                # Action-only mutations retain their original purpose. Using
+                # old observation offsets could reject them for the wrong step.
                 write_model(output, mutant, base, broken, action, config)
                 invalid.append(mutant)
+            if field == "async_runtime" and name == "QueueEdits":
+                for label, broken in queue_state_mutations(observations):
+                    mutant = module + label
+                    write_model(output, mutant, base, trace, action, config, broken)
+                    invalid.append(mutant)
     if covered != {base for _, base, _, _ in models}:
         raise ValueError("conformance must exercise all three runtime models")
     if not observed or not invalid:

@@ -78,8 +78,10 @@ Rust/PTY tests check terminal behavior independently.
 
 `src/model_trace.rs` adds an opt-in, payload-free event sink at existing Rust
 linearization points. Ordinary application construction installs no sink. The
-events carry only abstract action data: stable IDs, counts, categorical scope
-filters, and trace-local opaque scope labels. Prompt text, archive content,
+events carry stable IDs, counts, categorical scope filters, and trace-local
+opaque scope labels. Queue observations also record actual ordered IDs and
+delivery modes after an atomic mutation, claim/rollback, or normalization.
+Prompt text, archive content,
 tool input, provider payloads, project paths, and user-chosen saved-session
 names never enter the serialized trace. Saved names are replaced consistently
 across save, search, and deletion by trace-local history IDs.
@@ -100,7 +102,12 @@ identity domains are derived from the trace and `MaxRounds` is supplied by the
 Rust scenario's actual configuration. Claimed follow-up IDs and the complete
 ordered list of claimed steering IDs are observed from the real queue and
 constrain the corresponding model post-state. Empty suites, unknown actions,
-and missing model coverage are rejected. TLC must report a temporal
+missing initial/final queue observations, and missing model coverage are
+rejected. Snapshots use the action trace's ID mapping and constrain the modeled
+queue and queued delivery modes after the recorded number of actions. Moves
+and bulk removals are observed after the complete Rust mutation and its modeled
+substeps. The renderer does not reconstruct those snapshots from action names.
+TLC must report a temporal
 counterexample for an invalid trace, rather than a parse or infrastructure
 failure.
 
@@ -113,11 +120,16 @@ claim rollback. The storage scenario covers paused capture, enabled capture,
 forgetting, same-scope writes, and allowed current-scope history/memory search.
 Mutations cover early continuation, missing results/repair, lost denial,
 replayed permission replies, lost queue deletion/steering commit, forgotten
-memory disclosure, and an incorrect scope filter. Three additional model faults
+memory disclosure, and an incorrect scope filter. Three more mutations keep
+every action intact and corrupt only observed queue membership, order, or
+delivery mode. The action-only mutations run without snapshots so their
+rejection still checks the original protocol violation. Three model faults
 must violate the named ownership, lifecycle, and scope invariants.
 
-This is sampled safety evidence. Most trace records observe actions rather than
-complete Rust state; a missing or misleading event can still conceal a defect.
+This is sampled safety evidence with partial queue-state observations. Other
+components predominantly record actions; missing or misleading instrumentation
+can still conceal a defect. Queue text/provenance and the full prompt lifecycle
+are not independently observed, and restored queues remain outside the fixture.
 The models are checked separately, with no product-model proof linking async,
 memory, and archive executions. Copy-mode input ownership, permission-broker
 IDs, steering rollback, storage failures, global startup, foreign archive rows,
@@ -452,6 +464,10 @@ by the controller after execution. Display-only actions are covered by
 The live matrices above replace the accumulated historical audit narratives;
 prior versions remain in Git history. New changes should update the applicable
 row and the executable scenario rather than append another dated architecture.
+Review is driven by changes to ownership, ordering, authorization, cancellation,
+or capture/deletion rules. New model state needs a consequential property, a
+fault the check must reject, and a concrete implementation observation. Rendering
+and other payload/platform behavior retain their applicable Rust and PTY checks.
 
 The September 2026 review expanded the original three trace wrappers into
 independent scenarios. Running those scenarios against the old actions exposed
@@ -486,7 +502,8 @@ requested scope. This checks that the invariants reject concrete mistakes;
 it does not establish that the invariant set is complete. Parser errors and
 unrelated TLC failures do not satisfy a negative test.
 
-Run `make tla` for all finite state spaces, observed traces, and mutations;
-run `make check` for the complete repository gate. The technical whitepaper in
+Commit-time `make lint` covers non-formal checks; pre-push and CI retain the
+complete `make check` gate. `make tla` explicitly runs all finite state spaces,
+observed traces, and mutations during protocol development. The technical whitepaper in
 `whitepaper/` describes this evidence and its limits. Its validation record
 identifies the checked source snapshot, commands, bounds, and results.

@@ -63,6 +63,14 @@ struct QueueState {
     model_trace: Option<ModelTrace>,
 }
 
+impl QueueState {
+    fn observe(&self) {
+        if let Some(trace) = &self.model_trace {
+            trace.observe_queue(&self.items);
+        }
+    }
+}
+
 /// Cloneable handle to the single authoritative prompt queue.
 #[derive(Debug, Clone, Default)]
 pub struct PromptQueue {
@@ -103,18 +111,25 @@ impl PromptQueue {
 
     #[doc(hidden)]
     pub fn with_model_trace(model_trace: ModelTrace) -> Self {
-        Self {
+        let queue = Self {
             inner: Rc::new(RefCell::new(QueueState {
                 next_id: 0,
                 items: Vec::new(),
                 model_trace: Some(model_trace),
             })),
-        }
+        };
+        queue.observe();
+        queue
     }
 
     #[doc(hidden)]
     pub fn set_model_trace(&self, model_trace: ModelTrace) {
         self.inner.borrow_mut().model_trace = Some(model_trace);
+        self.observe();
+    }
+
+    fn observe(&self) {
+        self.inner.borrow().observe();
     }
 
     pub fn enqueue(&self, text: impl Into<String>, delivery: DeliveryMode) -> PromptId {
@@ -136,14 +151,13 @@ impl PromptQueue {
             delivery,
             source,
         });
-        let model_trace = state.model_trace.clone();
-        drop(state);
-        if let Some(trace) = model_trace {
+        if let Some(trace) = &state.model_trace {
             trace.record_async(AsyncModelAction::Enqueue {
                 prompt_id: id,
                 delivery,
             });
         }
+        state.observe();
         id
     }
 
@@ -169,6 +183,7 @@ impl PromptQueue {
             keep
         });
         let mut changed = state.items.len() != before;
+        state.observe();
         drop(state);
         if needed && !found {
             self.enqueue_from(
@@ -199,6 +214,7 @@ impl PromptQueue {
         let replacement = replacement.inner.borrow();
         state.next_id = replacement.next_id;
         state.items.clone_from(&replacement.items);
+        state.observe();
     }
 
     pub fn edit(&self, id: PromptId, text: String) -> bool {
@@ -225,6 +241,7 @@ impl PromptQueue {
         if let Some(trace) = &state.model_trace {
             trace.record_async(AsyncModelAction::DeleteQueued { index: index + 1 });
         }
+        state.observe();
         true
     }
 
@@ -249,6 +266,7 @@ impl PromptQueue {
                 delivery,
             });
         }
+        state.observe();
         true
     }
 
@@ -277,6 +295,9 @@ impl PromptQueue {
                 trace.record_async(AsyncModelAction::MoveQueuedEarlier { index: swapped + 1 });
             }
         }
+        // Rust performs the entire move atomically; observe after all of its
+        // modeled adjacent swaps, without inventing intermediate Rust states.
+        state.observe();
         true
     }
 
@@ -288,6 +309,7 @@ impl PromptQueue {
         if let Some(trace) = &state.model_trace {
             trace.record_async(AsyncModelAction::DeleteQueued { index });
         }
+        state.observe();
         Some(item)
     }
 
@@ -305,6 +327,7 @@ impl PromptQueue {
         if let Some(trace) = &model_trace {
             trace.record_async(AsyncModelAction::DispatchFollowUp { prompt_id: item.id });
         }
+        self.observe();
         Some(PromptClaim::new(
             self.clone(),
             vec![item],
@@ -337,6 +360,7 @@ impl PromptQueue {
                 prompt_ids: claimed.iter().map(|item| item.id).collect(),
             });
         }
+        self.observe();
         Some(PromptClaim::new(
             self.clone(),
             claimed,
@@ -347,11 +371,15 @@ impl PromptQueue {
 
     /// A steer whose target turn has ended becomes an ordinary follow-up.
     pub fn normalize_steers(&self) {
-        for item in &mut self.inner.borrow_mut().items {
+        let mut state = self.inner.borrow_mut();
+        for item in &mut state.items {
             if item.delivery == DeliveryMode::Steer {
                 item.delivery = DeliveryMode::FollowUp;
             }
         }
+        // Settlement/cancellation records the model transition before the
+        // controller reaches this queue mutation. Observe the actual result.
+        state.observe();
     }
 
     fn requeue_front(&self, mut items: Vec<QueuedPrompt>) {
@@ -409,6 +437,7 @@ impl PromptClaim {
                 ClaimKind::Steering => AsyncModelAction::CommitSteering,
             });
         }
+        self.queue.observe();
         items
     }
 }
@@ -423,6 +452,7 @@ impl Drop for PromptClaim {
                     ClaimKind::Steering => AsyncModelAction::RequeueSteering,
                 });
             }
+            self.queue.observe();
         }
     }
 }
