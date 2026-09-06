@@ -1,0 +1,23 @@
+The audited local source passed 16 observed traces, 25 rejecting trace
+mutations, and three rejecting model faults. The exhaustive runs completed
+with the counts below; they refer to the checked finite configurations.
+\begin{center}
+\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Model & Generated states & Distinct states & Depth \\
+\midrule
+\code{AsyncRuntime} & 306,655 & 65,475 & 26 \\
+\code{MemoryRuntime} & 7,627 & 1,690 & 16 \\
+\code{ArchiveScopeRuntime} & 519,516 & 59,725 & 13 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{samepage}
+The Rust gate passed 318 library tests, 36 binary tests, two integration tests,
+six example tests, and two documentation examples. Two live provider-catalog
+tests were explicitly ignored. Native MLX execution is not established by the
+stub-compatible build. All figures describe local validation, not hosted CI or live
+provider evaluation.
+\par
+\end{samepage}

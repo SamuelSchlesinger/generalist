@@ -218,6 +218,7 @@ impl Agent {
 
     pub fn set_provider(&mut self, provider: Box<dyn Provider>) {
         self.provider = provider;
+        self.last_context_tokens = None;
     }
 
     /// The complete conversation history.
@@ -293,16 +294,23 @@ impl Agent {
     /// The TUI uses this to commit a two-phase queue claim only after the
     /// conversation owns the prompt.
     pub fn begin_turn(&mut self, user_input: &str) {
-        self.history.push(Message::user_text(user_input));
+        self.push_history(Message::user_text(user_input));
     }
 
     /// Record a claimed queued prompt while preserving host provenance.
     pub fn begin_queued_turn(&mut self, prompt: &QueuedPrompt) {
         if prompt.source == PromptSource::GoalContinuation {
             debug_assert!(crate::goal::is_goal_continuation_prompt(&prompt.text));
-            self.history.push(Message::goal_continuation());
+            self.push_history(Message::goal_continuation());
         } else {
             self.begin_turn(&prompt.text);
         }
+    }
+
+    /// Provider measurements describe the request that produced them. Once
+    /// history changes, estimate the new context until a fresh measurement.
+    fn push_history(&mut self, message: Message) {
+        self.last_context_tokens = None;
+        self.history.push(message);
     }
 }

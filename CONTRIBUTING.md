@@ -53,7 +53,10 @@ For every change touching `src/main.rs`, `src/command.rs`, `src/commands.rs`,
    update `src/model_trace.rs` and
    `examples/model_conformance.rs` at the same time. Run `make conformance`;
    `scripts/check-model-conformance.sh` must accept the real implementation
-   traces and reject all deliberate mutations. The renderer invokes the
+   traces and reject all deliberate mutations. Wrapper configurations must
+   inherit the base invariant lists and use each scenario's actual bounds.
+   Model faults must fail through their named invariant, not an unrelated
+   parse, launch, or temporal error. The renderer invokes the
    original TLA+ actions, so do not replace a missing action with a look-alike
    predicate in the wrapper.
 7. Re-run every TLC model and the implementation traces with `make tla`. A

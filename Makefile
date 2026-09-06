@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: check lint test fmt format-staged clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks memory-evaluation hooks-check tla conformance embedded install-embedded setup hooks tla-tools doctor
+.PHONY: check lint test fmt format-staged clippy docs shellcheck profile-paths traceability memory-research agent-benchmarks memory-evaluation hooks-check tla conformance whitepaper embedded install-embedded setup hooks tla-tools doctor
 
 check: lint test
 
@@ -8,6 +8,7 @@ lint: fmt clippy docs shellcheck profile-paths traceability memory-research agen
 
 test:
 	GENERALIST_MLX_ALLOW_STUB=1 cargo test --all-targets --all-features --locked
+	GENERALIST_MLX_ALLOW_STUB=1 cargo test --doc --all-features --locked
 
 fmt:
 	cargo fmt --all -- --check
@@ -60,6 +61,9 @@ tla:
 
 conformance:
 	./scripts/check-model-conformance.sh
+
+whitepaper:
+	$(MAKE) -C whitepaper
 
 embedded:
 	./scripts/build-embedded.sh

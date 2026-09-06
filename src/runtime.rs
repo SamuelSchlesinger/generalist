@@ -152,38 +152,33 @@ impl PromptQueue {
     pub fn reconcile_goal_continuation(&self, needed: bool) -> bool {
         let mut state = self.inner.borrow_mut();
         let before = state.items.len();
-        if !needed {
-            state
-                .items
-                .retain(|item| item.source != PromptSource::GoalContinuation);
-            return state.items.len() != before;
-        }
-
+        let trace = state.model_trace.clone();
         let mut found = false;
+        let mut index = 0;
         state.items.retain(|item| {
-            if item.source != PromptSource::GoalContinuation {
-                return true;
-            }
-            if found {
-                false
-            } else {
+            let host_prompt = item.source == PromptSource::GoalContinuation;
+            let keep = !host_prompt || (needed && !found);
+            if host_prompt {
                 found = true;
-                true
             }
+            if keep {
+                index += 1;
+            } else if let Some(trace) = &trace {
+                trace.record_async(AsyncModelAction::DeleteQueued { index: index + 1 });
+            }
+            keep
         });
-        if found {
-            return state.items.len() != before;
+        let mut changed = state.items.len() != before;
+        drop(state);
+        if needed && !found {
+            self.enqueue_from(
+                crate::goal::GOAL_CONTINUATION_PROMPT,
+                DeliveryMode::FollowUp,
+                PromptSource::GoalContinuation,
+            );
+            changed = true;
         }
-
-        let id = state.next_id;
-        state.next_id = state.next_id.saturating_add(1);
-        state.items.push(QueuedPrompt {
-            id,
-            text: crate::goal::GOAL_CONTINUATION_PROMPT.to_string(),
-            delivery: DeliveryMode::FollowUp,
-            source: PromptSource::GoalContinuation,
-        });
-        true
+        changed
     }
 
     pub fn snapshot(&self) -> Vec<QueuedPrompt> {
@@ -227,14 +222,18 @@ impl PromptQueue {
             return false;
         };
         state.items.remove(index);
+        if let Some(trace) = &state.model_trace {
+            trace.record_async(AsyncModelAction::DeleteQueued { index: index + 1 });
+        }
         true
     }
 
     pub fn toggle_delivery(&self, id: PromptId, turn_active: bool) -> bool {
         let mut state = self.inner.borrow_mut();
-        let Some(item) = state.items.iter_mut().find(|item| item.id == id) else {
+        let Some(index) = state.items.iter().position(|item| item.id == id) else {
             return false;
         };
+        let item = &mut state.items[index];
         if item.source == PromptSource::GoalContinuation {
             return false;
         }
@@ -243,6 +242,13 @@ impl PromptQueue {
             DeliveryMode::FollowUp if turn_active => DeliveryMode::Steer,
             DeliveryMode::FollowUp => return false,
         };
+        let delivery = item.delivery;
+        if let Some(trace) = &state.model_trace {
+            trace.record_async(AsyncModelAction::ReclassifyQueued {
+                index: index + 1,
+                delivery,
+            });
+        }
         true
     }
 
@@ -259,12 +265,30 @@ impl PromptQueue {
         }
         let item = state.items.remove(index);
         state.items.insert(target, item);
+        if let Some(trace) = &state.model_trace {
+            // One move is a sequence of adjacent swaps in the model. Moving
+            // down swaps the following item earlier, preserving every ID.
+            for step in 0..index.abs_diff(target) {
+                let swapped = if target < index {
+                    index - step
+                } else {
+                    index + step + 1
+                };
+                trace.record_async(AsyncModelAction::MoveQueuedEarlier { index: swapped + 1 });
+            }
+        }
         true
     }
 
     /// Remove the latest visible item so it can be restored to the composer.
     pub fn restore_latest(&self) -> Option<QueuedPrompt> {
-        self.inner.borrow_mut().items.pop()
+        let mut state = self.inner.borrow_mut();
+        let index = state.items.len();
+        let item = state.items.pop()?;
+        if let Some(trace) = &state.model_trace {
+            trace.record_async(AsyncModelAction::DeleteQueued { index });
+        }
+        Some(item)
     }
 
     /// Claim the first follow-up. The caller must commit after recording it;
@@ -279,7 +303,7 @@ impl PromptQueue {
         let model_trace = state.model_trace.clone();
         drop(state);
         if let Some(trace) = &model_trace {
-            trace.record_async(AsyncModelAction::DispatchFollowUp);
+            trace.record_async(AsyncModelAction::DispatchFollowUp { prompt_id: item.id });
         }
         Some(PromptClaim::new(
             self.clone(),
@@ -309,7 +333,9 @@ impl PromptQueue {
         let model_trace = state.model_trace.clone();
         drop(state);
         if let Some(trace) = &model_trace {
-            trace.record_async(AsyncModelAction::ClaimSteering);
+            trace.record_async(AsyncModelAction::ClaimSteering {
+                prompt_ids: claimed.iter().map(|item| item.id).collect(),
+            });
         }
         Some(PromptClaim::new(
             self.clone(),

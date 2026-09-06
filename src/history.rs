@@ -1098,7 +1098,7 @@ mod tests {
                 ArchiveModelAction::ForgetHistory {
                     history_id: forgotten
                 }
-            ] if history_id == "temporary" && forgotten == "temporary"
+            ] if history_id == "history-1" && forgotten == history_id
         ));
     }
 }

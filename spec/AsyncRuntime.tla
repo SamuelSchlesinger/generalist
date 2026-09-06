@@ -16,11 +16,11 @@
 \* rendering, conversation-search query/selection, reasoning payloads, and
 \* other provider payloads are hidden data represented by stuttering steps.
 \* Permission-policy mutation occurs with no live request and only changes
-\* whether a later concrete tool use reaches AskPermission. `/copy select`
-\* instead refines EnterCopyMode. Copy mode is
-\* the one terminal-rendering state modeled
-\* explicitly: it gates user input and therefore participates in the liveness
-\* argument, while agent progress remains independent of it.
+\* whether a later concrete tool use reaches AskPermission. Copy-mode toggles
+\* are display-only stutters: the controller still polls provider progress,
+\* remembered permission decisions, and host goal scheduling while rendering
+\* is paused. The model assumes eventual permission resolution through its
+\* controller fairness condition; it does not prove that a user resumes input.
 \*
 \* The autosave worker, its queue, and filesystem state are also hidden.
 \* Modeled checkpoints linearize at history-valid in-memory snapshots; the
@@ -64,7 +64,6 @@ LifecycleStates == {"fresh", "queued", "claimed", "committed", "discarded"}
 TerminalReasons == {"none", "answer", "refusal", "error", "denial", "limit"}
 
 VARIABLES
-    copyMode,
     phase,
     activeTurn,
     queue,
@@ -84,14 +83,8 @@ VARIABLES
     roundsLeft,
     failuresLeft
 
-protocolVars ==
-    <<phase, activeTurn, queue, delivery, lifecycle, claimedSteers,
-      settledTurns, interruptedTurns, committedOrder, toolUses,
-      toolResults, permission, permissionOwner, usedRequests,
-      continuationNeeded, terminalReason, roundsLeft, failuresLeft>>
-
 vars ==
-    <<copyMode, phase, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    <<phase, activeTurn, queue, delivery, lifecycle, claimedSteers,
       settledTurns, interruptedTurns, committedOrder, toolUses,
       toolResults, permission, permissionOwner, usedRequests,
       continuationNeeded, terminalReason, roundsLeft, failuresLeft>>
@@ -139,7 +132,6 @@ NormalizeQueuedSteers ==
         ELSE delivery[p]]
 
 Init ==
-    /\ copyMode = FALSE
     /\ phase = "idle"
     /\ activeTurn = NoPrompt
     /\ queue = <<>>
@@ -174,7 +166,7 @@ Enqueue(p, requestedMode) ==
     /\ queue' = Append(queue, p)
     /\ delivery' = [delivery EXCEPT ![p] = requestedMode]
     /\ lifecycle' = [lifecycle EXCEPT ![p] = "queued"]
-    /\ UNCHANGED <<copyMode, phase, activeTurn, claimedSteers, settledTurns,
+    /\ UNCHANGED <<phase, activeTurn, claimedSteers, settledTurns,
                    interruptedTurns, committedOrder, toolUses, toolResults,
                    permission, permissionOwner, usedRequests,
                    continuationNeeded, terminalReason, roundsLeft, failuresLeft>>
@@ -187,7 +179,7 @@ DeleteQueued(index) ==
        /\ queue' = RemoveAt(queue, index)
        /\ delivery' = [delivery EXCEPT ![p] = "unset"]
        /\ lifecycle' = [lifecycle EXCEPT ![p] = "discarded"]
-    /\ UNCHANGED <<copyMode, phase, activeTurn, claimedSteers, settledTurns,
+    /\ UNCHANGED <<phase, activeTurn, claimedSteers, settledTurns,
                    interruptedTurns, committedOrder, toolUses, toolResults,
                    permission, permissionOwner, usedRequests,
                    continuationNeeded, terminalReason, roundsLeft, failuresLeft>>
@@ -198,7 +190,7 @@ ReclassifyQueued(index, requestedMode) ==
     /\ phase = "idle" => requestedMode = "followup"
     /\ LET p == queue[index] IN
        delivery' = [delivery EXCEPT ![p] = requestedMode]
-    /\ UNCHANGED <<copyMode, phase, activeTurn, queue, lifecycle, claimedSteers,
+    /\ UNCHANGED <<phase, activeTurn, queue, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    toolUses, toolResults, permission, permissionOwner,
                    usedRequests, continuationNeeded, terminalReason, roundsLeft,
@@ -207,26 +199,11 @@ ReclassifyQueued(index, requestedMode) ==
 MoveQueuedEarlier(index) ==
     /\ index \in 2..Len(queue)
     /\ queue' = SwapWithPrevious(queue, index)
-    /\ UNCHANGED <<copyMode, phase, activeTurn, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<phase, activeTurn, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    toolUses, toolResults, permission, permissionOwner,
                    usedRequests, continuationNeeded, terminalReason, roundsLeft,
                    failuresLeft>>
-
-\* Native terminal copy mode releases mouse capture and freezes application
-\* input/redraws. F3 and idle `/copy select` are concrete entry gestures; F3
-\* and Esc are concrete exit gestures. It never owns or changes protocol state.
-\* The UI reactor keeps polling AgentProgress, and weak fairness for
-\* ExitCopyMode states the user assumption required by the liveness property.
-EnterCopyMode ==
-    /\ ~copyMode
-    /\ copyMode' = TRUE
-    /\ UNCHANGED protocolVars
-
-ExitCopyMode ==
-    /\ copyMode
-    /\ copyMode' = FALSE
-    /\ UNCHANGED protocolVars
 
 \* The controller removes one follow-up before handing mutable conversation
 \* ownership to an agent turn.
@@ -240,7 +217,7 @@ DispatchFollowUp ==
        /\ queue' = Tail(queue)
        /\ lifecycle' = [lifecycle EXCEPT ![p] = "claimed"]
     /\ roundsLeft' = MaxRounds
-    /\ UNCHANGED <<copyMode, delivery, claimedSteers, settledTurns,
+    /\ UNCHANGED <<delivery, claimedSteers, settledTurns,
                    interruptedTurns, committedOrder, toolUses, toolResults,
                    permission, permissionOwner, usedRequests,
                    continuationNeeded, terminalReason, failuresLeft>>
@@ -250,7 +227,7 @@ CommitStart ==
     /\ phase' = "provider"
     /\ lifecycle' = [lifecycle EXCEPT ![activeTurn] = "committed"]
     /\ committedOrder' = Append(committedOrder, activeTurn)
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, claimedSteers,
                    settledTurns, interruptedTurns, toolUses, toolResults,
                    permission, permissionOwner, usedRequests,
                    continuationNeeded, terminalReason, roundsLeft, failuresLeft>>
@@ -267,7 +244,7 @@ RequeueStart ==
     /\ activeTurn' = NoPrompt
     /\ roundsLeft' = 0
     /\ failuresLeft' = failuresLeft - 1
-    /\ UNCHANGED <<copyMode, claimedSteers, settledTurns, interruptedTurns,
+    /\ UNCHANGED <<claimedSteers, settledTurns, interruptedTurns,
                    committedOrder, toolUses, toolResults, permission,
                    permissionOwner, usedRequests, continuationNeeded, terminalReason>>
 
@@ -283,7 +260,7 @@ ProviderAnswer ==
     /\ roundsLeft' = roundsLeft - 1
     /\ toolUses' = 0
     /\ toolResults' = 0
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    permission, permissionOwner, usedRequests, failuresLeft>>
 
@@ -296,7 +273,7 @@ ProviderRefusal ==
     /\ roundsLeft' = roundsLeft - 1
     /\ toolUses' = 0
     /\ toolResults' = 0
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    permission, permissionOwner, usedRequests, failuresLeft>>
 
@@ -311,7 +288,7 @@ ProviderFailure ==
     /\ roundsLeft' = roundsLeft - 1
     /\ toolUses' = 0
     /\ toolResults' = 0
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    permission, permissionOwner, usedRequests, failuresLeft>>
 
@@ -326,7 +303,7 @@ ProviderToolBatch(count) ==
     /\ roundsLeft' = roundsLeft - 1
     /\ terminalReason' =
         IF roundsLeft' = 0 THEN "limit" ELSE "none"
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    permission, permissionOwner, usedRequests, failuresLeft>>
 
@@ -335,7 +312,7 @@ CompleteTool ==
     /\ toolResults < toolUses
     /\ toolResults' = toolResults + 1
     /\ phase' = IF toolResults' = toolUses THEN "boundary" ELSE "tools"
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    toolUses, permission, permissionOwner, usedRequests,
                    continuationNeeded, terminalReason, roundsLeft, failuresLeft>>
@@ -348,39 +325,38 @@ AskPermission(requestId) ==
     /\ permission' = requestId
     /\ permissionOwner' = activeTurn
     /\ usedRequests' = usedRequests \cup {requestId}
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    toolUses, toolResults, continuationNeeded, terminalReason, roundsLeft,
                    failuresLeft>>
 
 AllowPermission(requestId) ==
-    /\ ~copyMode
     /\ phase = "permission"
     /\ permission = requestId
     /\ permissionOwner = activeTurn
     /\ phase' = "tools"
     /\ permission' = NoRequest
     /\ permissionOwner' = NoPrompt
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    toolUses, toolResults, usedRequests, continuationNeeded,
                    terminalReason, roundsLeft, failuresLeft>>
 
-\* A denied tool still gets a result block.  The model abstracts its contents
-\* but keeps the same pairing rule as a successfully completed tool.
+\* A permission decision retires only the request. A code-mode script may
+\* receive several (even denied) bridge decisions before its one outer result
+\* exists. CompleteTool separately pairs that result, including synthetic
+\* results for the remainder of a batch stopped by a denial.
 DenyPermission(requestId) ==
-    /\ ~copyMode
     /\ phase = "permission"
     /\ permission = requestId
     /\ permissionOwner = activeTurn
     /\ permission' = NoRequest
     /\ permissionOwner' = NoPrompt
-    /\ toolResults' = toolResults + 1
     /\ terminalReason' = "denial"
-    /\ phase' = IF toolResults' = toolUses THEN "boundary" ELSE "tools"
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ phase' = "tools"
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
-                   toolUses, usedRequests, continuationNeeded, roundsLeft,
+                   toolUses, toolResults, usedRequests, continuationNeeded, roundsLeft,
                    failuresLeft>>
 
 \* Claim every steering item that exists at this safe boundary, preserving its
@@ -396,7 +372,7 @@ ClaimSteering ==
     /\ lifecycle' =
         [p \in PromptIds |->
             IF p \in SeqSet(QueuedSteers) THEN "claimed" ELSE lifecycle[p]]
-    /\ UNCHANGED <<copyMode, activeTurn, delivery, settledTurns, interruptedTurns,
+    /\ UNCHANGED <<activeTurn, delivery, settledTurns, interruptedTurns,
                    committedOrder, toolUses, toolResults, permission,
                    permissionOwner, usedRequests, continuationNeeded,
                    terminalReason, roundsLeft, failuresLeft>>
@@ -414,7 +390,7 @@ CommitSteering ==
     /\ toolResults' = 0
     /\ continuationNeeded' = FALSE
     /\ terminalReason' = "none"
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, settledTurns,
+    /\ UNCHANGED <<activeTurn, queue, delivery, settledTurns,
                    interruptedTurns, permission, permissionOwner,
                    usedRequests, roundsLeft, failuresLeft>>
 
@@ -428,7 +404,7 @@ RequeueSteering ==
             IF p \in SeqSet(claimedSteers) THEN "queued" ELSE lifecycle[p]]
     /\ claimedSteers' = <<>>
     /\ failuresLeft' = failuresLeft - 1
-    /\ UNCHANGED <<copyMode, activeTurn, delivery, settledTurns, interruptedTurns,
+    /\ UNCHANGED <<activeTurn, delivery, settledTurns, interruptedTurns,
                    committedOrder, toolUses, toolResults, permission,
                    permissionOwner, usedRequests, continuationNeeded,
                    terminalReason, roundsLeft>>
@@ -443,7 +419,7 @@ ContinueAfterTools ==
     /\ toolUses' = 0
     /\ toolResults' = 0
     /\ continuationNeeded' = FALSE
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    permission, permissionOwner, usedRequests, terminalReason,
                    roundsLeft, failuresLeft>>
@@ -463,7 +439,7 @@ SettleTurn ==
     /\ toolResults' = 0
     /\ continuationNeeded' = FALSE
     /\ terminalReason' = "none"
-    /\ UNCHANGED <<copyMode, queue, lifecycle, claimedSteers,
+    /\ UNCHANGED <<queue, lifecycle, claimedSteers,
                    interruptedTurns, committedOrder, permission,
                    permissionOwner, usedRequests, failuresLeft>>
 
@@ -476,7 +452,7 @@ RequestCancel ==
     /\ permissionOwner' = NoPrompt
     /\ continuationNeeded' = FALSE
     /\ terminalReason' = "none"
-    /\ UNCHANGED <<copyMode, activeTurn, queue, delivery, lifecycle, claimedSteers,
+    /\ UNCHANGED <<activeTurn, queue, delivery, lifecycle, claimedSteers,
                    settledTurns, interruptedTurns, committedOrder,
                    toolUses, toolResults, usedRequests, roundsLeft,
                    failuresLeft>>
@@ -485,7 +461,7 @@ RepairCancelledTool ==
     /\ phase = "cancelling"
     /\ toolResults < toolUses
     /\ toolResults' = toolResults + 1
-    /\ UNCHANGED <<copyMode, phase, activeTurn, queue, delivery, lifecycle,
+    /\ UNCHANGED <<phase, activeTurn, queue, delivery, lifecycle,
                    claimedSteers, settledTurns, interruptedTurns,
                    committedOrder, toolUses, permission, permissionOwner,
                    usedRequests, continuationNeeded, terminalReason, roundsLeft,
@@ -503,7 +479,7 @@ FinishCancellation ==
     /\ toolResults' = 0
     /\ continuationNeeded' = FALSE
     /\ terminalReason' = "none"
-    /\ UNCHANGED <<copyMode, queue, lifecycle, claimedSteers, settledTurns,
+    /\ UNCHANGED <<queue, lifecycle, claimedSteers, settledTurns,
                    committedOrder, permission, permissionOwner,
                    usedRequests, failuresLeft>>
 
@@ -544,37 +520,18 @@ AgentProgress ==
     \/ RepairCancelledTool
     \/ FinishCancellation
 
-\* Permission choices are user input. They are unavailable while copy mode owns
-\* the terminal, so weak fairness of the combined AgentProgress action is not
-\* enough: repeatedly entering copy mode could otherwise postpone a reply
-\* forever. Strong fairness states the environmental assumption that a choice is
-\* eventually made if the permission UI is available infinitely often.
-PermissionResolution ==
-    \E requestId \in RequestIds :
-        AllowPermission(requestId) \/ DenyPermission(requestId)
+Next == UserAction \/ AgentProgress \/ IdleWait
 
-Next ==
-    \/ /\ ~copyMode
-       /\ UNCHANGED copyMode
-       /\ UserAction
-    \/ /\ UNCHANGED copyMode
-       /\ AgentProgress
-    \/ IdleWait
-    \/ EnterCopyMode
-    \/ ExitCopyMode
-
-Spec ==
-    /\ Init
-    /\ [][Next]_vars
-    /\ WF_vars(AgentProgress)
-    /\ WF_vars(ExitCopyMode)
-    /\ SF_vars(PermissionResolution)
+\* Fairness is an environment assumption: while a permission request is live,
+\* controller progress requires its eventual resolution (or cancellation).
+\* This covers interactive and remembered decisions without incorrectly
+\* treating paused terminal rendering as a disabled automatic permission.
+Spec == Init /\ [][Next]_vars /\ WF_vars(AgentProgress)
 
 \* -------------------------------------------------------------------------
 \* Safety properties checked by TLC
 
 TypeOK ==
-    /\ copyMode \in BOOLEAN
     /\ phase \in Phases
     /\ activeTurn \in PromptIds \cup {NoPrompt}
     /\ queue \in Seq(PromptIds)
@@ -671,10 +628,5 @@ HistoryOrderHasStableIds ==
 \* busy period eventually releases conversation ownership.
 EveryBusyPeriodSettles ==
     [](phase # "idle" => <>(phase = "idle"))
-
-\* Copy mode deliberately suspends user input, but it is not a permanent
-\* runtime state under the explicit user-resumption fairness assumption.
-CopyModeEventuallyResumes ==
-    [](copyMode => <>(~copyMode))
 
 =============================================================================

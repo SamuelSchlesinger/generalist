@@ -1113,6 +1113,25 @@ fn estimated_context_cache_tracks_in_place_steering() {
 }
 
 #[test]
+fn provider_measurements_expire_when_history_or_provider_changes() {
+    let mut agent = agent_with(Script::new(vec![]));
+    agent.last_context_tokens = Some(123);
+    agent.begin_turn(&"new user input ".repeat(100));
+    assert_eq!(agent.context_tokens(), estimate_tokens(agent.history()));
+
+    agent.last_context_tokens = Some(123);
+    let queue = PromptQueue::default();
+    queue.enqueue("a new constraint", DeliveryMode::Steer);
+    let (_cancel, control) = TurnControl::for_turn(queue);
+    assert!(agent.commit_steering(&control, &mut |_| {}));
+    assert_eq!(agent.context_tokens(), estimate_tokens(agent.history()));
+
+    agent.last_context_tokens = Some(123);
+    agent.set_provider(Box::new(Script::new(vec![])));
+    assert_eq!(agent.context_tokens(), estimate_tokens(agent.history()));
+}
+
+#[test]
 fn retry_delay_honors_retry_after_as_floor_with_cap() {
     // Pure backoff: 1, 2, 4, 8.
     assert_eq!(retry_delay_secs(0, None), 1);
@@ -1675,6 +1694,36 @@ async fn denial_mid_batch_stops_the_remaining_calls() {
     }
     // The tool after the denial never reached execution.
     assert_eq!(agent.registry.execution_history().len(), 2);
+}
+
+#[tokio::test]
+async fn cancellation_at_truncated_batch_boundary_preserves_steering() {
+    let mut response = tool_response();
+    response.stop_reason = StopReason::MaxTokens;
+    let mut agent = agent_with(Script::new(vec![Ok(response)]));
+    let queue = PromptQueue::default();
+    let steer = queue.enqueue("keep this queued", DeliveryMode::Steer);
+    let (cancel, mut control) = TurnControl::for_turn(queue.clone());
+    agent.begin_turn("go");
+    let outcome = agent
+        .run_started_turn(
+            &mut |event| {
+                if matches!(event, AgentEvent::Notice(ref text) if text.contains("mid-tool-call")) {
+                    cancel.cancel();
+                }
+            },
+            &mut control,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, TurnOutcome::Interrupted);
+    assert_eq!(queue.snapshot()[0].id, steer);
+    assert!(history_tool_protocol_is_valid(agent.history()));
+    assert!(agent.registry.execution_history().is_empty());
+    assert!(!agent
+        .history()
+        .iter()
+        .any(|message| message.text().contains("keep this queued")));
 }
 
 #[test]

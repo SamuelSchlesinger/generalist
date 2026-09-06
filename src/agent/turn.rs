@@ -79,17 +79,14 @@ impl Agent {
             }) else {
                 return Ok(self.traced_outcome(TurnOutcome::Interrupted));
             };
-            if let Some(usage) = &response.usage {
-                self.last_context_tokens = Some(
-                    usage.input_tokens
-                        + usage.output_tokens
-                        + usage.cache_read_input_tokens.unwrap_or(0)
-                        + usage.cache_creation_input_tokens.unwrap_or(0),
-                );
-            }
-
-            self.history
-                .push(Message::assistant(response.content.clone()));
+            self.push_history(Message::assistant(response.content.clone()));
+            self.last_context_tokens = response.usage.as_ref().map(|usage| {
+                usage
+                    .input_tokens
+                    .saturating_add(usage.output_tokens)
+                    .saturating_add(usage.cache_read_input_tokens.unwrap_or(0))
+                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0))
+            });
 
             if streamed.text || streamed.reasoning {
                 let text = streamed.text.then(|| {
@@ -161,7 +158,7 @@ impl Agent {
                             is_error: Some(true),
                         })
                         .collect();
-                    self.history.push(Message::user(results));
+                    self.push_history(Message::user(results));
                 }
                 on_event(AgentEvent::Notice(
                     "The model declined to continue with this request.".to_string(),
@@ -216,7 +213,11 @@ impl Agent {
                 for _ in &results {
                     self.trace_async(AsyncModelAction::CompleteTool);
                 }
-                self.history.push(Message::user(results));
+                self.push_history(Message::user(results));
+                if control.is_cancelled() {
+                    self.emit_checkpoint(on_event);
+                    return Ok(self.traced_outcome(TurnOutcome::Interrupted));
+                }
                 let steered =
                     iteration + 1 < self.max_iterations && self.commit_steering(control, on_event);
                 if !steered {
@@ -236,7 +237,7 @@ impl Agent {
 
             // Every tool_use gets a result — required by the APIs even when
             // a call was denied or cancellation interrupts the batch.
-            self.history.push(Message::user(results));
+            self.push_history(Message::user(results));
 
             // The controller may have processed an interrupt while the final
             // tool or permission future became ready. Do not steer merely
@@ -286,19 +287,18 @@ impl Agent {
         let mut results = Vec::with_capacity(tool_uses.len());
         let mut denied = false;
         let mut cancelled = false;
-        let mut index = 0;
-        while index < tool_uses.len() {
+        let mut remaining = tool_uses.into_iter();
+        while let Some((name, input, id)) = remaining.next() {
             if control.is_cancelled() {
                 self.trace_cancel_request();
-                for (_, _, id) in &tool_uses[index..] {
-                    results.push(cancelled_tool_result(id.clone()));
+                for id in std::iter::once(id).chain(remaining.map(|(_, _, id)| id)) {
+                    results.push(cancelled_tool_result(id));
                     self.trace_async(AsyncModelAction::RepairCancelledTool);
                 }
                 cancelled = true;
                 break;
             }
 
-            let (name, input, id) = tool_uses[index].clone();
             if self.builtin_code_mode_enabled()
                 && !self.is_code_mode_call(&name)
                 && name != UPDATE_GOAL_TOOL_NAME
@@ -326,7 +326,7 @@ impl Agent {
                     tool_use_id: id,
                     is_error: Some(true),
                 });
-                index += 1;
+                self.trace_async(AsyncModelAction::CompleteTool);
                 continue;
             }
 
@@ -364,8 +364,8 @@ impl Agent {
                 });
                 results.push(cancelled_tool_result(cancellation_id));
                 self.trace_async(AsyncModelAction::RepairCancelledTool);
-                for (_, _, id) in &tool_uses[index + 1..] {
-                    results.push(cancelled_tool_result(id.clone()));
+                for (_, _, id) in remaining {
+                    results.push(cancelled_tool_result(id));
                     self.trace_async(AsyncModelAction::RepairCancelledTool);
                 }
                 cancelled = true;
@@ -385,27 +385,24 @@ impl Agent {
             });
 
             let was_denied = result.outcome == ToolCallOutcome::Denied;
-            if was_denied {
-                denied = true;
-            } else {
-                self.trace_async(AsyncModelAction::CompleteTool);
-            }
+            denied |= was_denied;
+            self.trace_async(AsyncModelAction::CompleteTool);
             results.push(result.block);
-            index += 1;
 
             if was_denied {
                 // A denial stops the rest of the batch: the user is
                 // redirecting, so later calls queued alongside the denied
                 // one must not fire behind their back. Each still gets a
                 // paired result, mirroring the cancellation path.
-                for (_, _, remaining_id) in &tool_uses[index..] {
+                for (_, _, remaining_id) in remaining {
                     results.push(ContentBlock::ToolResult {
                         content: "This tool call was not executed because an earlier call in \
                                       the same batch was denied."
                             .to_string(),
-                        tool_use_id: remaining_id.clone(),
+                        tool_use_id: remaining_id,
                         is_error: Some(true),
                     });
+                    self.trace_async(AsyncModelAction::CompleteTool);
                 }
                 break;
             }
@@ -443,8 +440,9 @@ impl Agent {
         {
             last.content.extend(text_blocks);
         } else {
-            self.history.push(Message::user(text_blocks));
+            self.push_history(Message::user(text_blocks));
         }
+        self.last_context_tokens = None;
         self.invalidate_estimated_tokens_cache();
         let prompts = claim.commit();
         on_event(AgentEvent::SteeringCommitted { prompts });

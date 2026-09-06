@@ -94,8 +94,8 @@ document.
   matching tool call. Direct archive-tool execution is rejected.
 - `make conformance` generates payload-free traces through the real queue,
   agent, registry, history, and memory implementations. TLC must consume each
-  observed sequence through the original model actions and reject three
-  deliberate ordering/lifecycle/scope mutations. This is sampled safety
+  observed sequence through the original model actions, reject targeted trace
+  corruptions, and detect three deliberate model faults through named invariants. This is sampled safety
   conformance, not exhaustive Rust refinement.
 
 `/memory forget` deletes from the live SQLite store with `secure_delete=ON`,

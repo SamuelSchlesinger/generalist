@@ -3,52 +3,8 @@ set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
-find_tla_jar() {
-    if [ -n "${TLA2TOOLS_JAR:-}" ] && [ -f "$TLA2TOOLS_JAR" ]; then
-        printf '%s\n' "$TLA2TOOLS_JAR"
-        return
-    fi
-
-    if [ -f "$repo_root/.tools/tla2tools.jar" ]; then
-        printf '%s\n' "$repo_root/.tools/tla2tools.jar"
-        return
-    fi
-
-    toolbox_jar="/Applications/TLA+ Toolbox.app/Contents/Eclipse/tla2tools.jar"
-    if [ -f "$toolbox_jar" ]; then
-        printf '%s\n' "$toolbox_jar"
-        return
-    fi
-
-    printf '%s\n' \
-        "TLC not found. Run 'make tla-tools' or set TLA2TOOLS_JAR." >&2
-    exit 1
-}
-
-find_java() {
-    if [ -n "${TLA_JAVA:-}" ] && [ -x "$TLA_JAVA" ]; then
-        printf '%s\n' "$TLA_JAVA"
-        return
-    fi
-
-    if command -v java >/dev/null 2>&1 && java -version >/dev/null 2>&1; then
-        command -v java
-        return
-    fi
-
-    for candidate in \
-        /Applications/TLA+\ Toolbox.app/Contents/Eclipse/plugins/org.lamport.openjdk.*/Contents/Home/bin/java
-    do
-        if [ -x "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return
-        fi
-    done
-
-    printf '%s\n' \
-        "Java 11 or newer is required to run TLC. Set TLA_JAVA if needed." >&2
-    exit 1
-}
+# shellcheck source=scripts/tlc-common.sh
+. "$repo_root/scripts/tlc-common.sh"
 
 tla_jar=$(find_tla_jar)
 java_bin=$(find_java)
@@ -78,18 +34,21 @@ run_tlc() {
         "$rendered/$model.tla" >"$log" 2>&1
 }
 
-for model in AsyncObservedTrace MemoryObservedTrace ArchiveObservedTrace
+failed=0
+while IFS= read -r model
 do
     log="$work_dir/$model.log"
     if ! run_tlc "$model" "$log"; then
         printf 'Observed implementation trace failed TLA+ conformance: %s\n' "$model" >&2
         cat "$log" >&2
-        exit 1
+        failed=1
+        continue
     fi
     printf 'PASS observed implementation trace: %s\n' "$model"
-done
+done < "$rendered/observed.txt"
+[ "$failed" -eq 0 ] || exit 1
 
-for model in AsyncInvalidTrace MemoryInvalidTrace ArchiveInvalidTrace
+while IFS= read -r model
 do
     log="$work_dir/$model.log"
     if run_tlc "$model" "$log"; then
@@ -102,5 +61,20 @@ do
         cat "$log" >&2
         exit 1
     fi
-    printf 'PASS rejected refinement mutation: %s\n' "$model"
-done
+    printf 'PASS rejected trace mutation: %s\n' "$model"
+done < "$rendered/invalid.txt"
+
+while IFS="$(printf '\t')" read -r model invariant
+do
+    log="$work_dir/$model.log"
+    if run_tlc "$model" "$log"; then
+        printf 'Model fault escaped its invariants: %s\n' "$model" >&2
+        exit 1
+    fi
+    if ! grep -Fq "Invariant $invariant is violated" "$log"; then
+        printf 'Model fault failed for the wrong reason: %s\n' "$model" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    printf 'PASS model fault: %s violates %s\n' "$model" "$invariant"
+done < "$rendered/model-mutants.tsv"

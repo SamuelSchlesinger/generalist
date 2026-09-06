@@ -9,6 +9,7 @@ use generalist::{
     Error, Message, ModelKind, ModelTrace, ModelTraceSnapshot, PromptQueue, Result, SavedState,
     StopReason, Tool, ToolCallOutcome, ToolRegistry, TurnControl, TurnOutcome, WorkspaceScope,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs;
@@ -100,96 +101,215 @@ fn refusal_response() -> CompletionResponse {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ExpectedTurn {
-    Outcome(TurnOutcome),
+enum AsyncCase {
+    ToolAnswer,
+    Refusal,
     ProviderFailure,
+    CancelBeforeProvider,
+    DeniedBatch,
+    DeniedPython,
+    NestedDenial,
+    UndeclaredTool,
+    TruncatedBatch,
+    CancelTruncatedBatch,
+    IterationLimit,
+    Steering,
+    CancelledBatch,
+    QueueEdits,
 }
 
-async fn run_async_turn(
-    trace: &ModelTrace,
-    queue: &PromptQueue,
-    prompt_text: &str,
-    responses: Vec<Result<CompletionResponse>>,
-    expected: ExpectedTurn,
-) -> Result<()> {
-    queue.enqueue(prompt_text, DeliveryMode::FollowUp);
-    let claim = queue
-        .claim_follow_up()
-        .ok_or_else(|| Error::Other("Conformance follow-up was not claimable".to_string()))?;
-    let prompt = claim.prompts()[0].clone();
+struct DenyNamed(&'static str);
 
-    let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(Echo))?;
-    let provider = ScriptedProvider::new(responses);
-    let mut agent = Agent::new(Box::new(provider), registry, "conformance");
-    agent.code_mode = false;
-    agent.max_iterations = 2;
-    agent.max_retries = 0;
-    agent.set_model_trace(trace.clone());
-    agent.begin_queued_turn(&prompt);
-    claim.commit();
-
-    let (cancel, mut control) = TurnControl::for_turn(queue.clone());
-    if matches!(expected, ExpectedTurn::Outcome(TurnOutcome::Interrupted)) {
-        cancel.cancel();
-    }
-
-    let actual = agent.run_started_turn(&mut |_| {}, &mut control).await;
-    match (actual, expected) {
-        (Ok(actual), ExpectedTurn::Outcome(expected)) if actual == expected => Ok(()),
-        (Err(Error::Api { status: 401, .. }), ExpectedTurn::ProviderFailure) => Ok(()),
-        (Ok(actual), expected) => Err(Error::Other(format!(
-            "Conformance turn ended with {actual:?}, expected {expected:?}"
-        ))),
-        (Err(error), expected) => Err(Error::Other(format!(
-            "Conformance turn failed with {error}, expected {expected:?}"
-        ))),
+#[async_trait]
+impl generalist::ToolPermissionHandler for DenyNamed {
+    async fn check_permission(
+        &self,
+        request: &generalist::ToolExecutionRequest,
+    ) -> generalist::PermissionDecision {
+        if request.tool_name == self.0 {
+            generalist::PermissionDecision::Deny
+        } else {
+            generalist::PermissionDecision::Allow
+        }
     }
 }
 
-async fn async_runtime_trace() -> Result<ModelTraceSnapshot> {
+struct CancelPermission(generalist::CancelHandle);
+
+#[async_trait]
+impl generalist::ToolPermissionHandler for CancelPermission {
+    async fn check_permission(
+        &self,
+        _request: &generalist::ToolExecutionRequest,
+    ) -> generalist::PermissionDecision {
+        self.0.cancel();
+        std::future::pending().await
+    }
+}
+
+fn batch_response(count: usize) -> CompletionResponse {
+    let mut response = tool_response();
+    response.content = (0..count)
+        .map(|index| ContentBlock::ToolUse {
+            name: "echo".into(),
+            input: json!({}),
+            id: format!("call-{index}"),
+        })
+        .collect();
+    response
+}
+
+fn python_response() -> CompletionResponse {
+    CompletionResponse {
+        content: vec![ContentBlock::ToolUse {
+            name: "python".into(),
+            input: json!({"code": "import tools\nfor _ in range(2):\n    try:\n        tools.echo()\n    except Exception:\n        pass"}),
+            id: "python-1".into(),
+        }],
+        stop_reason: StopReason::ToolUse,
+        usage: None,
+    }
+}
+
+#[derive(Serialize)]
+struct Scenario {
+    name: String,
+    max_rounds: usize,
+    #[serde(flatten)]
+    trace: ModelTraceSnapshot,
+}
+
+async fn async_runtime_trace(case: AsyncCase) -> Result<Scenario> {
+    use AsyncCase::*;
     let trace = ModelTrace::for_models(&[ModelKind::AsyncRuntime]);
     let queue = PromptQueue::with_model_trace(trace.clone());
-
-    run_async_turn(
-        &trace,
-        &queue,
-        "exercise the tool runtime",
-        vec![Ok(tool_response()), Ok(answer_response())],
-        ExpectedTurn::Outcome(TurnOutcome::Completed),
-    )
-    .await?;
-    run_async_turn(
-        &trace,
-        &queue,
-        "exercise provider refusal",
-        vec![Ok(refusal_response())],
-        ExpectedTurn::Outcome(TurnOutcome::Refused),
-    )
-    .await?;
-    run_async_turn(
-        &trace,
-        &queue,
-        "exercise provider failure",
-        vec![Err(Error::Api {
+    let (cancel, mut control) = TurnControl::for_turn(queue.clone());
+    let mut registry = match case {
+        DeniedBatch | NestedDenial => {
+            ToolRegistry::with_permission_handler(Box::new(DenyNamed("echo")))
+        }
+        DeniedPython => ToolRegistry::with_permission_handler(Box::new(DenyNamed("python"))),
+        CancelledBatch => {
+            ToolRegistry::with_permission_handler(Box::new(CancelPermission(cancel.clone())))
+        }
+        _ => ToolRegistry::new(),
+    };
+    registry.register(Arc::new(Echo))?;
+    let responses = match case {
+        ToolAnswer | UndeclaredTool => vec![Ok(tool_response()), Ok(answer_response())],
+        Refusal => vec![Ok(refusal_response())],
+        ProviderFailure => vec![Err(Error::Api {
             status: 401,
-            message: "deterministic failure".to_string(),
+            message: "deterministic failure".into(),
             retry_after: None,
             error_type: None,
         })],
-        ExpectedTurn::ProviderFailure,
-    )
-    .await?;
-    run_async_turn(
-        &trace,
-        &queue,
-        "exercise cancellation",
-        Vec::new(),
-        ExpectedTurn::Outcome(TurnOutcome::Interrupted),
-    )
-    .await?;
-
-    Ok(trace.snapshot())
+        CancelBeforeProvider => Vec::new(),
+        DeniedBatch | CancelledBatch => vec![Ok(batch_response(2))],
+        DeniedPython | NestedDenial => vec![Ok(python_response())],
+        TruncatedBatch | CancelTruncatedBatch => {
+            let mut response = batch_response(2);
+            response.stop_reason = StopReason::MaxTokens;
+            vec![Ok(response), Ok(answer_response())]
+        }
+        IterationLimit => vec![Ok(tool_response()), Ok(tool_response())],
+        Steering => vec![Ok(answer_response()), Ok(answer_response())],
+        QueueEdits => vec![Ok(answer_response())],
+    };
+    if matches!(case, QueueEdits) {
+        // Duplicate text must not hide a lost deletion or wrong claimed ID.
+        let deleted = queue.enqueue("duplicate", DeliveryMode::FollowUp);
+        let kept = queue.enqueue("duplicate", DeliveryMode::FollowUp);
+        let restored = queue.enqueue("duplicate", DeliveryMode::FollowUp);
+        assert!(queue.delete(deleted));
+        assert!(queue.move_by(kept, 1));
+        assert!(queue.move_by(kept, -1));
+        assert_eq!(queue.restore_latest().unwrap().id, restored);
+        assert!(queue.reconcile_goal_continuation(true));
+        assert!(!queue.reconcile_goal_continuation(true));
+        assert!(queue.reconcile_goal_continuation(false));
+        drop(queue.claim_follow_up().unwrap()); // rollback, then retry below
+    } else {
+        queue.enqueue("exercise runtime", DeliveryMode::FollowUp);
+    }
+    let claim = queue.claim_follow_up().expect("one claimable follow-up");
+    let mut agent = Agent::new(
+        Box::new(ScriptedProvider::new(responses)),
+        registry,
+        "conformance",
+    );
+    agent.code_mode = matches!(case, DeniedPython | NestedDenial | UndeclaredTool);
+    agent.max_iterations = 2;
+    agent.max_retries = 0;
+    agent.set_model_trace(trace.clone());
+    agent.begin_queued_turn(&claim.prompts()[0]);
+    claim.commit();
+    if matches!(case, CancelBeforeProvider) {
+        cancel.cancel();
+    }
+    let mut steered = false;
+    let mut checkpoints = 0;
+    let actual = agent
+        .run_started_turn(
+            &mut |event| {
+                if matches!(case, Steering)
+                    && !steered
+                    && matches!(event, generalist::AgentEvent::ApiCallStarted)
+                {
+                    let id = queue.enqueue("duplicate", DeliveryMode::FollowUp);
+                    assert!(queue.toggle_delivery(id, true));
+                    queue.enqueue("duplicate", DeliveryMode::Steer);
+                    steered = true;
+                }
+                let truncated = matches!(event, generalist::AgentEvent::Notice(ref text)
+                    if text.contains("mid-tool-call"));
+                if matches!(case, CancelTruncatedBatch) && truncated {
+                    queue.enqueue("retain until next turn", DeliveryMode::Steer);
+                    cancel.cancel();
+                }
+                if let generalist::AgentEvent::HistoryCheckpoint { history, .. } = event {
+                    assert!(generalist::history_tool_protocol_is_valid(&history));
+                    checkpoints += 1;
+                }
+            },
+            &mut control,
+        )
+        .await;
+    let expected = match case {
+        Refusal => TurnOutcome::Refused,
+        CancelBeforeProvider | CancelledBatch | CancelTruncatedBatch => TurnOutcome::Interrupted,
+        DeniedBatch | DeniedPython | NestedDenial => TurnOutcome::PausedOnDenial,
+        IterationLimit => TurnOutcome::MaxIterationsReached,
+        _ => TurnOutcome::Completed,
+    };
+    if matches!(case, ProviderFailure) {
+        assert!(matches!(actual, Err(Error::Api { status: 401, .. })));
+    } else {
+        assert_eq!(actual?, expected, "{case:?}");
+        if !matches!(case, CancelBeforeProvider) {
+            assert!(checkpoints > 0);
+        }
+    }
+    assert!(generalist::history_tool_protocol_is_valid(agent.history()));
+    if matches!(case, CancelTruncatedBatch) {
+        assert_eq!(queue.len(), 1);
+        queue.normalize_steers();
+        assert_eq!(queue.snapshot()[0].delivery, DeliveryMode::FollowUp);
+    } else {
+        assert!(queue.is_empty());
+    }
+    if matches!(case, DeniedBatch) {
+        assert_eq!(agent.registry.execution_history().len(), 1);
+        assert_eq!(agent.history().last().unwrap().content.len(), 2);
+    }
+    if matches!(case, UndeclaredTool | TruncatedBatch | DeniedPython) {
+        assert!(agent.registry.execution_history().is_empty());
+    }
+    Ok(Scenario {
+        name: format!("{case:?}"),
+        max_rounds: 2,
+        trace: trace.snapshot(),
+    })
 }
 
 async fn storage_runtime_trace() -> Result<ModelTraceSnapshot> {
@@ -211,6 +331,17 @@ async fn storage_runtime_trace() -> Result<ModelTraceSnapshot> {
         scope.clone(),
         trace.clone(),
     )?;
+    assert!(memory
+        .record_settled_turn(
+            "capture is paused",
+            &[Message::user_text("capture is paused")],
+            EpisodeOutcome::Completed,
+            "test",
+            "model",
+            Utc::now(),
+        )
+        .await?
+        .is_none());
     memory.set_capture_enabled(true).await?;
 
     let mut state = SavedState::new(scope, "test".to_string(), "model".to_string());
@@ -309,14 +440,31 @@ async fn main() -> Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| Error::Other("Usage: model_conformance <output.json>".to_string()))?;
-    let async_trace = async_runtime_trace().await?;
-    let storage_trace = storage_runtime_trace().await?;
-    let snapshot = ModelTraceSnapshot {
-        async_runtime: async_trace.async_runtime,
-        memory_runtime: storage_trace.memory_runtime,
-        archive_scope_runtime: storage_trace.archive_scope_runtime,
-    };
-    let bytes = serde_json::to_vec_pretty(&snapshot)?;
+    let mut scenarios = Vec::new();
+    for case in [
+        AsyncCase::ToolAnswer,
+        AsyncCase::Refusal,
+        AsyncCase::ProviderFailure,
+        AsyncCase::CancelBeforeProvider,
+        AsyncCase::DeniedBatch,
+        AsyncCase::DeniedPython,
+        AsyncCase::NestedDenial,
+        AsyncCase::UndeclaredTool,
+        AsyncCase::TruncatedBatch,
+        AsyncCase::CancelTruncatedBatch,
+        AsyncCase::IterationLimit,
+        AsyncCase::Steering,
+        AsyncCase::CancelledBatch,
+        AsyncCase::QueueEdits,
+    ] {
+        scenarios.push(async_runtime_trace(case).await?);
+    }
+    scenarios.push(Scenario {
+        name: "Storage".into(),
+        max_rounds: 2,
+        trace: storage_runtime_trace().await?,
+    });
+    let bytes = serde_json::to_vec_pretty(&scenarios)?;
     fs::write(&output, bytes).map_err(|error| {
         Error::Other(format!(
             "Failed to write conformance trace {}: {error}",

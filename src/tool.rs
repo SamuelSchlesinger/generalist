@@ -28,7 +28,7 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the tool's input.
     fn input_schema(&self) -> Value;
 
-    /// Execute with validated-by-the-model input; return output text.
+    /// Validate the supplied input and execute the capability; return output text.
     async fn execute(&self, input: Value) -> Result<String>;
 
     /// Execute after the registry has authorized this exact tool call.
@@ -286,7 +286,42 @@ impl ToolRegistry {
     /// executing anything. Used for agent-level tools (e.g. code mode) that
     /// are not in the registry but must obey the same policy.
     pub async fn check_permission(&self, request: &ToolExecutionRequest) -> PermissionDecision {
-        self.permission_handler.check_permission(request).await
+        let archive_request = archive_request(request);
+        // The trace and its allocated permission-request ID travel together,
+        // so no later step can observe one without the other.
+        let traced = self
+            .model_trace
+            .as_ref()
+            .map(|trace| (trace, trace.next_request_id()));
+        if let Some((trace, request_id)) = &traced {
+            trace.record_async(AsyncModelAction::AskPermission {
+                request_id: request_id.clone(),
+            });
+            if let Some((kind, filter)) = archive_request {
+                trace.record_archive(ArchiveModelAction::RequestSearch {
+                    kind: kind.to_string(),
+                    filter,
+                });
+                if kind == "memory" {
+                    trace.record_memory(MemoryModelAction::RequestSearch { filter });
+                }
+            }
+        }
+
+        let decision = self.permission_handler.check_permission(request).await;
+        match &decision {
+            PermissionDecision::Allow => {
+                if let Some((trace, request_id)) = &traced {
+                    trace.record_async(AsyncModelAction::AllowPermission {
+                        request_id: request_id.clone(),
+                    });
+                }
+            }
+            PermissionDecision::Deny | PermissionDecision::DenyWithReason(_) => {
+                record_denial(&traced, archive_request);
+            }
+        }
+        decision
     }
 
     /// Register a tool. Errors if the name is already taken.
@@ -378,35 +413,8 @@ impl ToolRegistry {
             input: input.clone(),
             tool_description: tool.description().to_string(),
         };
-        let archive_request = archive_request(&request);
-        // The trace and its allocated permission-request ID travel together,
-        // so no later step can observe one without the other.
-        let traced = self
-            .model_trace
-            .as_ref()
-            .map(|trace| (trace, trace.next_request_id()));
-        if let Some((trace, request_id)) = &traced {
-            trace.record_async(AsyncModelAction::AskPermission {
-                request_id: request_id.clone(),
-            });
-            if let Some((kind, filter)) = archive_request {
-                trace.record_archive(ArchiveModelAction::RequestSearch {
-                    kind: kind.to_string(),
-                    filter,
-                });
-                if kind == "memory" {
-                    trace.record_memory(MemoryModelAction::RequestSearch { filter });
-                }
-            }
-        }
-
-        match self.permission_handler.check_permission(&request).await {
+        match self.check_permission(&request).await {
             PermissionDecision::Allow => {
-                if let Some((trace, request_id)) = &traced {
-                    trace.record_async(AsyncModelAction::AllowPermission {
-                        request_id: request_id.clone(),
-                    });
-                }
                 execution.state = ExecutionState::Executing;
                 let authorization = ToolAuthorization::new(request);
                 let result = tool.execute_authorized(input, &authorization).await;
@@ -429,7 +437,6 @@ impl ToolRegistry {
                 call_result
             }
             PermissionDecision::Deny => {
-                record_denial(&traced, archive_request);
                 execution.deny("Permission denied");
                 self.executions.push(execution);
                 ToolCallResult::new(
@@ -439,7 +446,6 @@ impl ToolRegistry {
                 )
             }
             PermissionDecision::DenyWithReason(reason) => {
-                record_denial(&traced, archive_request);
                 execution.deny(&reason);
                 self.executions.push(execution);
                 ToolCallResult::new(

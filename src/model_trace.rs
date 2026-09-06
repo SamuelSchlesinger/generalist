@@ -45,7 +45,19 @@ pub enum AsyncModelAction {
         prompt_id: u64,
         delivery: DeliveryMode,
     },
-    DispatchFollowUp,
+    DeleteQueued {
+        index: usize,
+    },
+    ReclassifyQueued {
+        index: usize,
+        delivery: DeliveryMode,
+    },
+    MoveQueuedEarlier {
+        index: usize,
+    },
+    DispatchFollowUp {
+        prompt_id: u64,
+    },
     CommitStart,
     RequeueStart,
     ProviderAnswer,
@@ -64,7 +76,9 @@ pub enum AsyncModelAction {
     DenyPermission {
         request_id: String,
     },
-    ClaimSteering,
+    ClaimSteering {
+        prompt_ids: Vec<u64>,
+    },
     CommitSteering,
     RequeueSteering,
     ContinueAfterTools,
@@ -127,6 +141,7 @@ pub struct ModelTrace {
 struct TraceState {
     snapshot: ModelTraceSnapshot,
     scope_ids: HashMap<String, String>,
+    history_ids: HashMap<String, String>,
     selected_archive_scope: Option<String>,
     next_request_id: u64,
 }
@@ -179,14 +194,26 @@ impl ModelTrace {
         }
     }
 
-    pub(crate) fn record_archive(&self, action: ArchiveModelAction) {
+    pub(crate) fn record_archive(&self, mut action: ArchiveModelAction) {
         if self.records(ModelKind::ArchiveScopeRuntime) {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .snapshot
-                .archive_scope_runtime
-                .push(action);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Saved-session names are user text. Preserve equality across
+            // writes, reads, and deletion without retaining names in output.
+            if let ArchiveModelAction::SaveHistory { history_id }
+            | ArchiveModelAction::ForgetHistory { history_id }
+            | ArchiveModelAction::ApproveHistorySearch { history_id, .. } = &mut action
+            {
+                let next = state.history_ids.len() + 1;
+                *history_id = state
+                    .history_ids
+                    .entry(history_id.clone())
+                    .or_insert_with(|| format!("history-{next}"))
+                    .clone();
+            }
+            state.snapshot.archive_scope_runtime.push(action);
         }
     }
 
@@ -298,5 +325,24 @@ mod tests {
                 scope: "scope-1".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn saved_names_are_redacted_consistently_across_archive_actions() {
+        let trace = ModelTrace::for_models(&[ModelKind::ArchiveScopeRuntime]);
+        let name = "confidential project notes".to_string();
+        trace.record_archive(ArchiveModelAction::SaveHistory {
+            history_id: name.clone(),
+        });
+        trace.record_archive(ArchiveModelAction::ApproveHistorySearch {
+            scope: "scope-1".into(),
+            history_id: name.clone(),
+        });
+        trace.record_archive(ArchiveModelAction::ForgetHistory {
+            history_id: name.clone(),
+        });
+        let serialized = serde_json::to_string(&trace.snapshot()).unwrap();
+        assert!(!serialized.contains(&name));
+        assert_eq!(serialized.matches("history-1").count(), 3);
     }
 }

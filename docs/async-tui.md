@@ -573,20 +573,22 @@ earliest safe delivery point.
 
 ## Formal model and review
 
-`spec/AsyncRuntime.tla` models the controller protocol and copy-mode terminal
-ownership, while reasoning text and Ratatui layout remain hidden
-payload/display state. `spec/MemoryRuntime.tla` separately models opt-in
+`spec/AsyncRuntime.tla` models the controller protocol: stable queue IDs,
+claims, steering, tool-result pairing, permission ownership, cancellation,
+and eventual release of a busy turn under weak fairness of controller
+progress. Permission resolution is an environmental assumption. Copy-mode
+rendering and input suppression are abstracted as stuttering; remembered
+permissions and host goal scheduling may still progress while the frame is
+paused. The model does not prove that a user resumes or answers a prompt.
+
+`spec/MemoryRuntime.tla` separately models opt-in
 settled-turn capture, the FIFO SQLite worker, failure/skip outcomes, immutable
 live episodes, explicit live-store deletion, and the absence of automatic
 retrieval. Their checked-in `.cfg` files supply the finite CI bounds. TLC checks queue
 identity, single-turn ownership, delivery modes, safe steering, terminal
 reasons, tool-result pairing, permission correlation, committed settlement,
-stable ID ordering, weakly fair release of busy ownership, and eventual copy
-mode exit under an explicit user-resumption fairness assumption. Because copy
-mode makes permission keys intermittently unavailable, permission resolution
-has its own strong-fairness assumption when the permission UI is available
-infinitely often; the first version without that assumption produced a TLC
-liveness counterexample. The memory model's worker fairness similarly assumes
+stable ID ordering, and weakly fair release of busy ownership. The memory
+model's worker fairness similarly assumes
 that the OS and filesystem eventually return; Rust bounds SQLite lock waiting
 but cannot force a failed kernel or disk to progress.
 
@@ -618,7 +620,7 @@ the Rust and shell validation.
 - Copy mode intentionally suspends application input and visual updates so the
   host terminal can own selection. Runtime work continues, but a permission
   request that arrives in copy mode cannot be answered until `F3` or `Esc`
-  resumes the display. TLA+ liveness assumes the user eventually resumes; the
+  resumes the display. Protocol liveness assumes permissions eventually resolve; the
   implementation cannot force that environmental action.
 - OSC 52 is intentionally a best-effort terminal request. Generalist can prove
   it emitted one complete, bounded request but cannot observe whether the

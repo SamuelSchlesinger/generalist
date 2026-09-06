@@ -390,8 +390,10 @@ documented in [the architecture note](docs/async-tui.md) and
 `make conformance` additionally runs deterministic paths through the real Rust
 queue, agent, permission, history, and memory code, then asks TLC to consume
 those exact abstract action sequences through the original model operators. It
-also verifies that three deliberately invalid traces are rejected. This is a
-sampled executable refinement check, not a proof over every Rust execution.
+also rejects targeted trace mutations and checks that deliberate faults in
+each model violate specific invariants. This is sampled safety evidence, not a
+proof over every Rust execution. The [whitepaper](whitepaper/README.md) explains
+the architecture, measured verification coverage, and remaining limits.
 
 ## Memory architecture status
 
